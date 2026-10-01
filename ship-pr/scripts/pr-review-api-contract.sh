@@ -56,6 +56,10 @@
 # so; the workflow reports every exit but 0 and 3, naming which. A belief this repository
 # cannot check prints as `skip`, with the reason, so the unpinned set is visible in every run
 # rather than assumed away.
+#
+# This script's own logic — which claims pin and which skip, the read guards, how a failed read is
+# sorted, the cleanup on exit — is pinned by test-pr-review-api-contract.sh against a fixture world
+# (ludics-lite#91): a belief added or reworded here changes that suite's expected verdict list too.
 
 set -euo pipefail
 
@@ -219,8 +223,11 @@ pin() {
 # A read built from a field another read returned validates that field first: a field that moved
 # has already been recorded MOVED above, and the dependent request would only turn that drift
 # into a 404 — exit 3, transport — and hide every MOVED line after it.
-is_sha() { case "$1" in *[!0-9a-f]* | '') return 1 ;; esac; [ "${#1}" -eq 40 ]; }
-is_num() { case "$1" in '' | *[!0-9]*) return 1 ;; esac; }
+# The sets are spelled out, never ranges: a bracket range collates by the locale, and under bash
+# 3.2 in en_US.UTF-8 `a-f` admits the capitals between them, so an upper-case sha passed (found by
+# test-pr-review-api-contract.sh's hostile-locale pass, ludics-lite#91).
+is_sha() { case "$1" in *[!0123456789abcdef]* | '') return 1 ;; esac; [ "${#1}" -eq 40 ]; }
+is_num() { case "$1" in '' | *[!0123456789]*) return 1 ;; esac; }
 # A list whose wrapper moved arrives as null; row-level claims on it would crash a jq under
 # errexit instead of standing behind the MOVED the wrapper claim recorded.
 is_list() { jq -e 'type == "array"' <<<"$1" >/dev/null 2>&1; }
@@ -232,6 +239,14 @@ skip() { # <belief> <why>
 }
 
 section() { printf '\n== %s\n' "$*"; }
+
+# The fixture suite (test-pr-review-api-contract.sh) loads everything above — the helpers, the
+# scratch directory and the EXIT trap that removes it — without the reads below: sourced with
+# CONTRACT_TEST_SOURCE_ONLY=1, this file ends here (ludics-lite#91). pr-review.sh's own
+# SHIP_PR_TEST_SOURCE_ONLY cannot serve, since this file exports it itself to source the library.
+if [ "${CONTRACT_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  return 0 2>/dev/null || { echo "pr-review-api-contract.sh: CONTRACT_TEST_SOURCE_ONLY=1 is for sourcing this file, not running it" >&2; exit 2; }
+fi
 
 # --- the anchors ------------------------------------------------------------------------------
 section "anchors on $REPO"

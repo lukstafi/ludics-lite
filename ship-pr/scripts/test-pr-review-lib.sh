@@ -26,6 +26,10 @@
 #   review_thread <id> <resolved> …     one row of the reviewThreads connection, and the paged
 #   review_threads_answer <nodes> "$@"  GraphQL answer over such rows, for a fixture `gh`'s
 #                                       reviewThreads arm (ludics-lite#289)
+#   inline_comment <id> <orig> <cur> …  one inline finding as the flat listing serves it, and as
+#   positional_comment <id> <orig> …    the per-review endpoint does: the shapes
+#                                       pr-review-api-contract.sh pins, held to its pins by
+#                                       test-pr-review-api-contract.sh (ludics-lite#91)
 #   gh_fixture_parse "$@"               inside a fixture `gh`: refuses anything but `gh api`, any
 #   gh_fixture_answer <response>        option outside gh api's own table (below), and any
 #                                       endpoint that is neither `graphql` nor a REST path with a
@@ -570,6 +574,41 @@ review_threads_answer() { # <nodes json> <the gh call's args...>
       pageInfo: {hasNextPage: (($start + $size) < ($nodes | length)),
                  endCursor: ("c" + (($start + $size) | tostring))},
       nodes: $nodes[$start:($start + $size)]}}}}}'
+}
+
+# --- inline comment rows (ludics-lite#91) ------------------------------------------------------
+# The two shapes GitHub serves one inline finding in, built here once so a suite cannot drift from
+# what pr-review-api-contract.sh pins of them: test-pr-review-api-contract.sh builds the contract's
+# reviewed-PR world from THESE builders and runs the contract's own pins over it, so a builder
+# that stops carrying a field the contract names turns that suite red. Both carry the two commit
+# fields — GitHub migrates `commit_id` forward to the current head for a comment whose lines still
+# exist, while `original_commit_id` stays the commit the reviewer wrote it against — the
+# `pull_request_review_id` the contract pins on both feeds (1 unless the extra json says
+# otherwise; poll's fold deny-lists it), and BOTH halves of the anchor pair the row migrates in,
+# the original defaulting to the current one, so a migrated anchor is an argument rather than a
+# case nobody can write (#272: one position argument written to both fields hid a renderer gap
+# from every fixture).
+#
+# inline_comment: a row of the FLAT listing (pulls/<n>/comments), anchored by line/original_line.
+inline_comment() { # <id> <original commit> <current commit> [body] [path] [line] [original line] [extra json]
+  jq -cn --argjson id "$1" --arg orig "$2" --arg cur "$3" --arg b "${4:-a finding}" \
+    --arg p "${5:-a.sh}" --argjson ln "${6:-3}" --argjson oln "${7:-${6:-3}}" \
+    --argjson extra "${8:-null}" --arg rev "$REVIEWER" \
+    '{id:$id, pull_request_review_id:1, user:{login:($rev + "[bot]")}, path:$p, line:$ln,
+      original_line:$oln, body:$b, original_commit_id:$orig, commit_id:$cur} + ($extra // {})'
+}
+
+# positional_comment: a row as the PER-REVIEW comments endpoint (pulls/<n>/reviews/<id>/comments)
+# serves it, which is not the flat listing's shape: no `line` and no `original_line` at all —
+# verified against this repository's live API on 2026-09-10 — with the location carried by
+# position/original_position instead. poll renders such a row by the field it actually has,
+# `:@<position>`.
+positional_comment() { # <id> <original commit> <body> <position> [original position] [extra json]
+  jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" \
+    --argjson opos "${5:-$4}" --argjson extra "${6:-null}" --arg rev "$REVIEWER" \
+    '{id:$id, pull_request_review_id:1, user:{login:($rev + "[bot]")}, path:"a.sh", body:$b,
+      position:$pos, original_position:$opos, original_commit_id:$orig, commit_id:$orig}
+     + ($extra // {})'
 }
 
 # --- counting a fixture's calls --------------------------------------------------------------

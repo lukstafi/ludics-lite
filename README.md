@@ -371,6 +371,7 @@ ship-pr/scripts/test-pr-review-status.sh
 ship-pr/scripts/test-pr-review-watch.sh
 ship-pr/scripts/test-pr-review-reply.sh
 ship-pr/scripts/test-pr-review-retry.sh
+ship-pr/scripts/test-pr-review-api-contract.sh
 scripts/test-wake-lab.sh
 scripts/test-wake-lab-linux.sh
 scripts/test-check-prompts.sh

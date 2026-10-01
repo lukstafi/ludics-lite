@@ -145,15 +145,9 @@ review() { # <id> <commit> <submitted_at> [body]
       submitted_at:$at, body:$b}'
 }
 
-# An inline comment carries BOTH commit fields, because they are what the head test turns on:
-# GitHub migrates `commit_id` forward to the current head for a comment whose lines still exist,
-# while `original_commit_id` stays the commit the reviewer wrote it against.
-inline_comment() { # <id> <original commit> <current commit> [body] [path] [line] [extra json]
-  jq -cn --argjson id "$1" --arg orig "$2" --arg cur "$3" --arg b "${4:-a finding}" \
-    --arg p "${5:-a.sh}" --argjson ln "${6:-3}" --argjson extra "${7:-null}" --arg rev "$REVIEWER" \
-    '{id:$id, user:{login:($rev + "[bot]")}, path:$p, line:$ln, body:$b,
-      original_commit_id:$orig, commit_id:$cur} + ($extra // {})'
-}
+# The inline rows, inline_comment (the flat listing) and positional_comment (the per-review
+# endpoint), are test-pr-review-lib.sh's since ludics-lite#91, where the contract suite holds them
+# to the fields pr-review-api-contract.sh pins.
 
 # How many times a string occurs in the whole of what a watch printed. A fold is only a fold if
 # the duplicated BODY is printed once, and "contains it" cannot tell one copy from three.
@@ -167,18 +161,6 @@ occurrences() { # <haystack> <needle>
 # An assertion per token would pass on a rendering that printed the same line for both.
 distinct_inline_headers() { # <haystack>
   { grep -F -- '--- inline ' <<<"$1" || true; } | sed 's/ id=[^ ]*//' | sort -u | wc -l | tr -d '[:space:]'
-}
-
-# A row as the PER-REVIEW comments endpoint serves it, which is not the shape the flat feed has:
-# no `line` and no `original_line` at all — verified against this repository's live API on
-# 2026-09-10 — with the location carried by position/original_position instead. poll renders such
-# a row by the field it actually has, `:@<position>`, so two of them at different places in one
-# file are told apart by the eye as well as by the fold key.
-positional_comment() { # <id> <original commit> <body> <position> [original position]
-  jq -cn --argjson id "$1" --arg orig "$2" --arg b "$3" --argjson pos "$4" \
-    --argjson opos "${5:-$4}" --arg rev "$REVIEWER" \
-    '{id:$id, user:{login:($rev + "[bot]")}, path:"a.sh", body:$b, position:$pos,
-      original_position:$opos, original_commit_id:$orig, commit_id:$orig}'
 }
 
 summary_comment() { # <id> <created_at> <body>
@@ -387,7 +369,7 @@ test_a_row_with_no_location_at_all_says_so() {
   reset_fixture
   schedule reviews 1 "[$(review 500 "$H2" 2026-09-01T00:01:00Z)]"
   schedule inline 1 \
-    "[$(inline_comment 900 "$H2" "$H2" 'a finding about the whole file' a.sh null '{"subject_type":"file"}')]"
+    "[$(inline_comment 900 "$H2" "$H2" 'a finding about the whole file' a.sh null '' '{"subject_type":"file"}')]"
   run_watch 0,0,0
   assert_eq "$WATCH_RC" 0 "the round is acted on"
   assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:?" "an unknown line renders as unknown"
@@ -901,22 +883,22 @@ test_threads_at_different_places_are_not_folded() {
 test_an_unrecognized_field_keeps_two_threads_apart() {
   reset_fixture
   local same="the same text at two anchors"
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"side":"RIGHT"}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '' '{"side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '' '{"side":"RIGHT"}')]"
   run_watch 0,0,0
   assert_not_contains "$WATCH_OUT" "id=900+901" "a deletion and an addition at one line separate"
   reset_fixture
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"start_line":3}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '' '{"start_line":1}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '' '{"start_line":3}')]"
   run_watch 0,0,0
   assert_not_contains "$WATCH_OUT" "id=900+901" "and so does a multi-line range"
   reset_fixture
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"an_anchor_github_has_yet_to_invent":"a"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"an_anchor_github_has_yet_to_invent":"b"}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '' '{"an_anchor_github_has_yet_to_invent":"a"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '' '{"an_anchor_github_has_yet_to_invent":"b"}')]"
   run_watch 0,0,0
   assert_not_contains "$WATCH_OUT" "id=900+901" \
     "a field this script has never heard of is identifying by default"
   # The control the deny-list rests on: two threads differing ONLY in the fields that must differ
   # between two posts of one finding still fold — or the fold would never fire on a real pair.
   reset_fixture
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"node_id":"A","url":"u/900","html_url":"h/900","pull_request_url":"p","pull_request_review_id":11,"created_at":"2026-09-01T00:00:01Z","updated_at":"2026-09-01T00:00:01Z","reactions":{"url":"r/900"},"_links":{"self":{"href":"s/900"}}}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"node_id":"B","url":"u/901","html_url":"h/901","pull_request_url":"p","pull_request_review_id":12,"created_at":"2026-09-01T00:00:02Z","updated_at":"2026-09-01T00:00:02Z","reactions":{"url":"r/901"},"_links":{"self":{"href":"s/901"}}}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '' '{"node_id":"A","url":"u/900","html_url":"h/900","pull_request_url":"p","pull_request_review_id":11,"created_at":"2026-09-01T00:00:01Z","updated_at":"2026-09-01T00:00:01Z","reactions":{"url":"r/900"},"_links":{"self":{"href":"s/900"}}}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '' '{"node_id":"B","url":"u/901","html_url":"h/901","pull_request_url":"p","pull_request_review_id":12,"created_at":"2026-09-01T00:00:02Z","updated_at":"2026-09-01T00:00:02Z","reactions":{"url":"r/901"},"_links":{"self":{"href":"s/901"}}}')]"
   run_watch 0,0,0
   assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:3" \
     "ids, urls, timestamps, reactions, links and the per-comment review id are not the finding"
@@ -935,7 +917,7 @@ test_the_anchor_fields_that_keep_two_rows_apart_are_on_the_line() {
   local same="the same text at two anchors"
   # A deletion and an addition at one line. RIGHT is where every other row is and prints nothing.
   reset_fixture
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"side":"RIGHT"}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '' '{"side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '' '{"side":"RIGHT"}')]"
   run_watch 0,0,0
   assert_not_contains "$WATCH_OUT" "id=900+901" "two sides are two findings, as the key already had it"
   assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:3 side=LEFT commit=${H2:0:7}" \
@@ -946,7 +928,7 @@ test_the_anchor_fields_that_keep_two_rows_apart_are_on_the_line() {
     "two entries the fold kept apart read as two places, the id aside"
   # A multi-line anchor and a single line at its end: two places, two renderings.
   reset_fixture
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"RIGHT","side":"RIGHT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"side":"RIGHT"}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '' '{"start_line":1,"start_side":"RIGHT","side":"RIGHT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '' '{"side":"RIGHT"}')]"
   run_watch 0,0,0
   assert_not_contains "$WATCH_OUT" "id=900+901" "a range and a line are two findings"
   assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:1-3 commit=${H2:0:7}" \
@@ -957,7 +939,7 @@ test_the_anchor_fields_that_keep_two_rows_apart_are_on_the_line() {
   # A range whose ends are on different sides. The end's side is the default and says nothing, so
   # the start's is named: `start_side` prints exactly when it differs from the side of the end.
   reset_fixture
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"LEFT","side":"RIGHT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"LEFT","side":"LEFT"}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '' '{"start_line":1,"start_side":"LEFT","side":"RIGHT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '' '{"start_line":1,"start_side":"LEFT","side":"LEFT"}')]"
   run_watch 0,0,0
   assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:1-3 start_side=LEFT commit=${H2:0:7}" \
     "a range from the deletion side to the addition side names the end that is not the default"
@@ -968,7 +950,7 @@ test_the_anchor_fields_that_keep_two_rows_apart_are_on_the_line() {
   # the branch advances while the `original_*` pair stays where the reviewer wrote it, and the
   # key holds both — so two findings written at different places can sit at one place today.
   reset_fixture
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 40 '{"start_line":36,"original_line":34,"original_start_line":30}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 40 '{"start_line":36,"original_line":34,"original_start_line":32}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 40 34 '{"start_line":36,"original_start_line":30}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 40 34 '{"start_line":36,"original_start_line":32}')]"
   run_watch 0,0,0
   assert_not_contains "$WATCH_OUT" "id=900+901" "two anchors as written are two findings"
   assert_contains "$WATCH_OUT" "--- inline id=900 a.sh:36-40 was=30-34 commit=${H2:0:7}" \
@@ -1002,7 +984,7 @@ test_the_anchor_fields_that_keep_two_rows_apart_are_on_the_line() {
   # and the folded entry prints that anchor once. Without it these cases would pass on a header
   # that had simply started printing the id of every thread separately.
   reset_fixture
-  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"LEFT","side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '{"start_line":1,"start_side":"LEFT","side":"LEFT"}')]"
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" "$same" a.sh 3 '' '{"start_line":1,"start_side":"LEFT","side":"LEFT"}'),$(inline_comment 901 "$H2" "$H2" "$same" a.sh 3 '' '{"start_line":1,"start_side":"LEFT","side":"LEFT"}')]"
   run_watch 0,0,0
   assert_contains "$WATCH_OUT" "--- inline id=900+901 a.sh:1-3 side=LEFT commit=${H2:0:7}" \
     "one anchor in every field is one finding and one reply"

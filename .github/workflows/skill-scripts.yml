@@ -263,6 +263,8 @@ jobs:
         run: ship-pr/scripts/test-pr-review-reply.sh
       - name: Exercise the plain retry's classification and the run await's addressing
         run: ship-pr/scripts/test-pr-review-retry.sh
+      - name: Exercise the live-API contract's own logic against a fixture world
+        run: ship-pr/scripts/test-pr-review-api-contract.sh
 
   pr-review-hostile:
     name: pr-review fixtures, hostile runner (ubuntu)
@@ -452,6 +454,9 @@ jobs:
       - name: pr-review fixtures, the plain retry and the run await
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/test-pr-review-retry.sh || { echo '::error title=macOS suite failed::test-pr-review-retry.sh'; exit 1; }
+      - name: pr-review fixtures, the live-API contract's own logic
+        if: ${{ !cancelled() }}
+        run: ship-pr/scripts/test-pr-review-api-contract.sh || { echo '::error title=macOS suite failed::test-pr-review-api-contract.sh'; exit 1; }
       - name: post-merge cleanup
         if: ${{ !cancelled() }}
         # The per-case logs go OUTSIDE the checkout, as on the Ubuntu leg. The fleet launcher
