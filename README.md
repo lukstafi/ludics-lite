@@ -234,8 +234,8 @@ came later, on 2026-09-18: while one lock said both things, the sweep routine's 
 step 1 reserved the boxes against its own sweep in step 2, and three backends went uncovered.
 
 That interlock spans two repositories with nothing enforcing it: the sweep takes the lane lock
-itself and neither side reads anything from the other, so four facts stay equal by hand — the
-directory, the `<box>.lock` name, the box name the sweep derives from an ssh alias, and a negative
+itself, reading only which box an ssh alias belongs to from `wake-lab.sh endpoint-map`, so four
+facts stay equal by hand — the directory, the `<box>.lock` name, the box name that lookup yields, and a negative
 one, that the sweep must never take or honour the **hold** lock. The first three fail open (the two
 sides quietly stop meeting and the interlock is gone) and the fourth fails closed (a held box can
 no longer sweep itself). `test-wake-lab.sh` compares all four against the sweep's own code. It

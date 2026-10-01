@@ -2507,11 +2507,11 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-
 # --- the lock contract with the ocannl sweep, compared across the two repositories ---------------
 # Every case above pins this side against a literal; none of them compares the two sides, and the
 # interlock is an agreement between two repositories that nothing enforces. This script refuses to
-# destroy a box whose lock is held, ocannl-staging's `tools/sweep.sh` takes that lock, and neither
-# reads anything from the other -- deliberately, so that a sweep checkout on a box with no
-# `~/bin/wake-lab.sh` still reserves correctly. Three facts therefore have to stay equal by hand:
-# the directory, the `<box>.lock` filename, and the box NAME the sweep derives from an ssh alias in
-# its own `lab_box_of`. Every way they drift is silent in the safe-looking direction -- the two
+# destroy a box whose lock is held, and ocannl-staging's `tools/sweep.sh` takes that lock itself.
+# Which box an ssh alias reserves the sweep reads from this repository (its `lab_box_of` looks the
+# alias up in `wake-lab.sh endpoint-map`'s answer, staging ac1dbc153); the rest it holds by hand, so
+# three facts have to stay equal: the directory, the `<box>.lock` filename, and the box NAME that
+# lookup yields. Every way they drift is silent in the safe-looking direction -- the two
 # sides simply stop meeting, this script finds no lock, and a restart destroys a VM mid-sweep. That
 # is the 2026-09-16 incident, which was read as a GPU fault for two days (ludics-lite#170).
 #
@@ -2537,7 +2537,10 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-
 # The anchors are REQUIRED to match exactly once, so a rename fails loudly instead of leaving the
 # check quietly examining nothing (ludics-lite#188). Two of them are the lane's call site: nothing
 # short of running a sweep can execute it, so that it still composes `lab_box_of` with
-# `take_lab_lock` is held as a required core rather than proven. The staging checkout is read
+# `take_lab_lock` is held as a required core rather than proven. Three more are the same for the
+# map lab_box_of reads: this suite fills LAB_MAP from `endpoint-map` itself (sweep_lock), so that
+# the sweep still defines `lab_map`, fills LAB_MAP in it from `"$WAKE_LAB" endpoint-map`, and calls
+# it at startup is held as a required core too, not exercised. The staging checkout is read
 # strictly read-only: `git show` of a ref, never a branch, a fetch or a write.
 STAGING=${OCANNL_STAGING:-$HOME/ocannl-staging}
 created() { # created <dir> -- every regular file under it, relative and shell-quoted, one line
@@ -2546,21 +2549,169 @@ created() { # created <dir> -- every regular file under it, relative and shell-q
     < <(find "$1" -type f -print0 2>/dev/null)
   printf '%s' "${out# }"
 }
-# take_lab_lock's own wait is LAB_LOCK_WAIT, which is not among the lines extracted below; give it
-# a small explicit value rather than letting it be unset, so a contended case fails in seconds and
-# nothing depends on how the shell reads an empty arithmetic operand. A subshell rather than an
-# `env` argument list, because the lock directory has to be genuinely UNSET for the default-path
-# cases and an empty array expansion is an error under `set -u` on bash 3.2.
+# What the fragment copied out of the sweep runs with, and ALL it runs with: sweep_env builds the
+# environment of every run of it from exactly these names, and the run starts from `env -i`, so
+# nothing ambient reaches it -- neither a variable of this suite's shell nor one a child process
+# (`perl`, `date`) would read from its environment.
+#   PATH                     this suite's, shims included
+#   HOME, WAKE_LAB_LOCK_DIR  the inputs of the fragment's LAB_LOCK_DIR line, set (or left unset)
+#                            per case
+#   LAB_LOCK_WAIT            take_lab_lock's wait: small, so a contended case fails in seconds
+#   LAB_MAP                  lab_box_of's table, which the sweep's lab_map fills from
+#                            `wake-lab.sh endpoint-map`; SWEEP_MAP is this checkout's answer to it
+#   stamp                    the run stamp take_lab_lock writes into its advisory holder line
+# And it runs under `set -uo pipefail`, the sweep's own options (an anchor below holds the sweep
+# to that line), so a read of
+# anything else on a path a case executes is `<name>: unbound variable` on the holder's stderr,
+# which sweep_hold_stop reports by name -- whether it is read plainly, behind a branch that did
+# not run, through an arithmetic value, in a subshell or in a command substitution, since bash
+# itself decides. That is what this suite missed when lab_box_of came to read LAB_MAP: the copy did
+# not carry it, the box resolved empty, and five cases reported that as the two repositories
+# disagreeing (ludics-lite#469). Out of bounds: a read on a path no case executes, which cannot
+# change what a case reports, and a child process reading its environment itself (`printenv`, a
+# perl `%ENV`, `date`'s TZ), which sees only the names above. The reads `set -u` lets through
+# unset are fragment_defaulted's.
+SWEEP_MAP=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" "$WL" endpoint-map 2>&1); sweep_map_rc=$?
+sweep_env() { # sweep_env <lock-dir|-> <home> -- sets SWEEP_ENV, the `env -i` arguments of a run
+  SWEEP_ENV=(PATH="$PATH" HOME="$2" LAB_LOCK_WAIT=2 LAB_MAP="$SWEEP_MAP" stamp=test-wake-lab)
+  [ "$1" = - ] || SWEEP_ENV+=(WAKE_LAB_LOCK_DIR="$1")
+}
+# The variables bash itself defines in that clean environment, asked of the bash that runs the
+# fragment: `env -i` cannot make them unset, and some it takes from the environment when the sweep
+# has one (SHELL, PWD, SHLVL, TERM) or from whatever its caller ran last (PIPESTATUS, REPLY,
+# BASH_REMATCH), so a read of one is a read set -u cannot see. Asked from inside a function, after
+# a pipeline, a `[[ =~ ]]`, a bare `read` and, on bash 4 and later, a `mapfile` and a `coproc`, since
+# bash creates those variables only when something first sets them.
+SWEEP_SHELL_VARS=()
+while IFS= read -r v; do SWEEP_SHELL_VARS+=("$v"); done \
+  < <(env -i PATH="$PATH" bash -c 'probe() {
+        true | true; [[ a =~ a ]]; read -r <<<x
+        if [ "${BASH_VERSINFO[0]}" -ge 4 ]; then mapfile -t <<<x; eval "coproc { :; }; wait"; fi
+        compgen -v
+      }; probe' 2>/dev/null)
+# fragment_defaulted <fragment> <bound-name...> -- <bash-variable...> -- each name the fragment
+# reads in a form `set -u` lets through unset and that is not bound, one per line, and
+# `refused <construct>` for what would blind the run. The forms, as a closed list: `${name-w}` and
+# `${name:-w}`, the same with `=`, `+` and `?`, on a name or an array element; a whole-array
+# `${name[@]}` or `${name[*]}` (`#` or not), which bash 4.4 and later expand to nothing when unset
+# even under `set -u`; every `-v name` set test, wherever it sits in the test (after whitespace,
+# `(`, `!`, `&&` or `||`, spaced or not); and any mention of a
+# bash variable, as a whole word, since bash defines it even under `env -i`. Each would quietly
+# take a value or a branch where the sweep had another, which is ludics-lite#469's shape again
+# with the error swallowed. SECONDS is bound by the callers, being bash's own clock in any
+# environment. It reads logical lines, a backslash-newline joined first, as bash parses them.
+# Refused outright: `${!`, whose target no reader of the text can name; a `-v` whose
+# operand is neither a bare name nor an awk-style `name=value` (quoted, or computed); anything that
+# could turn `set -u` off -- a `set` given a `+` option or a computed argument, or any mention of
+# `nounset`; and code the text does not show, `eval`, `source` and a `.` command. It reads the
+# whole fragment text, comments and quoted spans included, so an occurrence is over-reported, never
+# missed -- a whole-array read of the fragment's own `local` array included, which is loud. Out of
+# bounds: anything else that asks whether a name is set (`declare -p`, `compgen -v`); a nounset
+# failure the fragment itself silences and recovers from (`( ... ) 2>/dev/null || fallback`); and
+# the process the fragment runs in, as opposed to its variables -- `$0`, `$$`, `$?` on entry, the
+# working directory, umask and open descriptors are this suite's, not the sweep's; and a command
+# word assembled from quoted pieces (`s''et +u`). This is a tripwire for a copied function that
+# quietly gains an input, the drift ludics-lite#469 met, not a sandbox for code written to evade it.
+fragment_defaulted() {
+  perl -e '
+    my ($file, @rest) = @ARGV;
+    my (@bound, @shell);
+    my $into = \@bound;
+    for (@rest) { if ($_ eq "--") { $into = \@shell } else { push @$into, $_ } }
+    my %ok = map { $_ => 1 } @bound;
+    my $shell = join "|", map { quotemeta } grep { !$ok{$_} } @shell;
+    my %seen;
+    my $id = qr/[A-Za-z_][A-Za-z0-9_]*/;
+    open my $fh, "<", $file or die "$file: $!\n";
+    my $text = do { local $/; <$fh> };
+    close $fh or die "$file: $!\n";
+    # Logical lines, as bash reads them: a backslash-newline is removed before parsing.
+    $text =~ s/\\\n//g;
+    for (split /\n/, $text) {
+      my @refused;
+      push @refused, "\${!" if /\$\{!/;
+      push @refused, $1 while /\b(set[ \t][^\n;|&]*?[+\$][^\n;|&]*?)[ \t]*(?=$|[;|&}])/g;
+      push @refused, "nounset" if /\bnounset\b/;
+      push @refused, $1 while /(?<![\w.-])(eval|source)(?![\w-])/g;
+      push @refused, "." if /(?:^|[;&|{(]|\b(?:then|do|else))[ \t]*\.[ \t]/;
+      my @names = (/\$\{($id)(?:\[[^\]]*\])?:?[-=+?]/g, /\$\{#?($id)\[[@*]\]/g);
+      push @names, /(?<!\w)($shell)(?!\w)/g if $shell ne "";
+      for my $v (/(?:^|[\s(!&|])-v[ \t]+([^\s\]]+)/g) {
+        next if $v =~ /^$id=/;
+        if ($v =~ /^$id$/) { push @names, $v } else { push @refused, "-v $v" }
+      }
+      for (@refused) { print "refused $_\n" unless $seen{"refused $_"}++ }
+      for my $n (@names) { print "$n\n" unless $ok{$n} || $seen{$n}++ }
+    }' "$@"
+}
+# The negative control, which needs no staging checkout and so runs in CI too: a check that cannot
+# fail proves nothing. Each planted_* reads one name nothing binds, in a way the copy step's old
+# anchors could not see, and must be reported by name; planted_bound reads only what sweep_env
+# binds and must run clean. The text check must report exactly the defaulted, indirect, `-v`,
+# whole-array and bash-variable reads and the refusals, and neither awk's `-v a=` nor SECONDS.
+cat >"$TMP/planted-fragment.sh" <<'EOF'
+PLANTED_TOP=${PLANTED_DEFAULTED:-fallback}
+planted_plain() { printf '%s\n' "$LAB_MAP $PLANTED_PLAIN"; }
+planted_branch() { false && PLANTED_BRANCH=1; printf '%s\n' "$PLANTED_BRANCH"; }
+planted_arith() { local n=PLANTED_ARITH; printf '%s\n' "$((n + 1))"; }
+planted_subst() { printf '%s\n' "$(printf '%s' "$PLANTED_SUBST")"; }
+planted_bound() { local box=$1; printf '%s\n' "$LAB_MAP $stamp $HOME ${box:0:1} $((SECONDS + LAB_LOCK_WAIT))"; }
+planted_indirect() { local r=LAB_MAP; printf '%s\n' "${!r}"; }
+planted_tested() { [ -v PLANTED_TESTED ] && printf '%s\n' set; }
+planted_awk() { awk -v a="$1" '{ print a }' </dev/null; }
+planted_array() { printf '%s\n' "${PLANTED_ARRAY[@]}"; }
+planted_unguarded() { set +u; }
+planted_computed() { [ -v "$PLANTED_NAME" ] && printf '%s\n' set; }
+planted_compound() { [ -n "$LAB_MAP" -a -v PLANTED_COMPOUND ] && printf '%s\n' set; }
+planted_shell() { [ "$SHELL" = /bin/zsh ] && printf '%s\n' zsh; }
+planted_status() { [ "${PIPESTATUS[0]}" = 1 ] && printf '%s\n' failed; }
+planted_optset() { local o=u; set +$o; }
+planted_eval() { eval "$PLANTED_CODE"; }
+planted_continued() {
+  set \
+-o pipefail +u
+}
+EOF
+sweep_env "$LOCKS" "$TMP/sweep-home-planted"
+for planted in plain branch arith subst; do
+  name=PLANTED_$(printf '%s' "$planted" | tr '[:lower:]' '[:upper:]')
+  out=$(env -i "${SWEEP_ENV[@]}" bash -uo pipefail -c '. "$1"; "$2"' _ "$TMP/planted-fragment.sh" \
+    "planted_$planted" 2>&1)
+  grep -q "$name: unbound variable" <<<"$out" \
+    && ok "a planted fragment reading $name (planted_$planted) is reported by name" \
+    || ko "a planted fragment's unbound read in planted_$planted went unreported -- $out"
+done
+out=$(env -i "${SWEEP_ENV[@]}" bash -uo pipefail -c '. "$1"; planted_bound rog' _ "$TMP/planted-fragment.sh" 2>&1)
+rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'unbound variable' <<<"$out" \
+  && ok "...while one reading only what sweep_env binds runs clean (rc=$rc)" \
+  || ko "a planted fragment reading only bound names failed under sweep_env (rc=$rc) -- $out"
+sweep_env "$LOCKS" "$HOME"
+if out=$(fragment_defaulted "$TMP/planted-fragment.sh" "${SWEEP_ENV[@]%%=*}" SECONDS -- \
+           ${SWEEP_SHELL_VARS[@]+"${SWEEP_SHELL_VARS[@]}"}); then
+  want=$(printf '%s\n' PLANTED_DEFAULTED 'refused ${!' PLANTED_TESTED PLANTED_ARRAY \
+    'refused set +u' 'refused -v "$PLANTED_NAME"' PLANTED_COMPOUND SHELL PIPESTATUS \
+    'refused set +$o' 'refused eval' 'refused set -o pipefail +u')
+  [ "$out" = "$want" ] \
+    && ok "the text check reports exactly the planted reads set -u lets through unset" \
+    || ko "the text check is off on the planted fragment -- want [$want], got [$out]"
+else
+  ko "the text check did not run on the planted fragment -- $out"
+fi
+# ...and a `-v` behind an unspaced `||`, which bash 3.2 cannot even parse inside `[[ ]]`, so it is
+# planted as text the check reads but nothing sources.
+printf '%s\n' '[[ -z x||-v PLANTED_UNSPACED ]]' >"$TMP/planted-text.sh"
+out=$(fragment_defaulted "$TMP/planted-text.sh" "${SWEEP_ENV[@]%%=*}")
+[ "$out" = PLANTED_UNSPACED ] \
+  && ok "...including a -v set test behind an unspaced ||" \
+  || ko "the text check missed a -v set test behind an unspaced || -- got [$out]"
 # With <ready> and <keep>, the lock is HELD until <keep> is removed, and the waiting happens inside
 # the very shell that took it: take_lab_lock's flock belongs to the open file description behind
 # its fd 8, so it dies with that shell. A wait wrapped AROUND this function holds nothing -- which
 # is not a hypothetical, it is what the first draft of the end-to-end case below did, and it failed
 # against a correct sweep because the lock was already gone by the time wake-lab looked.
 sweep_lock() { # sweep_lock <lock-dir|-> <home> <ssh-alias> [<ready> <keep>]
-  ( if [ "$1" = - ]; then unset WAKE_LAB_LOCK_DIR
-    else WAKE_LAB_LOCK_DIR=$1; export WAKE_LAB_LOCK_DIR; fi
-    HOME=$2; export HOME
-    LAB_LOCK_WAIT=2; export LAB_LOCK_WAIT
+  ( sweep_env "$1" "$2"
     # Its OWN process group, so the watchdog below can kill the whole tree. Killing the wrapper
     # alone leaves whatever it was blocked in -- a `sleep`, a blocking flock -- orphaned WITH the
     # inherited lock descriptor, and an flock lives until every descriptor onto that open file
@@ -2572,15 +2723,15 @@ sweep_lock() { # sweep_lock <lock-dir|-> <home> <ssh-alias> [<ready> <keep>]
     # many levels of subshell survive between them is a bash optimization, not a contract. The
     # first draft killed `-$!`, that named no group, the kill was a no-op and the `wait` behind it
     # never returned -- the suite wedged for 20 minutes. So the leader writes its own pgid down.
-    exec perl -e 'setpgrp(0,0);
+    exec env -i "${SWEEP_ENV[@]}" perl -e 'setpgrp(0,0);
                   open my $fh, ">", $ARGV[0] or die $!; print $fh "$$\n"; close $fh;
                   shift @ARGV; exec @ARGV or die $!' \
       "$TMP/sweep-pgid" \
-      bash -c '. "$1" || exit 2
-               take_lab_lock "$(lab_box_of "$2")" || exit 1
-               [ -n "$3" ] || exit 0
-               : > "$3"
-               while [ -e "$4" ]; do sleep 1; done' \
+      bash -uo pipefail -c '. "$1" || exit 2
+                take_lab_lock "$(lab_box_of "$2")" || exit 1
+                [ -n "$3" ] || exit 0
+                : > "$3"
+                while [ -e "$4" ]; do sleep 1; done' \
       _ "$TMP/sweep-lock.sh" "$3" "${4:-}" "${5:-}" )
 }
 # EVERY call into that imported helper goes through these two, so every one of them runs in the
@@ -2622,6 +2773,11 @@ sweep_hold_stop() { # sweep_hold_stop -- let the holder go, and do not return un
   # ON PURPOSE across this call, so waiting on it would burn the whole deadline every single run.
   deadline=$((SECONDS + 15))
   while ! file_free "$LOCKS/rog.lock" && [ "$SECONDS" -lt "$deadline" ]; do sleep 1; done
+  # The fragment ran under set -u (sweep_env): a name it read that nothing bound is on its stderr.
+  ! grep -q 'unbound variable' "$TMP/sweep-holder.log" 2>/dev/null \
+    || ko "the fragment copied out of origin/master's sweep read a variable this suite does not \
+bind, so the case around this ran it on an input nobody set (ludics-lite#469) -- bind it in \
+sweep_env, or copy its definition: $(grep 'unbound variable' "$TMP/sweep-holder.log" | tr '\n' ';')"
 }
 if ! git -C "$STAGING" rev-parse --git-dir >/dev/null 2>&1; then
   skip "the cross-repository lock contract is UNCHECKED: no ocannl-staging git checkout at \
@@ -2634,17 +2790,44 @@ else
   SWEEP=$TMP/sweep-master.sh
   anchors=1
   for anchor in '^LAB_LOCK_DIR=' '^lab_box_of() {' '^take_lab_lock() {' \
-                '^[[:space:]]*lab_box=\$(lab_box_of ' '^[[:space:]]*take_lab_lock "\$lab_box"'; do
+                '^[[:space:]]*lab_box=\$(lab_box_of ' '^[[:space:]]*take_lab_lock "\$lab_box"' \
+                '^lab_map() {' '^[[:space:]]*ask_capped LAB_MAP [0-9][0-9]* "\$WAKE_LAB" endpoint-map' \
+                '[[:space:]{;]lab_map[;[:space:]]' '^set -uo pipefail$'; do
     n=$(grep -c -- "$anchor" "$SWEEP")
     [ "$n" -eq 1 ] || { anchors=0
       ko "origin/master's sweep has $n lines matching /$anchor/, not 1 -- the lane no longer takes \
-its lock the way the cases below assume, so they would stop being about the live sweep"; }
+its lock, fills the map it reads or sets its shell options the way the cases below assume, so \
+they would stop being about the live sweep"; }
   done
   if [ "$anchors" -eq 1 ]; then
     { grep '^LAB_LOCK_DIR=' "$SWEEP"
       sed -n '/^lab_box_of() {/,/^}/p' "$SWEEP"
       sed -n '/^take_lab_lock() {/,/^}/p' "$SWEEP"
     } >"$TMP/sweep-lock.sh"
+    # The reads set -u lets through unset, before anything runs. The check's own status first:
+    # one that died before printing would otherwise read as a fragment with nothing to report.
+    sweep_env "$LOCKS" "$HOME"
+    if [ "${#SWEEP_SHELL_VARS[@]}" -eq 0 ]; then
+      anchors=0
+      ko "the bash that runs the fragment listed no variables of its own (compgen -v), so the text \
+check could not tell which reads of them set -u would let through"
+    elif ! defaulted=$(fragment_defaulted "$TMP/sweep-lock.sh" "${SWEEP_ENV[@]%%=*}" SECONDS -- \
+                         "${SWEEP_SHELL_VARS[@]}" 2>&1); then
+      anchors=0
+      ko "the text check over the fragment copied out of origin/master's sweep did not run to \
+completion, so nothing says which names it reads past set -u -- ${defaulted//$'\n'/; }"
+    elif [ -n "$defaulted" ]; then
+      anchors=0
+      ko "the fragment copied out of origin/master's sweep asks whether names are set that this \
+suite does not bind, which set -u cannot catch, so the cases below would quietly run on the \
+fallback (ludics-lite#469) -- bind it in sweep_env, or copy its definition: ${defaulted//$'\n'/; }"
+    elif [ "$sweep_map_rc" -ne 0 ] || [ -z "$SWEEP_MAP" ]; then
+      anchors=0
+      ko "wake-lab endpoint-map gave no map for the sweep's lab_box_of (rc=$sweep_map_rc) -- \
+$SWEEP_MAP"
+    fi
+  fi
+  if [ "$anchors" -eq 1 ]; then
     for pair in rog-nv-wsl:rog minix-amd-wsl:minix; do
       sshalias=${pair%%:*}; box=${pair##*:}
       # A HOME of its own per box: the sweep derives its directory from $HOME, so this keeps the
