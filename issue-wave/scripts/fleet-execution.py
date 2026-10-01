@@ -3,7 +3,7 @@
 This records cooperative ownership; it neither launches nor supervises processes.
 
 Argv: <state root> <action> <coordinator> <lease token> <json payload> <FLEET_BOXES>
-      [<FLEET_BOX_CORRECTNESS_SLOTS> [<endpoint map>]]
+      [<FLEET_BOX_CORRECTNESS_SLOTS> [<endpoint map> [<anchor> <lab host>]]]
 
 Ownership per execution host (ludics-lite#157): a `measurement` assignment is exclusive -- it
 refuses while anything else is outstanding on the box, and everything refuses while it is. A
@@ -48,8 +48,21 @@ EXCLUSIVE before it reads this registry too, so neither can slip between this ch
 it guards. What it reads, and nothing else: the box is the endpoint map row naming the execution
 host (the map argument above; a host on no row, or no map at all, is not a lab box and has no lane
 lock), and the lock directory is THIS process's -- WAKE_LAB_LOCK_DIR, else
-~/.local/state/wake-lab, the default wake-lab.sh and the sweep share -- so it is the lab's only
-because the anchor is the machine that runs wake-lab.sh and the sweep (mac-studio). The box's HOLD
+~/.local/state/wake-lab, the default wake-lab.sh and the sweep share. That directory is the lab's
+only on the machine that runs wake-lab.sh and the sweep; anywhere else it holds no lane's lock and
+every measurement would pass. So before reading it, a measurement on a lab box verifies that this
+anchor is that machine, and refuses naming both when it is not (ludics-lite#454). Two facts, and
+nothing else: the anchor's fleet name and the lab host's (the last two arguments, FLEET_ANCHOR and
+FLEET_LAB_HOST as fleet-worker resolves them) are one name up to case, which catches an anchor
+moved without the lab or a lab moved and declared; and the wake-lab site file -- WAKE_LAB_HOSTS,
+else ~/.config/wake-lab/hosts.sh, what wake-lab.sh refuses to drive the lab without -- is a
+readable file here, which catches a declaration naming a machine that cannot drive the lab. It
+resolves no alias, reads none of the file's contents, and cannot see a sweep moved to another
+box that has a site file of its own but was never declared: the declaration is that fact's only
+source. Absent identity arguments refuse. WAKE_LAB_LOCK_DIR and WAKE_LAB_HOSTS are read from THIS
+process's environment -- the anchor's, as its own wake-lab.sh and sweep would see them -- and never
+forwarded from the coordinator's: a coordinator's path names a file on the coordinator's machine. A
+custom path is set where the anchor's non-interactive ssh shell reads it. The box's HOLD
 lock is not read: a hold keeps a VM alive and says nothing about who works there. A lock file that
 cannot be created or opened is free, as wake-lab.sh treats it (no lane can hold what it cannot open:
 the sweep fails such a lane rather than running it); one that opens but cannot be probed refuses.
@@ -191,11 +204,29 @@ def check_one_entry_per_box(roster, map_spec):
 LANE_LOCKS = []   # lane-lock descriptors held SHARED until this process exits (see the header)
 
 
-def check_lane_lock(host, map_spec):
+def check_lab_host(host, box, anchor, lab):
+    """Refuse unless this anchor is the machine whose lock directory holds the lab's lane locks."""
+    if not anchor or not lab:
+        refuse(f"{host} is lab box {box}, and the anchor's and lab host's names were not passed, so this "
+               f"anchor cannot be shown to hold the lab's lane locks")
+    if anchor.casefold() != lab.casefold():
+        refuse(f"{host} is lab box {box}, whose lane lock is a flock on the lab host {lab} (FLEET_LAB_HOST), "
+               f"but this registry, on the anchor {anchor} (FLEET_ANCHOR), reads {anchor}'s lock directory, "
+               f"so a running lane could not be seen: the anchor must be the machine that runs "
+               f"wake-lab.sh and the sweep, and FLEET_LAB_HOST names that machine")
+    site = Path(os.environ.get("WAKE_LAB_HOSTS") or Path.home() / ".config/wake-lab/hosts.sh")
+    if not (site.is_file() and os.access(site, os.R_OK)):
+        refuse(f"{host} is lab box {box}, and the anchor {anchor}, declared the lab host, has no readable "
+               f"wake-lab site file ({site}), so it cannot be the machine whose wake-lab.sh drives the "
+               f"lab and holds its lane locks: a running lane could not be seen")
+
+
+def check_lane_lock(host, map_spec, anchor, lab):
     """Refuse a measurement on a box whose lab LANE lock is held; hold it shared if free."""
     box = endpoint_boxes(map_spec).get(host.casefold())
     if box is None:
         return
+    check_lab_host(host, box, anchor, lab)
     directory = Path(os.environ.get("WAKE_LAB_LOCK_DIR") or Path.home() / ".local/state/wake-lab")
     path = directory / (box + ".lock")
     try:
@@ -251,6 +282,7 @@ def main():
     root, action, coordinator, token, raw, boxes = sys.argv[1:7]
     slots_spec = sys.argv[7] if len(sys.argv) > 7 else ""
     map_spec = sys.argv[8] if len(sys.argv) > 8 else ""
+    anchor, lab = (sys.argv[9:11] + ["", ""])[:2]
     directory = Path(root) / "executions"
     # A corrupt record blocks dispatch instead of silently making its box available.
     records = {}
@@ -332,14 +364,14 @@ def main():
                 refuse("adopted assignment must be reconciled before dispatch")
             # The dispatch step, rechecked: a reservation can wait hours for its launch.
             if record["request"]["kind"] == "measurement":
-                check_lane_lock(record["request"]["execution_host"], map_spec)
+                check_lane_lock(record["request"]["execution_host"], map_spec, anchor, lab)
         else:
             halted = halt_identity is not None
             if "triage_reason" in request and not halted:
                 refuse("triage reservations require an active halt")
             check_capacity(request, records, canonical_hosts, slots_spec)
             if request["kind"] == "measurement":
-                check_lane_lock(request["execution_host"], map_spec)
+                check_lane_lock(request["execution_host"], map_spec, anchor, lab)
             if halted:
                 if "triage_reason" not in request:
                     refuse("fleet halted; ordinary reservations refused (only the named triage_reason reservation is admitted)")
@@ -398,7 +430,7 @@ def main():
             # Rechecked at dispatch, the moment the timed work starts: a reservation can wait hours
             # for its launch, and a lane harness that reads no registry can take the box meanwhile.
             if record["request"]["kind"] == "measurement":
-                check_lane_lock(record["request"]["execution_host"], map_spec)
+                check_lane_lock(record["request"]["execution_host"], map_spec, anchor, lab)
             state = "launching"
         elif action == "record":
             if record["state"] not in {"launching", "running", "uncertain"}:
