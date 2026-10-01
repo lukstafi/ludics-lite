@@ -15,7 +15,8 @@
 #
 # The fixture transport is test-pr-review-base-lib.sh, shared with the red-report and settle
 # suites (ludics-lite#179). Three cases here are on the clock, and the idiom that keeps them
-# honest — `spend_grace`, `at_round`, `rounds_polled` — is written down in that file's header.
+# honest — `spend_grace`, `at_round` and `runs_from_round`, `rounds_polled`, a wait ended by an
+# event under `EVENT_CEILING` — is written down in that file's header.
 
 set -euo pipefail
 
@@ -65,6 +66,10 @@ test_a_red_at_the_tip_ends_the_wait_at_once() {
 # push landing between the round's tip read and this check turns the red into an OLDER tip's red,
 # which is exactly the shape the wait exists to keep waiting on. Breaking anyway would report RED
 # for a commit that has no verdict yet and send the caller fixing a fix already in flight.
+#
+# The wait is ENDED by the successor's own verdict on round three, not by a ceiling (#375): a
+# ceiling sized to land after round one can land inside it on a slow runner, and then the headline
+# is round one's, about the tip that moved.
 test_the_red_break_reconfirms_the_tip() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" \
@@ -72,67 +77,74 @@ test_the_red_break_reconfirms_the_tip() {
       {conclusion:"failure", head_sha:$c, id:6021},
       {conclusion:"success", head_sha:$a, id:6020}]')")
   # The round reads SHA_C and sees its red; the re-confirm, after that round's own reads, gets
-  # the successor.
+  # the successor. Round two waits on the successor's run, and round three reads its verdict.
   at_round 1 "$SHA_B"
-  # The ceiling is roomy on purpose: this case is about the headline round TWO writes, and the
-  # grace cannot settle anything here, so the only thing a short ceiling could do is end the wait
-  # inside round one on a loaded machine (#169, round 2).
-  run_base --wait=6
-  assert_eq "$BASE_RC" 4 "the red belongs to a tip that moved, so the successor has no verdict yet"
-  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_B:0:8}" \
-    "the refusal should be about the tip that is actually there"
+  runs_from_round 3 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[{conclusion:"success", head_sha:$b, id:6022},
+      {conclusion:"failure", head_sha:$c, id:6021},
+      {conclusion:"success", head_sha:$a, id:6020}]')"
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "the red belonged to a tip that moved, and the successor's own run judged it ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_B:0:8})" \
+    "the verdict is the successor's, from its own run"
   assert_not_contains "$BASE_OUTPUT" "is RED" \
     "a red under a moved tip must not headline as the tip's own verdict"
-  assert_contains "$BASE_OUTPUT" "RED      ci — failure at ${SHA_C:0:8}" \
-    "the older red stays visible in the per-workflow lines under the honest headline"
-  assert_contains "$BASE_OUTPUT" "(ci is running now at ${SHA_B:0:8})" \
-    "and the run that will judge the successor is named as what the wait was owed"
+  assert_eq "$(rounds_polled)" 3 \
+    "round one's red was not broken on, round two waited on the successor's run, round three read it"
 }
 
 # The green break's own re-confirm: coverage is judged against the tip read BEFORE the runs, and a
 # sibling merge landing in that window is the integration loop's ordinary traffic. Accepting the
-# coverage anyway hands out "green (tip X)" for a branch already pointing at Y.
+# coverage anyway hands out "green (tip X)" for a branch already pointing at Y. Ended, as above, by
+# the successor's own run on round two rather than by a ceiling.
 test_the_covered_break_reconfirms_the_tip() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{conclusion:"success", head_sha:$c, id:6031}]')")
   at_round 1 "$SHA_B" # everything after the round's own reads answers the successor
+  runs_from_round 2 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
+    '[{conclusion:"success", head_sha:$b, id:6032}, {conclusion:"success", head_sha:$c, id:6031}]')"
   COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" '[$b]')
   FILES_DEFAULT='[{"filename":"src/main.ml"}]' # the successor is unrecognized: nothing settles it
-  run_base --wait=6 # roomy for the same reason: the headline this pins is round two's
-  assert_eq "$BASE_RC" 4 "the successor is unjudged, and a green for its predecessor is not its verdict"
-  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_B:0:8}" "the refusal is about the tip"
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "the successor's own green is its verdict ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_B:0:8})" "and it is about the successor"
   assert_not_contains "$BASE_OUTPUT" "green (tip ${SHA_C:0:8})" \
     "the tip that moved under the round must never be broken green for"
+  assert_eq "$(rounds_polled)" 2 "round one's coverage was not broken on, and round two's was"
 }
 
 # The absence clock starts at the last time the TIP MOVED. A merge landing after the grace has
 # already elapsed would otherwise be declared integration-green on the spot — its run not yet
-# created and the timer long spent — which is a green for a commit nothing has built. The tip
-# moves here five rounds in, with the grace sized so that only a restart keeps the wait alive to
-# its ceiling.
+# created and the timer long spent — which is a green for a commit nothing has built.
+#
+# This is the idiom test-pr-review-base-lib.sh writes down: the clock in an explicit delay, the
+# event on a counted round, the wait ended by an event and not by its ceiling. The first tip read
+# answers SHA_C after a delay as long as the grace, and every read from that round's runs read on
+# answers the successor. Round one therefore cannot break — its re-confirm, whichever break
+# reaches it, sees a tip that moved — and round two is where the two clocks part. Restarted with
+# the successor, the grace is stamped by round two itself and cannot have run out in it, so the
+# settle comes on round three or later, however long a round takes. Measured from the start of the
+# wait, it ran out during the delay, and round two settles. The settle is what ends the wait, so
+# no ceiling has to be sized against a round (#375: a six-second one landed inside round one on
+# the Git Bash runner).
 test_a_tip_that_moves_mid_wait_restarts_the_grace() {
   reset_fixture
   retune ABSENT_GRACE=4 CHECKS_INTERVAL=1
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:6061}]')")
   FILES_DEFAULT='[{"filename":"src/main.ml"}]' # unrecognized: only the clock can settle this
-  # WHEN the tip moves is not left to how many rounds fit inside the grace — a round launches a
-  # fixture and several jq subprocesses, and under load four rounds where five were counted on is
-  # enough to make the move land on the wrong side of the clock (#169, round 2). This is the
-  # idiom test-pr-review-base-lib.sh writes down: the clock in an explicit delay, the event on
-  # round one, the ceiling clear of both. So: the first tip read answers SHA_C after 4s, and
-  # every read from that round's reads on answers the successor. Round one therefore cannot
-  # break — its re-confirm, whichever break reaches it, sees a tip that moved — and from round
-  # two the question is only whether the grace restarted with the successor. Restarted, the
-  # earliest possible settle is a full grace past round two and the ceiling arrives first;
-  # measured from the start of the wait, it elapsed during the delay and round two settles green.
   spend_grace 4
   at_round 1 "$SHA_B"
-  run_base --wait=6
-  assert_eq "$BASE_RC" 4 "the successor's own creation window has not run out inside this wait"
-  assert_contains "$BASE_OUTPUT" "NO VERDICT for the tip ${SHA_B:0:8}" "the refusal is about the successor"
-  assert_contains "$BASE_OUTPUT" "--wait ceiling" "the wait ended at its ceiling, not at a settle"
-  assert_not_contains "$BASE_OUTPUT" "no run for the tip appeared" \
-    "a grace that restarted with the tip cannot also have expired for it"
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "the successor's grace runs out inside the wait ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_B:0:8})" \
+    "and the settle is for the successor, the tip that is actually there"
+  assert_contains "$BASE_OUTPUT" "no run for the tip appeared" \
+    "the wait ends on the successor's own grace running out, not at its ceiling"
+  assert_not_contains "$BASE_OUTPUT" "--wait ceiling" "the ceiling is a safety net, not the event"
+  local rounds
+  rounds=$(rounds_polled)
+  [ "$rounds" -ge 3 ] ||
+    bail "a grace that restarted with the successor cannot run out on the round that restarted it (settled on round $rounds)"
 }
 
 # The `norun` ambiguity, with every OTHER workflow judged at the tip: a listed workflow with no

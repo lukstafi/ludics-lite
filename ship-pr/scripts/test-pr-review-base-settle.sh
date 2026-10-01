@@ -14,7 +14,8 @@
 #
 # The fixture transport is test-pr-review-base-lib.sh, shared with the red-report and verdict
 # suites (ludics-lite#179). Two cases here are on the clock, and the idiom that keeps them honest
-# — `spend_grace`, `at_round`, `rounds_polled` — is written down in that file's header.
+# — `spend_grace`, `at_round`, `rounds_polled`, a wait ended by an event under `EVENT_CEILING` —
+# is written down in that file's header.
 
 set -euo pipefail
 
@@ -396,7 +397,9 @@ test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence() {
 # This settle accepts a verdict about an OLDER commit, so the tip it settles for has to still be
 # the tip: a push landing between the round's tip read and the settle would otherwise be answered
 # with a green from two commits back. The branch moves right after the round's own read here, so
-# the first tip is never settled for — the successor is judged on its own.
+# the first tip is never settled for — the successor is judged on its own, on round two, which is
+# what ends the wait: the ceiling is a safety net, since a ceiling sized to land after round one
+# can land inside it on a slow runner, and the headline is then round one's (ludics-lite#375).
 test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5041}]')")
@@ -404,8 +407,12 @@ test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict() {
   # The round's tip read answers SHA_C; the re-confirm, and everything after that round's own
   # reads, answers SHA_B — as a push landing in that window would.
   at_round 1 "$SHA_B"
-  COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" '[$b]') # the successor's own one-commit range
-  run_base --wait=4
+  # One chain, the successor pushed on top of the first tip, so EACH round's compare reaches its
+  # own tip and each tip is paths-ignored: round one would settle for SHA_C but for its
+  # re-confirm. With the successor's range alone, round one's walk never reached SHA_C, and the
+  # re-confirm this case is named for was never asked (#375).
+  COMPARE_COMMITS=$(jq -cn --arg b "$SHA_B" --arg c "$SHA_C" '[$c, $b]')
+  run_base --wait="$EVENT_CEILING"
   assert_eq "$BASE_RC" 0 "the successor tip is itself paths-ignored, and settles on its own round"
   assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_B:0:8})" \
     "the settle is for the tip that is still there"
@@ -413,6 +420,7 @@ test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict() {
     "the tip that moved under the round must never be settled for"
   assert_contains "$(cat "$REQUEST_LOG")" "compare/$SHA_A...$SHA_B?per_page=" \
     "the successor is judged by its own range"
+  assert_eq "$(rounds_polled)" 2 "round one's settle was not taken, and round two's was"
 }
 
 tests=(
