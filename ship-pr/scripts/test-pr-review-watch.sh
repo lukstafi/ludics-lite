@@ -562,8 +562,8 @@ test_the_connector_thread_reply_opens_no_round() {
   local env_body='To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).'
   reset_fixture
   schedule reviews 1 "[$(review 500 "$H1" 2026-09-01T00:00:00Z),$(review 600 "$H2" 2026-09-01T01:00:00Z ' ')]"
-  schedule inline 1 "[$(inline_comment 4138519259 "$H2" "$H2" "$env_body" a.sh 3 '{"in_reply_to_id":900}')]"
-  schedule review_comments 1 "[$(inline_comment 4138519259 "$H2" "$H2" "$env_body" a.sh 3 '{"in_reply_to_id":900}')]"
+  schedule inline 1 "[$(inline_comment 4138519259 "$H2" "$H2" "$env_body" a.sh 3 '' '{"in_reply_to_id":900}')]"
+  schedule review_comments 1 "[$(inline_comment 4138519259 "$H2" "$H2" "$env_body" a.sh 3 '' '{"in_reply_to_id":900}')]"
   run_watch 0,0,500
   assert_eq "$WATCH_RC" 0 "the reply is new activity about the head"
   assert_contains "$WATCH_ERR" "— this window opened no round; rounds with findings: 1 of 12" \
