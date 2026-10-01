@@ -6,13 +6,14 @@ name: skill scripts
 # check, say) is one more entry below and no edit to the others.
 #
 # THE VERDICT GUARANTEE. `pr-review.sh merge` reads the head commit's check-runs and refuses a
-# head that has none (ABSENT, ludics-lite#21). Three jobs therefore run on every head, whatever it
-# changed: `prompts` (the prompt hygiene checks), `lint`, and `sync-routines`, which is
-# unconditional for a second reason given at the job itself. Everything expensive is conditioned
-# on the diff instead -- as job-level `if:` conditions on a `changes` job, NEVER as
+# head that has none (ABSENT, ludics-lite#21). Two jobs therefore run on every head, whatever it
+# changed: `prompts` (the small guards: the prompt hygiene checks, the sync-routines suite, which
+# is unconditional for a second reason given at the job itself, and three suites too cheap to
+# condition) and `lint`. Everything expensive is conditioned on the diff instead -- as job-level
+# `if:` conditions on a `changes` job, NEVER as
 # `on.<event>.paths`: a workflow-level path filter means no run at all for a prompt-only PR, so
 # no verdict; a job that its `if:` skips still reports a `skipped` check-run, which the gate
-# reads as green (nothing failed) next to the hygiene job's `success` (something ran and
+# reads as green (nothing failed) next to the small guards' `success` (something ran and
 # passed, which `--require-green` asks for). Adding a job that must always judge: leave its
 # `if:` out. Adding a job that is expensive: give it the `needs: changes` / `if:` pair below.
 #
@@ -22,16 +23,22 @@ name: skill scripts
 # macOS suite is one step of ONE macOS job, which installs the shared dependencies once; each
 # step still runs after an earlier one fails (`if: !cancelled()`), still names its suite when it
 # fails (the `::error` annotation), and the job is red if any step is. Those annotations are a
-# device of the macOS jobs and of windows-git-bash.yml's `git-bash` job, which takes the same
-# shape (one Windows runner, every ship-pr suite a step of it), and that `if:` is the whole reason
-# for them: with every suite running whatever the suite before it did, one red job of that shape
-# can hold several failures spread across its steps, and the annotation is what names them without reading the
-# log. It is NOT that Ubuntu is one suite per job -- `pr-review` runs fifteen suites as steps,
-# `lint` nine -- but that an Ubuntu suite that fails stops the job it is in, leaving a single red
-# step to find. The two `pr-review`
-# steps that do carry `if: !cancelled()` are unannotated exceptions to that; ludics-lite#266 is
-# about holding the `!cancelled()`/annotation pairing mechanically rather than by reading this
-# paragraph.
+# device of the jobs of that shape: the macOS jobs, the two Ubuntu jobs that gather independent
+# checks into one runner (`prompts` and `pr-review-hostile`), and windows-git-bash.yml's
+# `git-bash` job (one Windows runner, every ship-pr suite a step of it). That `if:` is the whole
+# reason for them: with every suite running whatever the suite before it did, one red job of that
+# shape can hold several failures spread across its steps, and the annotation is what names them
+# without reading the log. The other Ubuntu jobs run several suites as steps too (`pr-review`,
+# `lint`), but a suite that fails there stops the job it is in, leaving a single red step to
+# find. ludics-lite#266 is about holding the `!cancelled()`/annotation pairing mechanically rather
+# than by reading this paragraph.
+#
+# THE CAPS. A job that crosses its `timeout-minutes` concludes cancelled, with no verdict, however
+# green its steps were, and costs a re-run (ludics-lite#474). So every cap is at least
+# max(5, ceil(1.5 x p90)) minutes, the p90 taken over the job's successful runs on main and on
+# pull requests (for a job formed by moving steps, the sum of those steps); a cap above that
+# floor gives its own reason at the job. The runs measured are listed in ludics-lite#474's PR.
+# Re-measure with `gh run view <id> --json jobs` rather than trusting a figure written here.
 
 on:
   pull_request:
@@ -50,17 +57,52 @@ jobs:
   # ---- always run: the verdict every head carries -----------------------------------------
 
   prompts:
-    name: prompt hygiene
+    name: small guards (ubuntu)
+    # The prompt hygiene checks and every Ubuntu suite that finishes in seconds to a couple of
+    # minutes, on one runner rather than one each (ludics-lite#474): they were five jobs, each
+    # paying its own runner setup for a step shorter than that setup. No `if:` and no `needs:` on
+    # this job, ever: it is the check-run a prompt-only head is judged by, and the sync-routines
+    # pin below must run on exactly such a head. The three suites that used to be conditioned on
+    # the diff (the ship-pr nudge, the prompt checker fixtures, the base negative-control helper)
+    # run on every head here instead: conditioning a step needs `needs: changes`, which the job may
+    # not carry, and together they add about two minutes to a prompt-only head's slowest check.
+    # Every step after the first runs whatever the one before did, and names its suite on failure,
+    # so one red guard does not hide another's verdict as it could not when they were five jobs.
+    # The first carries neither: check-prompts.sh is pinned as a BARE invocation
+    # (scripts/test-preflight.sh), and it writes its own `::error` annotations.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: Check every SKILL.md's frontmatter and the README index tables
-        # No `if:` on this job, ever: it is the check-run a prompt-only head is judged by.
         run: scripts/check-prompts.sh
       - name: Reporter guards and fallback rendering
         # Execute the actual embedded shells with a fake gh; keep reporter vocabulary local.
-        run: python3 scripts/test-workflow-reporters.py
+        if: ${{ !cancelled() }}
+        run: python3 scripts/test-workflow-reporters.py || { echo '::error title=suite failed::test-workflow-reporters.py'; exit 1; }
+      - name: Exercise the routine install states and the routines-table pin
+        # Unconditional for the routines-table pin it carries. A PR that adds or relabels a local
+        # scheduled task can be entirely Markdown -- routines/README.md plus a prompt -- which the
+        # classification below calls prompt-only. Conditioned like the other suites, the one check
+        # that compares the table with the script's LOCAL_ROUTINES would be skipped on exactly the
+        # PRs that can break it, and check-prompts.sh does not compare them (its index claim is a
+        # per-directory lookup, ludics-lite#75, and is not to be grown into one). The suite holds
+        # this job to that: it refuses an `if:` or `needs:` on the job that runs it. Growth alone
+        # is not an argument for conditioning it: any condition cheap enough to be worth adding
+        # would reopen exactly the all-Markdown gap the pin exists to close. Its macOS leg
+        # stays in the conditioned macos-repo job below: bash 3.2 coverage is the expensive half,
+        # and the pin itself is platform-independent.
+        if: ${{ !cancelled() }}
+        run: scripts/test-sync-routines.sh || { echo '::error title=suite failed::test-sync-routines.sh'; exit 1; }
+      - name: Exercise the ship-pr nudge hook
+        if: ${{ !cancelled() }}
+        run: python3 ship-pr/hooks/test-ship-pr-nudge.py || { echo '::error title=suite failed::test-ship-pr-nudge.py'; exit 1; }
+      - name: Exercise run-against-base.sh against a scratch repo
+        if: ${{ !cancelled() }}
+        run: scripts/test-run-against-base.sh || { echo '::error title=suite failed::test-run-against-base.sh'; exit 1; }
+      - name: Exercise the hygiene checks against defective scratch trees
+        if: ${{ !cancelled() }}
+        run: scripts/test-check-prompts.sh || { echo '::error title=suite failed::test-check-prompts.sh'; exit 1; }
 
   lint:
     name: syntax, shellcheck, mode bits, parse guard
@@ -138,29 +180,6 @@ jobs:
         # the same set of checks: a step added here and not to the script's table fails it.
         run: scripts/test-preflight.sh
 
-  sync-routines:
-    name: sync-routines (ubuntu)
-    # No `if:` here either, and the reason is the routines-table pin the suite carries. A PR that
-    # adds or relabels a local scheduled task can be entirely Markdown -- routines/README.md plus a
-    # prompt -- which the classification below calls prompt-only. Conditioned like the other
-    # suites, the one check that compares the table with the script's LOCAL_ROUTINES would be
-    # skipped on exactly the PRs that can break it, and `prompts` does not compare them (its index
-    # claim is a per-directory lookup, ludics-lite#75, and is not to be grown into one). The pin is
-    # the whole of the reason, and it does not rest on the job being cheap. The suite needs no
-    # dependencies, but it is not free: its step took 22-27s on the hosted Ubuntu runner across the
-    # three most recent main runs (2026-09-18, 260 assertions), which places this job between the
-    # other two unconditional ones -- above `prompts` at ~8s, below `lint` at ~40s. Expect the
-    # figure to grow with the suite. Growth alone is not an argument for an `if:` here: any
-    # condition cheap enough to be worth adding would reopen exactly the all-Markdown gap the pin
-    # exists to close. Its macOS leg stays in the conditioned macos-repo job below: bash 3.2
-    # coverage is the expensive half, and the pin itself is platform-independent.
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Exercise the routine install states and the routines-table pin
-        run: scripts/test-sync-routines.sh
-
   # ---- the diff classification the suites are conditioned on ------------------------------
 
   changes:
@@ -194,32 +213,22 @@ jobs:
               - '!**/*.md'
               - 'README.md'
 
-  # ---- the script suites on Ubuntu, one job each ------------------------------------------
+  # ---- the expensive script suites on Ubuntu, one job per concern -------------------------
   # Each carries the same `needs`/`if` pair: run on any event but a pull request, and on a pull
   # request only when the diff classification says the scripts are involved. `!cancelled()` is
   # what lets the job evaluate its condition at all when `changes` was skipped (a push), while a
   # `changes` job that FAILED leaves the output empty, so the suites are skipped and the red
   # `changes` check is the head's verdict: fail closed.
 
-  ship-pr-nudge:
-    name: ship-pr nudge (ubuntu)
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - run: python3 ship-pr/hooks/test-ship-pr-nudge.py
-
   pr-review:
     name: pr-review fixtures (ubuntu)
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: ubuntu-latest
-    # Two complete fixture passes; allow slower runners time to finish both. 20, not 15: by
-    # 2026-09-29 a green run took 12-14 minutes, and runs on several PRs were cancelled at the
-    # 15-minute mark inside the second (hostile-locale) pass, a stop no fixture had caused.
-    timeout-minutes: 20
+    # The plain pass. The hostile-locale pass and the CRLF jq repeat are the next job: the two
+    # passes in one job outgrew a 15-minute cap under a wave's load and timed green runs out with
+    # no verdict (ludics-lite#474), and Ubuntu runners are plentiful enough to run both at once.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Exercise the suites' shared preamble and its shadow guard
@@ -242,17 +251,6 @@ jobs:
         run: ship-pr/scripts/test-pr-review-base-pushless.sh
       - name: Exercise the build gate's absent-vs-not-yet split
         run: ship-pr/scripts/test-pr-review-checks-absent.sh
-      - name: Repeat the four suites a CRLF jq turned red, over a stub jq.exe
-        # A native jq.exe ends its lines CRLF, and these four went red on it under Git Bash
-        # (ludics-lite#335). The stub is one that refuses `-b`, the strip path no runner's real jq
-        # takes; the Git Bash leg covers `-b` with the real jq.exe.
-        env:
-          SHIP_PR_TEST_JQ_EOL: crlf-no-binary
-        run: |
-          ship-pr/scripts/test-pr-review-base-red.sh
-          ship-pr/scripts/test-pr-review-base-settle.sh
-          ship-pr/scripts/test-pr-review-base-verdict.sh
-          ship-pr/scripts/test-pr-review-checks-absent.sh
       - name: Exercise the review-round count
         run: ship-pr/scripts/test-pr-review-rounds.sh
       - name: Exercise the merge command's head binding and close-out refusals
@@ -265,12 +263,35 @@ jobs:
         run: ship-pr/scripts/test-pr-review-reply.sh
       - name: Exercise the plain retry's classification and the run await's addressing
         run: ship-pr/scripts/test-pr-review-retry.sh
+
+  pr-review-hostile:
+    name: pr-review fixtures, hostile runner (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    # The same pr-review suites again, under the environments that once turned them red, split
+    # from the plain pass above (ludics-lite#474). Each pass runs whatever the one before did and
+    # names its suite when it fails, as the plain pass's job did for these when they were its tail.
+    timeout-minutes: 13
+    steps:
+      - uses: actions/checkout@v4
       - name: Check hostile-runner verdicts with synthetic scratch suites
-        if: ${{ !cancelled() }}
-        run: python3 ship-pr/scripts/test-pr-review-hostile.py
+        run: python3 ship-pr/scripts/test-pr-review-hostile.py || { echo '::error title=suite failed::test-pr-review-hostile.py'; exit 1; }
       - name: Repeat fixtures with inherited names, spaced paths, and a non-C locale
         if: ${{ !cancelled() }}
-        run: ship-pr/scripts/run-pr-review-hostile.sh
+        run: ship-pr/scripts/run-pr-review-hostile.sh || { echo '::error title=suite failed::run-pr-review-hostile.sh'; exit 1; }
+      - name: Repeat the four suites a CRLF jq turned red, over a stub jq.exe
+        # A native jq.exe ends its lines CRLF, and these four went red on it under Git Bash
+        # (ludics-lite#335). The stub is one that refuses `-b`, the strip path no runner's real jq
+        # takes; the Git Bash leg covers `-b` with the real jq.exe.
+        if: ${{ !cancelled() }}
+        env:
+          SHIP_PR_TEST_JQ_EOL: crlf-no-binary
+        run: |
+          ship-pr/scripts/test-pr-review-base-red.sh || { echo '::error title=suite failed::test-pr-review-base-red.sh over a CRLF jq'; exit 1; }
+          ship-pr/scripts/test-pr-review-base-settle.sh || { echo '::error title=suite failed::test-pr-review-base-settle.sh over a CRLF jq'; exit 1; }
+          ship-pr/scripts/test-pr-review-base-verdict.sh || { echo '::error title=suite failed::test-pr-review-base-verdict.sh over a CRLF jq'; exit 1; }
+          ship-pr/scripts/test-pr-review-checks-absent.sh || { echo '::error title=suite failed::test-pr-review-checks-absent.sh over a CRLF jq'; exit 1; }
 
   cleanup:
     name: post-merge cleanup (ubuntu)
@@ -317,34 +338,12 @@ jobs:
       - name: Exercise the fleet ssh mesh helper
         run: python3 scripts/test-fleet-peers.py
 
-  prompt-checker:
-    name: prompt checker fixtures (ubuntu)
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Exercise the hygiene checks against defective scratch trees
-        run: scripts/test-check-prompts.sh
-
-  run-against-base:
-    name: base negative-control helper (ubuntu)
-    needs: changes
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Exercise run-against-base.sh against a scratch repo
-        run: scripts/test-run-against-base.sh
-
   fleet-worker:
     name: fleet launcher (ubuntu)
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 17
     steps:
       - uses: actions/checkout@v4
         with:
@@ -394,12 +393,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: macos-latest
-    # 510-515s across the two most recent main runs (2026-09-18); post-merge cleanup is the
-    # largest at ~3.5 minutes and the shared preamble and watch suites are next, at ~1 and ~2.
     # The cleanup suite kills a stalled case at SHIP_PR_TEST_CASE_TIMEOUT (ludics-lite#14), so
-    # this is the backstop behind that, sized for the whole sequence rather than one suite.
-    # The margin over a measured run is ~2.3x -- re-read this figure before assuming it holds.
-    timeout-minutes: 20
+    # this is the backstop behind that, sized for the whole sequence by THE CAPS above.
+    timeout-minutes: 25
     steps:
       # A shallow checkout, as the ubuntu ship-pr jobs take: these suites build their own
       # scratch repositories. The full history belongs to the fleet launcher, in the job below.
@@ -478,12 +474,10 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: macos-latest
-    # 585-588s across the two most recent main runs (2026-09-18); by 2026-09-26 main's runs
-    # took 18m51s and 18m59s (36240807008, 36237967122: wake-lab ~6 min, the fleet launcher ~7),
-    # a minute under the old 20, and ludics-lite#259's stream-channel cases (a few seconds of
-    # real waiting each, for background tasks and mid-turn delivery) pushed the fleet launcher
-    # past it. 35 restores a margin near 2x -- re-read these figures before assuming it holds.
-    timeout-minutes: 35
+    # The merge gate's critical path, and the job that drifts: its fleet launcher suite grows
+    # with each stream-channel case that waits in real time (ludics-lite#259). Sized by THE CAPS
+    # above; splitting it was considered and declined (ludics-lite#474).
+    timeout-minutes: 46
     steps:
       - uses: actions/checkout@v4
         with:
