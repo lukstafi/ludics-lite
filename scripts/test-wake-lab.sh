@@ -2578,11 +2578,14 @@ sweep_env() { # sweep_env <lock-dir|-> <home> -- sets SWEEP_ENV, the `env -i` ar
 # fragment_defaulted <fragment> <bound-name...> -- each name the fragment reads in a form `set -u`
 # lets through unset and that is not bound, one per line, and `refused ${!` for an indirect
 # expansion, whose target no reader of the text can name. The forms, as a closed list: `${name-w}`
-# and `${name:-w}`, the same with `=`, `+` and `?`, on a name or an array element, and a `-v name`
-# test after `[`, `[[` or `test`. Each would quietly take its fallback where the sweep had a value,
-# which is ludics-lite#469's shape again with the error swallowed. It reads the whole fragment
-# text, comments and quoted spans included, so an occurrence is over-reported, never missed.
-# Anything else that asks whether a name is set (`declare -p`, `compgen -v`) is out of bounds.
+# and `${name:-w}`, the same with `=`, `+` and `?`, on a name or an array element; a whole-array
+# `${name[@]}` or `${name[*]}` (`#` or not), which bash 4.4 and later expand to nothing when unset
+# even under `set -u`; and a `-v name` test after `[`, `[[` or `test`. Each would quietly take its
+# fallback where the sweep had a value, which is ludics-lite#469's shape again with the error
+# swallowed. It reads the whole fragment text, comments and quoted spans included, so an
+# occurrence is over-reported, never missed -- a whole-array read of the fragment's own `local`
+# array included, which is loud. Anything else that asks whether a name is set (`declare -p`,
+# `compgen -v`) is out of bounds.
 fragment_defaulted() {
   perl -e '
     my ($file, @bound) = @ARGV;
@@ -2592,7 +2595,7 @@ fragment_defaulted() {
     open my $fh, "<", $file or die "$file: $!\n";
     while (<$fh>) {
       print "refused \${!\n" if /\$\{!/ && !$seen{"\${!"}++;
-      for my $n (/\$\{($id)(?:\[[^\]]*\])?:?[-=+?]/g,
+      for my $n (/\$\{($id)(?:\[[^\]]*\])?:?[-=+?]/g, /\$\{#?($id)\[[@*]\]/g,
                  /(?:\[\[?|\btest)[ \t]+(?:![ \t]+)?-v[ \t]+($id)/g) {
         print "$n\n" unless $ok{$n} || $seen{$n}++;
       }
@@ -2602,8 +2605,8 @@ fragment_defaulted() {
 # The negative control, which needs no staging checkout and so runs in CI too: a check that cannot
 # fail proves nothing. Each planted_* reads one name nothing binds, in a way the copy step's old
 # anchors could not see, and must be reported by name; planted_bound reads only what sweep_env
-# binds and must run clean. The text check must report exactly the defaulted, indirect and `-v`
-# reads, and not awk's `-v a=`.
+# binds and must run clean. The text check must report exactly the defaulted, indirect, `-v` and
+# whole-array reads, and not awk's `-v a=`.
 cat >"$TMP/planted-fragment.sh" <<'EOF'
 PLANTED_TOP=${PLANTED_DEFAULTED:-fallback}
 planted_plain() { printf '%s\n' "$LAB_MAP $PLANTED_PLAIN"; }
@@ -2614,6 +2617,7 @@ planted_bound() { local box=$1; printf '%s\n' "$LAB_MAP $stamp $HOME ${box:0:1} 
 planted_indirect() { local r=LAB_MAP; printf '%s\n' "${!r}"; }
 planted_tested() { [ -v PLANTED_TESTED ] && printf '%s\n' set; }
 planted_awk() { awk -v a="$1" '{ print a }' </dev/null; }
+planted_array() { printf '%s\n' "${PLANTED_ARRAY[@]}"; }
 EOF
 sweep_env "$LOCKS" "$TMP/sweep-home-planted"
 for planted in plain branch arith subst; do
@@ -2631,7 +2635,7 @@ rc=$?
   || ko "a planted fragment reading only bound names failed under sweep_env (rc=$rc) -- $out"
 sweep_env "$LOCKS" "$HOME"
 if out=$(fragment_defaulted "$TMP/planted-fragment.sh" "${SWEEP_ENV[@]%%=*}"); then
-  want=$(printf '%s\n' PLANTED_DEFAULTED 'refused ${!' PLANTED_TESTED)
+  want=$(printf '%s\n' PLANTED_DEFAULTED 'refused ${!' PLANTED_TESTED PLANTED_ARRAY)
   [ "$out" = "$want" ] \
     && ok "the text check reports exactly the planted reads set -u lets through unset" \
     || ko "the text check is off on the planted fragment -- want [$want], got [$out]"
