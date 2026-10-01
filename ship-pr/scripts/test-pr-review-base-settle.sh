@@ -78,10 +78,11 @@ test_a_tip_that_changed_a_source_file_is_not_recognized() {
     "the workflow file should be read once, not once per round"
 }
 
-# A commit's changed files are PAGINATED — 30 to a page by default, 300 in all — so an
-# unpaginated read of a 45-file commit answers with 30 ignored paths and hides the source file
-# behind them (ludics-lite#163 review, round 2). The read asks for every page, and a list at the
-# endpoint's own 300-file cap is a truncated diff that settles nothing.
+# A commit's changed files are PAGINATED — 300 to a default page, a rel=next link past it — so an
+# unpaginated read of a wide commit answers with one page of ignored paths and hides the source
+# file behind them (ludics-lite#163 review, round 2; the live paging is pinned by
+# pr-review-api-contract.sh, ludics-lite#177). The read asks for every page, and a list of 300 —
+# what an unpaginated read of a wide commit answers — is refused as possibly truncated.
 test_a_commits_files_are_read_whole() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5101}]')")
@@ -89,13 +90,13 @@ test_a_commits_files_are_read_whole() {
   run_base --wait=2
   assert_eq "$BASE_RC" 0 "the ordinary docs-only tip still settles"
   assert_contains "$(cat "$PAGINATE_LOG")" "commits/$SHA_C" \
-    "the commit's files must be read across every page, not one page of thirty"
-  # ... and a diff at the cap is not a diff.
+    "the commit's files must be read across every page, not one default page"
+  # ... and a list of 300 is not a diff.
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5102}]')")
   FILES_DEFAULT=$(jq -cn '[range(300) | {filename: ("docs/f" + (. | tostring) + ".md")}]')
   run_base --wait=2
-  assert_eq "$BASE_RC" 4 "a file list at the endpoint's cap is truncated, and truncated is not evidence"
+  assert_eq "$BASE_RC" 4 "a file list of 300 may be one truncated page, and truncated is not evidence"
   assert_not_contains "$BASE_OUTPUT" "within the paths-ignore of" "no recognition may be claimed"
 }
 

@@ -1081,7 +1081,17 @@ snapshot standing behind the merge's first parent (anchored on #53); and the rev
 (the `[bot]` suffix, the `+1` approval, `COMMENTED` rounds, the summary tag, 30-per-page
 pagination) anchored on #39; and, over the newest 60 merged PRs, that every summary Code Review row
 is a shape `status_state` reads (Completed, Failed, Running) and that a findings review is
-submitted before its row flips to Completed, the order the #439 reading rests on (#453).
+submitted before its row flips to Completed, the order the #439 reading rests on (#453); the
+`reviewThreads` connection the open-thread gate and `resolve` page through, asked with the
+library's own `THREADS_QUERY` on #370, whose first-comment ids run past 2^31 (totalCount on every
+page of a small-page walk and the pages adding up to it, the node `id`, `isResolved` a boolean,
+`fullDatabaseId` a decimal string, and `databaseId` null or whole past 2^31, never clamped —
+GitHub serves it whole today) (#389); and the commit-files paging `commit_files` rests on, on a
+353-file commit of lukstafi/ocannl since this repository has none wider than one page (the
+default page is 300 files, not the 30 the comments once said; `per_page=100` is honoured; the
+paginated read joins to the whole diff, past 300) (#177). A GraphQL query it rejects inside an
+HTTP 200 is exit 4, like a REST 4xx. The verdict line names the per-workflow wrapper claims, the
+one part of the count that varies with nothing drifting, so two runs' totals compare.
 `.github/workflows/api-contract.yml` runs it daily, on demand, and on a pull request that
 changes the contract itself; a scheduled failure opens (or comments on) one issue rather than
 failing silently, from a second job that checks nothing out, so the job that runs a pull request's
