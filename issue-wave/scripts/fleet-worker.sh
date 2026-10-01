@@ -2742,8 +2742,9 @@ elif mode == "bare":
     inhibitor, why, command = "", "", sys.argv[3:]
     prefix = "EXECUTION SLOT"
 else:
-    # hold: <inhibitor> <why> <measurement lock or ""> <marker or ""> <command...>
-    inhibitor, why, hold_lock, hold_marker, command = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7:]
+    # hold: <inhibitor> <why> <measurement lock or ""> <marker or ""> <slot count> <command...>
+    inhibitor, why, hold_lock, hold_marker = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+    hold_cap, command = int(sys.argv[7]), sys.argv[8:]
     prefix = "EXECUTION HOLD"
 HOLD_WAIT = 30  # seconds for systemd-inhibit to answer HELD or refuse; it answers at once
 
@@ -2827,6 +2828,32 @@ def run(why):
 
 if mode == "hold":
     if hold_lock:
+        # THE DRAIN (ludics-lite#481, at `execution hold`): every slot of the box, before the
+        # runner starts and for as long as its tree runs, so a batch that was running or waiting
+        # for a slot when the measurement was reserved ends before the measurement begins and
+        # none starts beside it. Before the marker's lock, so a nested slot of such a batch is
+        # still judged as it was until the batch ends. Fail-open and loud, as the marker is.
+        directory = os.path.dirname(hold_lock)
+        indices = set(range(1, hold_cap + 1))
+        try:
+            indices.update(int(name[5:]) for name in os.listdir(directory)
+                           if name.startswith("slot.") and name[5:].isdigit())
+        except OSError:
+            pass
+        for index in sorted(indices):
+            try:
+                descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_CREAT | os.O_RDWR, 0o644)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    sys.stderr.write("EXECUTION HOLD %s: measurement %s waits for the batch in slot %d to end\n"
+                                     % (box, hold_marker.split()[1], index))
+                    sys.stderr.flush()
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                os.set_inheritable(descriptor, True)
+            except OSError as exc:
+                sys.stderr.write("EXECUTION HOLD %s: WARNING: slot %d is not held for the measurement, so a batch"
+                                 " may run beside it -- %s\n" % (box, index, exc))
         # The measurement's marker and the lock that proves it live (THE MEASUREMENT'S OWN RUN,
         # at `execution hold`): shared, so a second hold of the same measurement is not refused,
         # and held on a descriptor every process of the command's tree inherits, so the kernel
@@ -2916,6 +2943,20 @@ if mode == "nested":
         os.close(descriptor)
         not_here("slot %d is not held" % index)
     os.close(descriptor)
+    # A live `execution hold --request` holds every slot (THE DRAIN, at `execution hold`), and no
+    # batch inside it carries this marker -- the measurement's own runs are judged by theirs -- so
+    # the slot above being held proves nothing while one is live.
+    try:
+        descriptor = os.open(os.path.join(directory, "measurement.lock"), os.O_RDWR)
+    except OSError:
+        pass
+    else:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(descriptor)
+            not_here("a measurement's `execution hold --request` holds this box's slots")
+        os.close(descriptor)
     # Whether that slot may hold the GPU is judged from THIS spec, never from the marker's own
     # word: the tokens are the first <tokens> slot files (THE GPU TOKENS, above).
     if tokens and index > tokens and not cpu:
@@ -3118,7 +3159,7 @@ cmd_execution_slot() {
 # first `slot` inside it, which is refused.
 # Exit: the command's own status; 127 with `EXECUTION HOLD REFUSED` when it cannot be run; 2 usage.
 cmd_execution_hold() {
-  local why="" request="" box dir="" marker=""
+  local why="" request="" box dir="" marker="" cap=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --why)
@@ -3141,9 +3182,12 @@ cmd_execution_hold() {
     dir="$(local_path "$SLOT_STATE")/$box"
     mkdir -p "$dir" || die "execution hold: cannot create the slot directory $dir"
     dir="$dir/measurement.lock" marker="$box $request"
+    # THE DRAIN takes every slot file there and slots 1..<count>; a spec it cannot read costs
+    # only the second half, never the measurement.
+    cap=$(box_correctness_slots "$box" 2>/dev/null) || cap=0
   fi
   [ -n "$why" ] || why="$box ${request:+measurement $request }hold: $*"
-  exec python3 -c "$(run_py)" hold "$box" "$(inhibitor_path)" "$why" "$dir" "$marker" "$@"
+  exec python3 -c "$(run_py)" hold "$box" "$(inhibitor_path)" "$why" "$dir" "$marker" "${cap:-0}" "$@"
 }
 
 cmd_execution() {
@@ -3290,12 +3334,21 @@ endpoint_map() {
 # launch preflight need have run on the box the coordinator itself runs from (PR #379 review). On
 # stderr, so stdout stays the record; the dispatch's exit status stands whatever the refresh
 # reports, and a record it cannot read is said so rather than skipped silently.
+#
+# A standing reservation queued behind a measurement window (ludics-lite#481) is not refreshed: the
+# box is measuring, and a fetch there is activity beside the timed run. Its worker's batches are
+# refused until the window concludes, so the line names the refresh to run then.
 execution_refresh() {
-  local host
+  local host window
   host=$(jq -r '.request.execution_host // empty' <<<"$1" 2>&1) && [ -n "$host" ] || {
     printf '%s\n' "REFRESH FAILED: cannot read the execution host from the dispatched record (${host:-empty}); run fleet-worker.sh refresh <host> by hand"
     return 1
   }
+  window=$(jq -r 'select(.state == "suspended") | .suspended_by' <<<"$1" 2>/dev/null)
+  if [ -n "$window" ]; then
+    printf '%s\n' "REFRESH DEFERRED $host: measurement window $window is measuring there; run fleet-worker.sh refresh $host once it concludes"
+    return 0
+  fi
   refresh_box "$host"
 }
 
