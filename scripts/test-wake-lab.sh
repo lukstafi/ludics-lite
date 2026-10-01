@@ -2537,7 +2537,10 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-
 # The anchors are REQUIRED to match exactly once, so a rename fails loudly instead of leaving the
 # check quietly examining nothing (ludics-lite#188). Two of them are the lane's call site: nothing
 # short of running a sweep can execute it, so that it still composes `lab_box_of` with
-# `take_lab_lock` is held as a required core rather than proven. The staging checkout is read
+# `take_lab_lock` is held as a required core rather than proven. Three more are the same for the
+# map lab_box_of reads: this suite fills LAB_MAP from `endpoint-map` itself (sweep_lock), so that
+# the sweep still defines `lab_map`, fills LAB_MAP in it from `"$WAKE_LAB" endpoint-map`, and calls
+# it at startup is held as a required core too, not exercised. The staging checkout is read
 # strictly read-only: `git show` of a ref, never a branch, a fetch or a write.
 STAGING=${OCANNL_STAGING:-$HOME/ocannl-staging}
 created() { # created <dir> -- every regular file under it, relative and shell-quoted, one line
@@ -2566,16 +2569,17 @@ SWEEP_FOREIGN=(lab_box_of:i)
 # the two repositories disagreeing (ludics-lite#469). The single-anchor checks could not see it.
 #
 # Its grammar, as a fail-closed allowlist. Each function is read as bash itself prints it
-# (`declare -f` in a clean shell, so comments are gone), and the fragment's top-level lines as
-# written: those outside the `name() {` ... `}` ranges the copy step cuts. A READ is any `$name`,
-# `${name` or `${#name`, quoted or not, and every name inside a `((...))`. A name is BOUND by SWEEP_BOUND, by an assignment on the fragment's top level, and,
-# within one function, by its `local` list or an assignment anywhere in its body. Reads inside
-# single quotes are checked too, so an awk or perl `$name` is over-reported (hence SWEEP_FOREIGN),
-# never missed. Text through which a variable can be read any other way -- `[[`, `let`, `eval`,
-# `declare`, `typeset`, `source`, a `.` command, `${!`, or a `local` given an option (`-n`, `-i`)
-# -- is refused, not scanned. Out of bounds: a function the fragment CALLS without copying it
-# (take_lab_lock's `say`, reached only after a wait), and whether an assignment in a body comes
-# before the read it binds.
+# (`declare -f` in a clean shell, so comments are gone), and the fragment's top-level lines as written: those
+# outside the `name() {` ... `}` ranges the copy step cuts. A READ is any `$name`, `${name` or
+# `${#name`, quoted or not, and every name inside a `((...))` or inside the `[...]` of a subscript
+# (`${a[i]}`, `a[i]=`), which bash evaluates arithmetically. A name is BOUND by SWEEP_BOUND, by an
+# assignment on the fragment's top level, and, within one function, by its `local` list or an
+# assignment anywhere in its body. Reads inside single quotes are checked too, so an awk or perl
+# `$name` is over-reported (hence SWEEP_FOREIGN), never missed. Text through which a variable can
+# be read any other way -- `[[`, `let`, `eval`, `declare`, `typeset`, `source`, a `.` command,
+# `${!`, or a `local` given an option (`-n`, `-i`) -- is refused, not scanned. Out of bounds: a
+# function the fragment CALLS without copying it (take_lab_lock's `say`, reached only after a
+# wait), and whether an assignment in a body comes before the read it binds.
 fragment_unbound() {
   local fns
   fns=$(env -i PATH="$PATH" bash --noprofile --norc -c '. "$1" >/dev/null 2>&1 </dev/null || exit 1
@@ -2611,8 +2615,8 @@ fragment_unbound() {
       }
       $mine{$1} = 1 while $text =~ /(?:^|[\s;&|(])($id)\+?=(?!=)/mg;
       $reads{$1} = 1 while $text =~ /\$\{?#?($id)/g;
-      while ($text =~ /\(\((.*?)\)\)/sg) {
-        (my $expr = $1) =~ s/\$\([^()]*\)//g;
+      for my $arith ($text =~ /\(\((.*?)\)\)/sg, $text =~ /\w\[([^\]\n]*)\]/g) {
+        (my $expr = $arith) =~ s/\$\([^()]*\)//g;
         $reads{$1} = 1 while $expr =~ /(?<![\w#])($id)/g;
       }
       print "$where: refused $_\n" for @refused;
@@ -2632,16 +2636,17 @@ lab_box_of() { # ssh-alias -- the $COMMENTED_OUT table
   awk -v a="$1" '{ for (i = 2; i <= NF; i++) if ($i == a) print $1 }' <<<"$PLANTED_MAP"
 }
 take_lab_lock() {
-  local box=$1 deadline=$((SECONDS + PLANTED_WAIT))
+  local box=$1 deadline=$((SECONDS + PLANTED_WAIT)) waits=(1 2)
   path=$LAB_LOCK_DIR/$box.lock
-  printf '%s\n' "$path $deadline ${#LAB_MAP} $stamp"
+  printf '%s\n' "$path $deadline ${#LAB_MAP} $stamp ${waits[PLANTED_INDEX]} ${waits[deadline]}"
 }
 planted_let() {
   let n=PLANTED_LET+1
 }
 EOF
 out=$(fragment_unbound "$TMP/planted-fragment.sh")
-want=$(printf '%s\n' 'lab_box_of: PLANTED_MAP' 'planted_let: refused let' 'take_lab_lock: PLANTED_WAIT')
+want=$(printf '%s\n' 'lab_box_of: PLANTED_MAP' 'planted_let: refused let' \
+  'take_lab_lock: PLANTED_INDEX' 'take_lab_lock: PLANTED_WAIT')
 [ "$out" = "$want" ] \
   && ok "the copy step's unbound-variable check flags exactly the planted reads and the refused let" \
   || ko "the copy step's unbound-variable check is off on a planted fragment -- want [$want], got [$out]"
@@ -2735,11 +2740,14 @@ else
   SWEEP=$TMP/sweep-master.sh
   anchors=1
   for anchor in '^LAB_LOCK_DIR=' '^lab_box_of() {' '^take_lab_lock() {' \
-                '^[[:space:]]*lab_box=\$(lab_box_of ' '^[[:space:]]*take_lab_lock "\$lab_box"'; do
+                '^[[:space:]]*lab_box=\$(lab_box_of ' '^[[:space:]]*take_lab_lock "\$lab_box"' \
+                '^lab_map() {' '^[[:space:]]*ask_capped LAB_MAP [0-9][0-9]* "\$WAKE_LAB" endpoint-map' \
+                '[[:space:]{;]lab_map[;[:space:]]'; do
     n=$(grep -c -- "$anchor" "$SWEEP")
     [ "$n" -eq 1 ] || { anchors=0
       ko "origin/master's sweep has $n lines matching /$anchor/, not 1 -- the lane no longer takes \
-its lock the way the cases below assume, so they would stop being about the live sweep"; }
+its lock (or fills the map it reads) the way the cases below assume, so they would stop being \
+about the live sweep"; }
   done
   if [ "$anchors" -eq 1 ]; then
     { grep '^LAB_LOCK_DIR=' "$SWEEP"
