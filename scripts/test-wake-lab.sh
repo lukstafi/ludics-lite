@@ -2577,10 +2577,17 @@ sweep_env() { # sweep_env <lock-dir|-> <home> -- sets SWEEP_ENV, the `env -i` ar
 }
 # The variables bash itself defines in that clean environment, asked of the bash that runs the
 # fragment: `env -i` cannot make them unset, and some it takes from the environment when the sweep
-# has one (SHELL, PWD, SHLVL, TERM), so a read of one is a read set -u cannot see.
+# has one (SHELL, PWD, SHLVL, TERM) or from whatever its caller ran last (PIPESTATUS, REPLY,
+# BASH_REMATCH), so a read of one is a read set -u cannot see. Asked from inside a function, after
+# a pipeline, a `[[ =~ ]]`, a bare `read` and, on bash 4 and later, a `mapfile` and a `coproc`, since
+# bash creates those variables only when something first sets them.
 SWEEP_SHELL_VARS=()
 while IFS= read -r v; do SWEEP_SHELL_VARS+=("$v"); done \
-  < <(env -i PATH="$PATH" bash -c 'compgen -v' 2>/dev/null)
+  < <(env -i PATH="$PATH" bash -c 'probe() {
+        true | true; [[ a =~ a ]]; read -r <<<x
+        if [ "${BASH_VERSINFO[0]}" -ge 4 ]; then mapfile -t <<<x; eval "coproc { :; }; wait"; fi
+        compgen -v
+      }; probe' 2>/dev/null)
 # fragment_defaulted <fragment> <bound-name...> -- <bash-variable...> -- each name the fragment
 # reads in a form `set -u` lets through unset and that is not bound, one per line, and
 # `refused <construct>` for what would blind the run. The forms, as a closed list: `${name-w}` and
@@ -2643,6 +2650,7 @@ planted_unguarded() { set +u; }
 planted_computed() { [ -v "$PLANTED_NAME" ] && printf '%s\n' set; }
 planted_compound() { [ -n "$LAB_MAP" -a -v PLANTED_COMPOUND ] && printf '%s\n' set; }
 planted_shell() { [ "$SHELL" = /bin/zsh ] && printf '%s\n' zsh; }
+planted_status() { [ "${PIPESTATUS[0]}" = 1 ] && printf '%s\n' failed; }
 EOF
 sweep_env "$LOCKS" "$TMP/sweep-home-planted"
 for planted in plain branch arith subst; do
@@ -2662,7 +2670,7 @@ sweep_env "$LOCKS" "$HOME"
 if out=$(fragment_defaulted "$TMP/planted-fragment.sh" "${SWEEP_ENV[@]%%=*}" SECONDS -- \
            ${SWEEP_SHELL_VARS[@]+"${SWEEP_SHELL_VARS[@]}"}); then
   want=$(printf '%s\n' PLANTED_DEFAULTED 'refused ${!' PLANTED_TESTED PLANTED_ARRAY \
-    'refused set +u' 'refused -v "$PLANTED_NAME"' PLANTED_COMPOUND SHELL)
+    'refused set +u' 'refused -v "$PLANTED_NAME"' PLANTED_COMPOUND SHELL PIPESTATUS)
   [ "$out" = "$want" ] \
     && ok "the text check reports exactly the planted reads set -u lets through unset" \
     || ko "the text check is off on the planted fragment -- want [$want], got [$out]"
