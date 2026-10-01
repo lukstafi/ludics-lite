@@ -43,6 +43,8 @@ source "$SCRIPT_DIR/test-pr-review-base-lib.sh"
 
 # The merged PR's head, and the commit the tip was merged onto.
 SHA_H=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+# The next merge, landing on the branch while a round is being read.
+SHA_D=dddddddddddddddddddddddddddddddddddddddd
 
 # ocannl's `ci` after #1057: pull requests, a schedule and manual runs — no push.
 PUSHLESS_YAML='name: ci
@@ -598,9 +600,9 @@ test_interim_waits_out_a_workflow_the_tip_may_have_added() {
 }
 
 # The tip's runs are read again after the source, each by its id: one that finished meanwhile is
-# the tip's own verdict, never "still running" under an interim green (review round 1). Either
-# read takes the round again at once to fold it (round 3), at most twice: this fixture's runs feed
-# never shows the run finish, which is the lagging feed that bound is for.
+# the tip's own verdict, never "still running" under an interim green (review round 1). Here the
+# runs feed never shows the run finish, so no round can fold it: what is pinned is the refusal and
+# its note. What the re-round then does is pinned by the three cases below.
 test_interim_rereads_the_tips_run_after_the_source() {
   local wait
   for wait in "" --wait=2; do
@@ -611,10 +613,78 @@ test_interim_rereads_the_tips_run_after_the_source() {
     assert_not_contains "$BASE_OUTPUT" "green, interim" "and no green says it is still running"
     assert_contains "$BASE_OUTPUT" "the tip's run of ci finished while the source was read" "and says why"
   done
+}
+
+# The run finishes between rounds (ludics-lite#426): the re-read after the source finds it done,
+# the round is taken again AT ONCE, and the next round's feed shows it finished — so the verdict is
+# the tip's OWN, here its red, and not the source's green nor a pending note. A plain read too: it
+# is the re-round, not a --wait's next poll, that folds it (round 3 of #308).
+test_interim_a_run_finishing_between_rounds_is_the_tips_own_verdict() {
+  local wait
+  for wait in "" --wait=4; do
+    burst_fixture "$BURST_RUNS"
+    RUN_7301='{"id":7301,"status":"completed","conclusion":"failure"}'
+    runs_from_round 2 1 '[{"conclusion":"failure","head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7301},
+                          {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7300}]'
+    run_base --interim ${wait:+"$wait"}
+    assert_eq "$BASE_RC" 1 "the tip's own red is its verdict ($wait)"
+    assert_contains "$BASE_OUTPUT" "$REPO $BRANCH is RED" "headlined as red"
+    assert_not_contains "$BASE_OUTPUT" "interim" "and the source's green is not the verdict, nor mentioned"
+    assert_eq "$(rounds_polled)" 2 "folded on the round the re-read took ($wait)"
+  done
+}
+
+# The tip moves between rounds (ludics-lite#426): the merge landing while the source was read is
+# found by the re-confirm, the round is taken again at once, and the next round judges the NEW tip
+# by its own run — re-reading the workflow list for it, as any move does — rather than leaving a
+# pending note about a tip the branch has left.
+test_interim_a_tip_that_moved_between_rounds_is_judged_anew() {
+  burst_fixture "$BURST_RUNS"
+  at_round 1 "$SHA_D"
+  runs_from_round 2 1 "$(jq -cn --arg d "$SHA_D" --arg c "$SHA_C" \
+    '[{conclusion:"success", head_sha:$d, id:7302}, {conclusion:"cancelled", head_sha:$c, id:7301}]')"
+  run_base --interim
+  assert_eq "$BASE_RC" 0 "the new tip's own green is the verdict"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_D:0:8})" "about the new tip"
+  assert_not_contains "$BASE_OUTPUT" "interim" "by its own run, not the source"
+  assert_not_contains "$BASE_OUTPUT" "the tip moved while the source was read" "and no note for the tip it left"
+  assert_eq "$(rounds_polled)" 2 "folded on the round the re-read took"
+  assert_eq "$(grep -c 'actions/workflows?per_page=100' "$REQUEST_LOG")" 2 \
+    "the workflow list was read again for the tip that moved"
+}
+
+# The re-round's bound (ludics-lite#426): at most twice per call, so a runs feed that lags the run
+# it lists cannot spin the loop. Here the feed shows the run finished only from round FOUR — the
+# one a third re-round would take — so a plain read stops at three rounds with its note, and a
+# bound of three would fold the red instead.
+test_interim_rerounds_at_most_twice() {
   burst_fixture "$BURST_RUNS"
   RUN_7301='{"id":7301,"status":"completed","conclusion":"failure"}'
+  runs_from_round 4 1 '[{"conclusion":"failure","head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7301}]'
   run_base --interim
   assert_eq "$(rounds_polled)" 3 "the read went round again at once, and no more than twice"
+  assert_eq "$BASE_RC" 4 "the lagging feed leaves the tip pending, not red"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: the tip's run of ci finished while the source was read" \
+    "with the note of the round the bound stopped on"
+}
+
+# The newcomer hold's clock is the round's SNAPSHOT (review round 6 of #308): the tip is aged at
+# the moment its runs were read, never at the later moment the hold is checked, so the API calls a
+# round makes after its reads cannot age a workflow out of its creation window. The tip's own run
+# is served 299s old when it is READ, against the 300s window, and a second passes after the read:
+# measured at the snapshot the tip is inside the window, measured at the check it is past it.
+test_interim_ages_the_tip_on_the_rounds_snapshot() {
+  burst_fixture "$BURST_RUNS"
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"nightly"}]')
+  RUNS_2=$(runs_json 2 '[]')
+  aged_at_read 7301 299
+  delay_after_runs_read 1
+  run_base --interim
+  assert_eq "$(delays_taken)" 1 "a second passed between the runs read and the hold"
+  assert_eq "$BASE_RC" 4 "a tip inside the window at its snapshot is held"
+  assert_contains "$BASE_OUTPUT" "inside the 300s window its first run may still appear in" \
+    "and the note ages it on the snapshot"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no green while the window is open"
 }
 
 # An integration record at the tip judged the tip's own tree: under --interim a failed one is the
@@ -681,6 +751,10 @@ tests=(
   test_interim_reconfirms_the_tip
   test_interim_waits_out_a_workflow_the_tip_may_have_added
   test_interim_rereads_the_tips_run_after_the_source
+  test_interim_a_run_finishing_between_rounds_is_the_tips_own_verdict
+  test_interim_a_tip_that_moved_between_rounds_is_judged_anew
+  test_interim_rerounds_at_most_twice
+  test_interim_ages_the_tip_on_the_rounds_snapshot
   test_interim_takes_a_record_at_the_tip
 )
 

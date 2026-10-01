@@ -25,13 +25,15 @@
 #                                   green by the same source under --interim (#308)
 #
 # What this file provides: the canned answers keyed the way `base` reads them (TIP, WORKFLOWS_JSON,
-# RUNS_<id>, JOBS_<run id>, FILES_<sha initial>, the compare and the workflow file), the fixture
-# `gh` that serves them, `reset_fixture` to clear every one of them between cases, `run_base` to
-# capture a command's output and status, and the wall-clock idiom below.
+# RUNS_<id> and its per-round successors, JOBS_<run id>, FILES_<sha initial>, the compare and the
+# workflow file), the fixture `gh` that serves them, `reset_fixture` to clear every one of them
+# between cases, `run_base` to capture a command's output and status, and the wall-clock idiom
+# below.
 #
 # Executed rather than sourced, it runs its own controls over that transport: the round counter,
-# the delay, and the tip move, each read directly off the fixture rather than through a `base`
-# run, so they say what the transport does and not what the script made of it.
+# the per-round feed, the delays, the run aged at its read, and the tip move, each read directly
+# off the fixture rather than through a `base` run, so they say what the transport does and not
+# what the script made of it.
 
 # Executed rather than sourced, this file sources the preamble ITSELF, before it defines anything:
 # the preamble refuses a caller that defined functions above it (the shadow in the other
@@ -87,11 +89,12 @@ SHA_0=0000000000000000000000000000000000000000
 # through `eval`, as the other suites' sequence pops are.
 #
 # The name patterns (EREs, anchored whole) of those per-key answers, which is what `reset_fixture`
-# clears: RUNS_<workflow id>, JOBS_<run id>, RUN_<run id>, WORKFLOW_PATH_<workflow id>,
-# YAML_OF_<file basename> and FILES_<sha initial>. A pattern must match only names the cases
-# create, and `reset_fixture` refuses one that matches a name in FIXTURE_NAMES_AS_SOURCED.
-FIXTURE_KEYS=('RUNS_[0-9]+' 'JOBS_[0-9]+' 'RUN_[0-9]+' 'WORKFLOW_PATH_[0-9]+' 'YAML_OF_[A-Za-z0-9_]*'
-  'FILES_[0-9a-z]')
+# clears: RUNS_<workflow id>, RUNS_<workflow id>_FROM_<round> (set through `runs_from_round`
+# below), JOBS_<run id>, RUN_<run id>, WORKFLOW_PATH_<workflow id>, YAML_OF_<file basename> and
+# FILES_<sha initial>. A pattern must match only names the cases create, and `reset_fixture`
+# refuses one that matches a name in FIXTURE_NAMES_AS_SOURCED.
+FIXTURE_KEYS=('RUNS_[0-9]+' 'RUNS_[0-9]+_FROM_[0-9]+' 'JOBS_[0-9]+' 'RUN_[0-9]+' 'WORKFLOW_PATH_[0-9]+'
+  'YAML_OF_[A-Za-z0-9_]*' 'FILES_[0-9a-z]')
 TIP=""
 WORKFLOWS_JSON=""
 JOBS_DEFAULT=""
@@ -141,6 +144,14 @@ HEAD_RUNS_LATER=""
 # so "once" is a fact the controls can read rather than a property of a marker file's existence.
 FIRST_READ_DELAY=""
 DELAY_LOG="$TEST_ROOT/delays"
+# The delay after round one's runs read, in seconds, set through `delay_after_runs_read`: what puts
+# wall clock between the moment a round's runs were read and everything that round checks after
+# them. And the run whose created_at the feed stamps at the moment it is READ, set through
+# `aged_at_read`: AGED_RUN_ID's row is served AGED_RUN_SECS seconds old, whenever and however
+# slowly the read arrives.
+RUNS_READ_DELAY=""
+AGED_RUN_ID=""
+AGED_RUN_SECS=""
 
 # A ci workflow as the fleet's repositories write one: docs are the paths-ignore.
 DOCS_IGNORED_YAML='name: ci
@@ -190,19 +201,36 @@ runs_json() {
 workflows_json() { jq -cn --argjson wf "$1" '{workflows: $wf}'; }
 jobs_json() { jq -cn --argjson jobs "$1" '{jobs: $jobs}'; }
 
-# The canned answer for one key, empty when the case set none: `runs_of 2` reads RUNS_2, `jobs_of
-# 3003` reads JOBS_3003 and falls back to JOBS_DEFAULT.
-runs_of() { eval "printf '%s' \"\${RUNS_$1:-}\""; }
-# run_of <run id>: RUN_<id> when a case set one, else that run's row from every RUNS_<n> set.
+# The canned answer for one key, empty when the case set none: `runs_of 2` reads the feed workflow
+# 2 answers in the round the wait is on — RUNS_2_FROM_<k> for the latest <k> not past that round
+# when a case set one, else RUNS_2 — and `jobs_of 3003` reads JOBS_3003 and falls back to
+# JOBS_DEFAULT. The round is the counter's current total, which the first listed workflow's read
+# has already advanced by the time any workflow's feed is served.
+runs_of() {
+  local k v
+  k=$(rounds_polled)
+  while [ "$k" -ge 2 ]; do
+    eval "v=\"\${RUNS_${1}_FROM_${k}:-}\""
+    if [ -n "$v" ]; then
+      printf '%s' "$v"
+      return 0
+    fi
+    k=$((k - 1))
+  done
+  eval "printf '%s' \"\${RUNS_${1}:-}\""
+}
+# run_of <run id>: RUN_<id> when a case set one, else that run's row from every workflow's feed as
+# this round serves it — a run that finishes between rounds reads finished from the round whose
+# feed shows it so.
 run_of() {
-  local v all=""
+  local v all="" wid
   eval "v=\"\${RUN_$1:-}\""
   if [ -n "$v" ]; then
     printf '%s' "$v"
     return 0
   fi
-  for v in $(set | LC_ALL=C sed -n 's/^\(RUNS_[0-9][0-9]*\)=.*/\1/p'); do
-    all="$all${!v}"
+  for wid in $(compgen -v | LC_ALL=C sed -n 's/^RUNS_\([0-9][0-9]*\)\(_FROM_[0-9][0-9]*\)\{0,1\}$/\1/p' | sort -u); do
+    all="$all$(runs_of "$wid")"
   done
   jq -cs --argjson id "$1" '[.[].workflow_runs[] | select(.id == $id)] | first // {}' <<<"$all"
 }
@@ -265,6 +293,9 @@ reset_fixture() {
   HEAD_RUNS_LATER=""
   fixture_call_reset headruns
   FIRST_READ_DELAY=""
+  RUNS_READ_DELAY=""
+  AGED_RUN_ID=""
+  AGED_RUN_SECS=""
   : >"$DELAY_LOG"
   : >"$PAGINATE_LOG"
   TIP_AT_ROUND=""
@@ -277,10 +308,10 @@ reset_fixture() {
 }
 
 gh() {
-  local response="" rid wid sha base reads
+  local response="" rid wid sha base reads round=""
   # The delay, once — on the FIRST read of the run, which is the round's tip read.
-  if [ -n "$FIRST_READ_DELAY" ] && [ ! -s "$DELAY_LOG" ]; then
-    printf 'x\n' >>"$DELAY_LOG"
+  if [ -n "$FIRST_READ_DELAY" ] && ! grep -qx 'first read' "$DELAY_LOG"; then
+    printf 'first read\n' >>"$DELAY_LOG"
     sleep "$FIRST_READ_DELAY"
   fi
   gh_fixture_parse "$@"
@@ -314,9 +345,23 @@ gh() {
     # rounds — no case lists one, and `is_advisory` is pr-review.sh's own test for it.)
     # `|| return 1`: the fixture runs in gh_retry's command substitution, which does not inherit
     # errexit, so a count that bails must be turned into a failed read by hand.
-    [ "$wid" != "$(first_wid)" ] || fixture_call_count rounds >/dev/null || return 1
+    if [ "$wid" = "$(first_wid)" ]; then
+      round=$(fixture_call_count rounds) || return 1
+    fi
     response=$(runs_of "$wid")
     [ -n "$response" ] || response=$(runs_json "$wid" '[]')
+    if [ -n "$AGED_RUN_ID" ]; then
+      # Stamped HERE, at the read: the row is AGED_RUN_SECS old on the API's clock when it is
+      # served, however late the read came (`aged_at_read`).
+      response=$(jq -c --argjson id "$AGED_RUN_ID" --argjson s "$AGED_RUN_SECS" \
+        '.workflow_runs |= map(if .id == $id then .created_at = ((now | floor) - $s | todate) else . end)' \
+        <<<"$response") || return 1
+    fi
+    # The delay after the runs read, once: on round one's, which the counter reaches exactly once.
+    if [ -n "$RUNS_READ_DELAY" ] && [ "$round" = 1 ]; then
+      printf 'runs read\n' >>"$DELAY_LOG"
+      sleep "$RUNS_READ_DELAY"
+    fi
     ;;
   "repos/$REPO/actions/runs/"*"/jobs?per_page=100")
     rid=${FIXTURE_ENDPOINT#*/actions/runs/}
@@ -408,7 +453,8 @@ all_red_runs() {
 # Five cases here depend on SECONDS: a retuned grace, a `--wait` ceiling, and a delay inside the
 # fixture. They are the only cases in this repository whose fixture and whose subject are both on
 # the clock, and they went red on a loaded machine twice before settling into one shape. It is
-# three rules, and each of them is a thing that failed:
+# three rules, and each of them is a thing that failed (a fourth, below them, keeps a case that
+# needs an AGE off the clock altogether):
 #
 #   Put the clock in an explicit DELAY. The grace is spent by `spend_grace <seconds>`, which
 #   holds up the round's FIRST read by that much, and never by "however long N rounds take".
@@ -428,6 +474,14 @@ all_red_runs() {
 #
 # What is NOT on the clock stays off it: a case that wants an ordinary round asks for `--wait=2`
 # and reads `rounds_polled`, not elapsed time.
+#
+#   Stamp an AGE at the READ. A case that needs a run of a given age when `base` reads it —
+#   just inside a window, just past it — has it stamped by the fixture as it serves the feed
+#   (`aged_at_read`), never computed from the case's own clock before `run_base`: the gap between
+#   the two is load, and a one-second margin spent by it reads the run on the wrong side. Stamped
+#   at the read, an age the script measures at its own snapshot (taken before the read) can only
+#   come out at or under the stamp, and one measured after a `delay_after_runs_read` of <d>
+#   seconds at or over the stamp plus <d> — whatever the box's load.
 
 # spend_grace <seconds>: hold up the fixture's FIRST read by <seconds>, once. An API round takes
 # time, and the grace is measured from when the tip was first READ, so a case that needs the grace
@@ -459,6 +513,39 @@ at_round() {
   TIP_NEXT="$2"
 }
 
+# runs_from_round <k> <workflow id> <runs as runs_json's overrides>: from the <k>th round on,
+# that workflow's runs feed answers these runs, until a later round set the same way takes over.
+# Rounds before the first <k> read RUNS_<id>, so <k> starts at 2. This is how a run FINISHES
+# between rounds, or a moved tip's own run appears — a feed that can change between rounds is
+# what the interim's re-round needs to be pinned by its outcome (ludics-lite#426), not only by
+# how many rounds it took. The rounds are the counter's, so a feed changes on the read that opens
+# its round, and the tip read before it still belongs to that round.
+runs_from_round() {
+  [ $# -eq 3 ] || bail "runs_from_round: \`runs_from_round <round> <workflow id> <runs>\`, got $# argument(s)"
+  case "$1" in '' | *[!0-9]* | 0 | 1 | 0*) bail "runs_from_round: a round number from 2 (round one is RUNS_<id>), got '$1'" ;; esac
+  case "$2" in '' | *[!0-9]*) bail "runs_from_round: a workflow id, got '$2'" ;; esac
+  printf -v "RUNS_${2}_FROM_${1}" '%s' "$(runs_json "$2" "$3")"
+}
+
+# delay_after_runs_read <seconds>: hold up the fixture's answer to round one's runs read by
+# <seconds>, once — wall clock between the moment the round's runs were read and everything the
+# round does after them (the interim's source, its re-read, its newcomer hold). What it pins is
+# WHICH clock a check reads: one taken before the reads cannot see the delay, one taken after can.
+delay_after_runs_read() {
+  case "$1" in '' | *[!0-9]* | 0) bail "delay_after_runs_read: whole seconds from 1, got '$1'" ;; esac
+  RUNS_READ_DELAY="$1"
+}
+
+# aged_at_read <run id> <seconds>: the feed serves that run created <seconds> before the moment
+# it is read, on whatever round reads it. See "Stamp an AGE at the READ" above.
+aged_at_read() {
+  [ $# -eq 2 ] || bail "aged_at_read: \`aged_at_read <run id> <seconds>\`, got $# argument(s)"
+  case "$1" in '' | *[!0-9]*) bail "aged_at_read: a run id, got '$1'" ;; esac
+  case "$2" in '' | *[!0-9]*) bail "aged_at_read: whole seconds, got '$2'" ;; esac
+  AGED_RUN_ID="$1"
+  AGED_RUN_SECS="$2"
+}
+
 # Everything above is in scope in all three suites, exactly as pr-review.sh's functions are, so it
 # is protected exactly as they are: the preamble's snapshot was taken before this file existed, and
 # `protect_library` extends it over what this file defines (review of ludics-lite#212, round 1).
@@ -476,6 +563,11 @@ protect_library "${BASH_SOURCE[0]}"
 fixture_gh() { local ep="$1"; shift; gh api "repos/$REPO/$ep" "$@"; }
 tip_read() { fixture_gh "commits/$BRANCH" --jq .sha; }
 runs_read() { fixture_gh "actions/workflows/$1/runs?branch=$BRANCH&event=push&per_page=10" >/dev/null; }
+# runs_feed <workflow id>: one runs read, answered as `<id>:<conclusion>` per row, newest first.
+runs_feed() {
+  fixture_gh "actions/workflows/$1/runs?branch=$BRANCH&event=push&per_page=10" \
+    --jq '[.workflow_runs[] | "\(.id):\(.conclusion)"] | join(" ")'
+}
 
 # One read of the first listed workflow's runs feed is one round; nothing else is. A second
 # workflow is listed here because counting the runs feed as a whole — the obvious reading — would
@@ -539,13 +631,93 @@ test_at_round_moves_the_tip_inside_the_round_it_names() {
   assert_eq "$(tip_read)" "$SHA_C" "a move is cleared with the rest of the fixture"
 }
 
-# Both setters refuse what they cannot mean. `spend_grace 0.5` is the one that would pass for
+# A feed set from a round on answers from that round's read on — the read that OPENS the round,
+# so its tip read still belongs to it — and keeps answering until a later one takes over. A second
+# workflow's feed follows the same round, the per-id read serves the run as the round's feed has
+# it, and every one of them is cleared with the rest of the fixture.
+test_a_runs_feed_changes_on_the_round_it_names() {
+  reset_fixture
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"fixtures"}]')
+  RUNS_1=$(runs_json 1 '[{"id":7,"status":"in_progress","conclusion":null}]')
+  RUNS_2=$(runs_json 2 '[{"id":8,"conclusion":"success"}]')
+  runs_from_round 2 1 '[{"id":7,"conclusion":"failure"}]'
+  runs_from_round 2 2 '[{"id":9,"conclusion":"success"},{"id":8,"conclusion":"success"}]'
+  runs_from_round 4 1 '[{"id":10,"conclusion":"success"},{"id":7,"conclusion":"failure"}]'
+  assert_eq "$(runs_feed 1)" "7:null" "round one reads RUNS_1"
+  assert_eq "$(runs_feed 2)" "8:success" "and so does the second workflow's read in it"
+  assert_eq "$(fixture_gh actions/runs/7 --jq .status)" in_progress "the run reads as round one has it"
+  assert_eq "$(runs_feed 1)" "7:failure" "round two's read opens round two, and answers its feed"
+  assert_eq "$(runs_feed 2)" "9:success 8:success" "the second workflow follows the same round"
+  assert_eq "$(fixture_gh actions/runs/7 --jq .conclusion)" failure "and the run reads finished"
+  assert_eq "$(runs_feed 1)" "7:failure" "round three keeps the latest feed not past it"
+  assert_eq "$(runs_feed 1)" "10:success 7:failure" "until a later round's takes over"
+  assert_eq "$(rounds_polled)" 4 "one round per first-workflow read, as ever"
+  reset_fixture
+  assert_eq "$(runs_feed 1)" "" "a per-round feed is cleared with the rest of the fixture"
+  runs_read 1
+  assert_eq "$(runs_feed 1)" "" "on every round"
+}
+
+# The delay after the runs read is round one's, and it happens once, AFTER that read is answered
+# rather than before the round's tip read: a clock taken before the runs cannot see it.
+test_the_runs_read_delay_is_round_ones_and_once() {
+  local started elapsed
+  reset_fixture
+  delay_after_runs_read 1
+  started=$(date +%s)
+  tip_read >/dev/null
+  elapsed=$(($(date +%s) - started))
+  assert_eq "$(delays_taken)" 0 "the tip read is not held up ($elapsed s)"
+  started=$(date +%s)
+  runs_read 1
+  elapsed=$(($(date +%s) - started))
+  assert_eq "$(delays_taken)" 1 "round one's runs read is"
+  [ "$elapsed" -ge 1 ] || bail "the delay should be real wall clock (took ${elapsed}s)"
+  tip_read >/dev/null
+  runs_read 1
+  assert_eq "$(delays_taken)" 1 "and round two's is not"
+  # The first-read delay and this one are told apart: setting both takes each once.
+  reset_fixture
+  spend_grace 1
+  delay_after_runs_read 1
+  runs_read 1
+  tip_read >/dev/null
+  assert_eq "$(sort "$DELAY_LOG" | tr '\n' ,)" "first read,runs read," "each delay is taken once, on its own read"
+}
+
+# The aged run is stamped when the feed is READ, not when the case set it: a first-read delay
+# between the two shows which, since a stamp taken at the setter would come out a second older.
+test_an_aged_run_is_stamped_at_the_read() {
+  local before after created
+  reset_fixture
+  RUNS_1=$(runs_json 1 '[{"id":7,"status":"in_progress","conclusion":null},{"id":6}]')
+  aged_at_read 7 100
+  spend_grace 1
+  tip_read >/dev/null
+  before=$(date +%s)
+  created=$(fixture_gh "actions/workflows/1/runs?branch=$BRANCH&event=push&per_page=10" \
+    --jq '.workflow_runs[] | select(.id == 7) | .created_at | fromdateiso8601')
+  after=$(date +%s)
+  [ "$created" -ge $((before - 100)) ] && [ "$created" -le $((after - 100)) ] ||
+    bail "run 7 should be served 100s old at the read: created $created, read between $before and $after"
+  assert_eq "$(fixture_gh "actions/workflows/1/runs?branch=$BRANCH&event=push&per_page=10" \
+    --jq '.workflow_runs[1].created_at')" "2026-09-10T00:58:00Z" "and only that run is restamped"
+  reset_fixture
+  RUNS_1=$(runs_json 1 '[{"id":7,"status":"in_progress","conclusion":null}]')
+  assert_eq "$(fixture_gh "actions/workflows/1/runs?branch=$BRANCH&event=push&per_page=10" \
+    --jq '.workflow_runs[0].created_at')" "2026-09-10T00:59:00Z" \
+    "the stamp is cleared with the rest of the fixture"
+}
+
+# Every setter refuses what it cannot mean. `spend_grace 0.5` is the one that would pass for
 # honoured: the fixture would sleep a fraction on the platforms whose sleep takes one and refuse
 # on the fleet's others, so a case would spend a grace on one box and not on the next.
-test_the_wall_clock_setters_refuse_what_they_cannot_mean() {
+test_the_fixture_setters_refuse_what_they_cannot_mean() {
   local rc
   reset_fixture
-  for rc in "spend_grace 0.5" "spend_grace x" "at_round 0 $SHA_B" "at_round x $SHA_B"; do
+  for rc in "spend_grace 0.5" "spend_grace x" "at_round 0 $SHA_B" "at_round x $SHA_B" \
+    "runs_from_round 1 1 '[]'" "runs_from_round 02 1 '[]'" "runs_from_round 2 x '[]'" "runs_from_round 2 1" \
+    "delay_after_runs_read 0" "delay_after_runs_read 0.5" "aged_at_read x 5" "aged_at_read 7 1.5" "aged_at_read 7"; do
     set +e
     # shellcheck disable=SC2086 # two words, and they are meant to be two arguments
     (eval $rc) 2>"$TEST_ROOT/refusal"
@@ -625,9 +797,9 @@ test_reset_fixture_refuses_to_unset_a_name_it_did_not_create() {
   assert_eq "$rc" 2 "a key pattern over a library name is refused ($(cat "$TEST_ROOT/refusal"))"
   assert_contains "$(cat "$TEST_ROOT/refusal")" "in scope before any case ran: WORKFLOW_YAML_FILTER —" \
     "the refusal should name the library variable the pattern matched, alone"
-  RUNS_7=x JOBS_7003=x RUN_7003=x WORKFLOW_PATH_7=x YAML_OF_nightly=x FILES_d=x
+  RUNS_7=x RUNS_7_FROM_2=x JOBS_7003=x RUN_7003=x WORKFLOW_PATH_7=x YAML_OF_nightly=x FILES_d=x
   reset_fixture
-  for v in RUNS_7 JOBS_7003 RUN_7003 WORKFLOW_PATH_7 YAML_OF_nightly FILES_d; do
+  for v in RUNS_7 RUNS_7_FROM_2 JOBS_7003 RUN_7003 WORKFLOW_PATH_7 YAML_OF_nightly FILES_d; do
     assert_eq "${!v-unset}" unset "reset_fixture should clear the per-key answer $v"
   done
   assert_eq "$(jq -c '.workflow_runs' <<<"$RUNS_1")" '[]' "and set RUNS_1 afresh"
@@ -637,7 +809,10 @@ tests=(
   test_the_round_counter_counts_rounds_and_not_reads
   test_the_grace_is_spent_once_on_the_first_read
   test_at_round_moves_the_tip_inside_the_round_it_names
-  test_the_wall_clock_setters_refuse_what_they_cannot_mean
+  test_a_runs_feed_changes_on_the_round_it_names
+  test_the_runs_read_delay_is_round_ones_and_once
+  test_an_aged_run_is_stamped_at_the_read
+  test_the_fixture_setters_refuse_what_they_cannot_mean
   test_a_suite_that_skips_the_preamble_is_refused
   test_a_suite_that_shadows_the_transport_is_refused
   test_reset_fixture_refuses_to_unset_a_name_it_did_not_create
