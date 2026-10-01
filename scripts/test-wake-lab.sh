@@ -2582,10 +2582,13 @@ sweep_env() { # sweep_env <lock-dir|-> <home> -- sets SWEEP_ENV, the `env -i` ar
 # `${name[@]}` or `${name[*]}` (`#` or not), which bash 4.4 and later expand to nothing when unset
 # even under `set -u`; and a `-v name` test after `[`, `[[` or `test`. Each would quietly take its
 # fallback where the sweep had a value, which is ludics-lite#469's shape again with the error
-# swallowed. It reads the whole fragment text, comments and quoted spans included, so an
+# swallowed. Refused outright, as what would blind the run itself: a `-v` whose operand is not a
+# bare name (quoted, or computed), and anything that turns `set -u` off (`set +u`, or any mention
+# of `nounset`). It reads the whole fragment text, comments and quoted spans included, so an
 # occurrence is over-reported, never missed -- a whole-array read of the fragment's own `local`
-# array included, which is loud. Anything else that asks whether a name is set (`declare -p`,
-# `compgen -v`) is out of bounds.
+# array included, which is loud. Out of bounds: anything else that asks whether a name is set
+# (`declare -p`, `compgen -v`), and a nounset failure the fragment itself silences and recovers
+# from (`( ... ) 2>/dev/null || fallback`), which the sweep's own `set -u` would not see either.
 fragment_defaulted() {
   perl -e '
     my ($file, @bound) = @ARGV;
@@ -2594,11 +2597,15 @@ fragment_defaulted() {
     my $id = qr/[A-Za-z_][A-Za-z0-9_]*/;
     open my $fh, "<", $file or die "$file: $!\n";
     while (<$fh>) {
-      print "refused \${!\n" if /\$\{!/ && !$seen{"\${!"}++;
-      for my $n (/\$\{($id)(?:\[[^\]]*\])?:?[-=+?]/g, /\$\{#?($id)\[[@*]\]/g,
-                 /(?:\[\[?|\btest)[ \t]+(?:![ \t]+)?-v[ \t]+($id)/g) {
-        print "$n\n" unless $ok{$n} || $seen{$n}++;
+      my @refused;
+      push @refused, "\${!" if /\$\{!/;
+      push @refused, "set +u" if /\bset[ \t]+(?:[-+][A-Za-z]*[ \t]+)*\+[A-Za-z]*u|\bnounset\b/;
+      my @names = (/\$\{($id)(?:\[[^\]]*\])?:?[-=+?]/g, /\$\{#?($id)\[[@*]\]/g);
+      for my $v (/(?:\[\[?|\btest)[ \t]+(?:![ \t]+)?-v[ \t]+([^\s\]]+)/g) {
+        if ($v =~ /^$id$/) { push @names, $v } else { push @refused, "-v $v" }
       }
+      for (@refused) { print "refused $_\n" unless $seen{"refused $_"}++ }
+      for my $n (@names) { print "$n\n" unless $ok{$n} || $seen{$n}++ }
     }
     close $fh or die "$file: $!\n";' "$@"
 }
@@ -2606,7 +2613,7 @@ fragment_defaulted() {
 # fail proves nothing. Each planted_* reads one name nothing binds, in a way the copy step's old
 # anchors could not see, and must be reported by name; planted_bound reads only what sweep_env
 # binds and must run clean. The text check must report exactly the defaulted, indirect, `-v` and
-# whole-array reads, and not awk's `-v a=`.
+# whole-array reads and the refusals, and not awk's `-v a=`.
 cat >"$TMP/planted-fragment.sh" <<'EOF'
 PLANTED_TOP=${PLANTED_DEFAULTED:-fallback}
 planted_plain() { printf '%s\n' "$LAB_MAP $PLANTED_PLAIN"; }
@@ -2618,6 +2625,8 @@ planted_indirect() { local r=LAB_MAP; printf '%s\n' "${!r}"; }
 planted_tested() { [ -v PLANTED_TESTED ] && printf '%s\n' set; }
 planted_awk() { awk -v a="$1" '{ print a }' </dev/null; }
 planted_array() { printf '%s\n' "${PLANTED_ARRAY[@]}"; }
+planted_unguarded() { set +u; }
+planted_computed() { [ -v "$PLANTED_NAME" ] && printf '%s\n' set; }
 EOF
 sweep_env "$LOCKS" "$TMP/sweep-home-planted"
 for planted in plain branch arith subst; do
@@ -2635,7 +2644,8 @@ rc=$?
   || ko "a planted fragment reading only bound names failed under sweep_env (rc=$rc) -- $out"
 sweep_env "$LOCKS" "$HOME"
 if out=$(fragment_defaulted "$TMP/planted-fragment.sh" "${SWEEP_ENV[@]%%=*}"); then
-  want=$(printf '%s\n' PLANTED_DEFAULTED 'refused ${!' PLANTED_TESTED PLANTED_ARRAY)
+  want=$(printf '%s\n' PLANTED_DEFAULTED 'refused ${!' PLANTED_TESTED PLANTED_ARRAY \
+    'refused set +u' 'refused -v "$PLANTED_NAME"')
   [ "$out" = "$want" ] \
     && ok "the text check reports exactly the planted reads set -u lets through unset" \
     || ko "the text check is off on the planted fragment -- want [$want], got [$out]"
