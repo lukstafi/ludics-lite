@@ -2507,11 +2507,11 @@ out=$(env WAKE_LAB_HOSTS="$TMP/absent.sh" WAKE_LAB_LOCK_DIR="$LOCKS" "$WL" lock-
 # --- the lock contract with the ocannl sweep, compared across the two repositories ---------------
 # Every case above pins this side against a literal; none of them compares the two sides, and the
 # interlock is an agreement between two repositories that nothing enforces. This script refuses to
-# destroy a box whose lock is held, ocannl-staging's `tools/sweep.sh` takes that lock, and neither
-# reads anything from the other -- deliberately, so that a sweep checkout on a box with no
-# `~/bin/wake-lab.sh` still reserves correctly. Three facts therefore have to stay equal by hand:
-# the directory, the `<box>.lock` filename, and the box NAME the sweep derives from an ssh alias in
-# its own `lab_box_of`. Every way they drift is silent in the safe-looking direction -- the two
+# destroy a box whose lock is held, and ocannl-staging's `tools/sweep.sh` takes that lock itself.
+# Which box an ssh alias reserves the sweep reads from this repository (its `lab_box_of` looks the
+# alias up in `wake-lab.sh endpoint-map`'s answer, staging ac1dbc153); the rest it holds by hand, so
+# three facts have to stay equal: the directory, the `<box>.lock` filename, and the box NAME that
+# lookup yields. Every way they drift is silent in the safe-looking direction -- the two
 # sides simply stop meeting, this script finds no lock, and a restart destroys a VM mid-sweep. That
 # is the 2026-09-16 incident, which was read as a GPU fault for two days (ludics-lite#170).
 #
@@ -2546,6 +2546,105 @@ created() { # created <dir> -- every regular file under it, relative and shell-q
     < <(find "$1" -type f -print0 2>/dev/null)
   printf '%s' "${out# }"
 }
+# What this suite binds for the fragment it copies out of the sweep, beside what the fragment binds
+# itself. sweep_lock below binds every one of these but SECONDS, which is bash's own, and the copy
+# step checks the fragment against exactly this list, so the two cannot drift apart:
+#   HOME, WAKE_LAB_LOCK_DIR  the inputs of the fragment's LAB_LOCK_DIR line, set (or unset) per case
+#   LAB_LOCK_WAIT            take_lab_lock's wait, see sweep_lock
+#   LAB_MAP                  lab_box_of's table, which the sweep's lab_map fills from
+#                            `wake-lab.sh endpoint-map`; this suite fills it the same way
+#   stamp                    the run stamp take_lab_lock writes into its advisory holder line
+# SWEEP_FOREIGN names, per function, a `$name` that belongs to a program the function hands to
+# another interpreter, which fragment_unbound reads as shell: awk's field loop in lab_box_of.
+SWEEP_BOUND=(HOME WAKE_LAB_LOCK_DIR LAB_LOCK_WAIT LAB_MAP stamp SECONDS)
+SWEEP_FOREIGN=(lab_box_of:i)
+# fragment_unbound <fragment> -- every variable the fragment reads that neither it nor SWEEP_BOUND
+# binds, as `<function>: <name>`, and `<function>: refused <construct>` for text it will not read;
+# empty output means every read is bound. The copy step refuses the import on any line, rather
+# than letting the cases run a function whose input this suite never set: when lab_box_of came to
+# read LAB_MAP the copy did not carry it, the box resolved empty, and five cases reported that as
+# the two repositories disagreeing (ludics-lite#469). The single-anchor checks could not see it.
+#
+# Its grammar, as a fail-closed allowlist. Each function is read as bash itself prints it
+# (`declare -f` in a clean shell, so comments are gone), and the fragment's top-level lines as
+# written: those outside the `name() {` ... `}` ranges the copy step cuts. A READ is any `$name`,
+# `${name` or `${#name`, quoted or not, and every name inside a `((...))`. A name is BOUND by SWEEP_BOUND, by an assignment on the fragment's top level, and,
+# within one function, by its `local` list or an assignment anywhere in its body. Reads inside
+# single quotes are checked too, so an awk or perl `$name` is over-reported (hence SWEEP_FOREIGN),
+# never missed. Text through which a variable can be read any other way -- `[[`, `let`, `eval`,
+# `declare`, `typeset`, `source`, a `.` command, `${!`, or a `local` given an option (`-n`, `-i`)
+# -- is refused, not scanned. Out of bounds: a function the fragment CALLS without copying it
+# (take_lab_lock's `say`, reached only after a wait), and whether an assignment in a body comes
+# before the read it binds.
+fragment_unbound() {
+  local fns
+  fns=$(env -i PATH="$PATH" bash --noprofile --norc -c '. "$1" >/dev/null 2>&1 </dev/null || exit 1
+    declare -F | while read -r _ _ f; do printf "\f%s\n" "$f"; declare -f "$f"; done' _ "$1") \
+    || { printf '%s\n' '(fragment): refused: it does not source in a clean bash'; return 0; }
+  { printf '\f%s\n' '(top level)'
+    awk '/^[A-Za-z_][A-Za-z0-9_]*\(\) *\{/ { body = 1 }
+         !body && !/^[[:space:]]*(#|$)/ { print }
+         body && /^}/ { body = 0 }' "$1"
+    printf '%s\n' "$fns"
+  } | perl -e '
+    use strict; use warnings;
+    my (%bound, %foreign);
+    for (@ARGV) { if (/:/) { $foreign{$_} = 1 } else { $bound{$_} = 1 } }
+    my $id = qr/[A-Za-z_][A-Za-z0-9_]*/;
+    local $/ = "\f";
+    while (my $unit = <STDIN>) {
+      chomp $unit;
+      next if $unit eq "";
+      my ($where, $text) = split /\n/, $unit, 2;
+      $text = "" unless defined $text;
+      my (@refused, %mine, %reads);
+      push @refused, $1
+        while $text =~ /(\[\[|\$\{!|(?<![\w.-])(?:let|eval|declare|typeset|source)(?![\w-]))/g;
+      push @refused, "." if $text =~ /(?:^|[;&|(])[ \t]*\.[ \t]/m;
+      while ($text =~ /^[ \t]*local[ \t]+([^\n]*)/mg) {
+        (my $list = $1) =~ s/\$\(\(.*?\)\)|\$\([^()]*\)|"[^"]*"|\x27[^\x27]*\x27//g;
+        for my $w (split " ", $list) {
+          $w =~ s/;$//;
+          if ($w =~ /^-/) { push @refused, "local $w"; next }
+          $mine{$1} = 1 if $w =~ /^($id)(?:=|$)/;
+        }
+      }
+      $mine{$1} = 1 while $text =~ /(?:^|[\s;&|(])($id)\+?=(?!=)/mg;
+      $reads{$1} = 1 while $text =~ /\$\{?#?($id)/g;
+      while ($text =~ /\(\((.*?)\)\)/sg) {
+        (my $expr = $1) =~ s/\$\([^()]*\)//g;
+        $reads{$1} = 1 while $expr =~ /(?<![\w#])($id)/g;
+      }
+      print "$where: refused $_\n" for @refused;
+      for (sort keys %reads) {
+        print "$where: $_\n" unless $bound{$_} || $mine{$_} || $foreign{"$where:$_"};
+      }
+      if ($where eq "(top level)") { $bound{$_} = 1 for keys %mine }
+    }' "${SWEEP_BOUND[@]}" "${SWEEP_FOREIGN[@]}"
+}
+# The negative control, which needs no staging checkout and so runs in CI too: a checker that
+# cannot fail proves nothing. A planted fragment in the real one's shape, with one unbound read of
+# each kind the grammar names, one read of each kind that IS bound, a comment that must not count,
+# awk's foreign `$i`, and one refused construct.
+cat >"$TMP/planted-fragment.sh" <<'EOF'
+LAB_LOCK_DIR=${WAKE_LAB_LOCK_DIR:-$HOME/.local/state/wake-lab}
+lab_box_of() { # ssh-alias -- the $COMMENTED_OUT table
+  awk -v a="$1" '{ for (i = 2; i <= NF; i++) if ($i == a) print $1 }' <<<"$PLANTED_MAP"
+}
+take_lab_lock() {
+  local box=$1 deadline=$((SECONDS + PLANTED_WAIT))
+  path=$LAB_LOCK_DIR/$box.lock
+  printf '%s\n' "$path $deadline ${#LAB_MAP} $stamp"
+}
+planted_let() {
+  let n=PLANTED_LET+1
+}
+EOF
+out=$(fragment_unbound "$TMP/planted-fragment.sh")
+want=$(printf '%s\n' 'lab_box_of: PLANTED_MAP' 'planted_let: refused let' 'take_lab_lock: PLANTED_WAIT')
+[ "$out" = "$want" ] \
+  && ok "the copy step's unbound-variable check flags exactly the planted reads and the refused let" \
+  || ko "the copy step's unbound-variable check is off on a planted fragment -- want [$want], got [$out]"
 # take_lab_lock's own wait is LAB_LOCK_WAIT, which is not among the lines extracted below; give it
 # a small explicit value rather than letting it be unset, so a contended case fails in seconds and
 # nothing depends on how the shell reads an empty arithmetic operand. A subshell rather than an
@@ -2561,6 +2660,8 @@ sweep_lock() { # sweep_lock <lock-dir|-> <home> <ssh-alias> [<ready> <keep>]
     else WAKE_LAB_LOCK_DIR=$1; export WAKE_LAB_LOCK_DIR; fi
     HOME=$2; export HOME
     LAB_LOCK_WAIT=2; export LAB_LOCK_WAIT
+    LAB_MAP=$SWEEP_MAP; export LAB_MAP
+    stamp=test-wake-lab; export stamp
     # Its OWN process group, so the watchdog below can kill the whole tree. Killing the wrapper
     # alone leaves whatever it was blocked in -- a `sleep`, a blocking flock -- orphaned WITH the
     # inherited lock descriptor, and an flock lives until every descriptor onto that open file
@@ -2645,6 +2746,22 @@ its lock the way the cases below assume, so they would stop being about the live
       sed -n '/^lab_box_of() {/,/^}/p' "$SWEEP"
       sed -n '/^take_lab_lock() {/,/^}/p' "$SWEEP"
     } >"$TMP/sweep-lock.sh"
+    unbound=$(fragment_unbound "$TMP/sweep-lock.sh")
+    # The map the sweep's lab_map would read, asked of this checkout's wake-lab over this suite's
+    # hosts table. Empty is a refusal too: every lab_box_of would then answer nothing.
+    SWEEP_MAP=$(env WAKE_LAB_HOSTS="$TMP/hosts.sh" "$WL" endpoint-map 2>&1); map_rc=$?
+    if [ -n "$unbound" ]; then
+      anchors=0
+      ko "the fragment copied out of origin/master's sweep reads what neither it nor this suite \
+binds, so the cases below would run it on an input nobody set and report whatever that yields as \
+the two repositories disagreeing (ludics-lite#469) -- bind it in sweep_lock and SWEEP_BOUND, or copy \
+its definition: ${unbound//$'\n'/; }"
+    elif [ "$map_rc" -ne 0 ] || [ -z "$SWEEP_MAP" ]; then
+      anchors=0
+      ko "wake-lab endpoint-map gave no map for the sweep's lab_box_of (rc=$map_rc) -- $SWEEP_MAP"
+    fi
+  fi
+  if [ "$anchors" -eq 1 ]; then
     for pair in rog-nv-wsl:rog minix-amd-wsl:minix; do
       sshalias=${pair%%:*}; box=${pair##*:}
       # A HOME of its own per box: the sweep derives its directory from $HOME, so this keeps the
