@@ -513,11 +513,15 @@ a script of its own in ludics-lite#247, and preflight runs it as one more step):
 but a push ran them, nothing probed them, and the file list they sweep was spelled three times in
 the YAML and a fourth time by hand in whatever buffer the next worker pre-flighted a push in. The suites
 run on every push to main and on a pull request that touches anything but Markdown (the top-level
-README counts as script input, since the fleet suite executes its install loops); three jobs run on
-every head regardless, the prompt hygiene check (`scripts/check-prompts.sh`), the lint, and the
-sync-routines suite, so every PR's merge gate reads a verdict rather than `ABSENT`, a prompt-only
-PR included. The third is unconditional for a reason of its own: the routines-table pin it carries
-is broken by exactly the all-Markdown PR the classification calls prompt-only.
+README counts as script input, since the fleet suite executes its install loops); two jobs run on
+every head regardless, the lint and the small guards, so every PR's merge gate reads a verdict
+rather than `ABSENT`, a prompt-only PR included. The small guards job gathers the prompt hygiene
+check (`scripts/check-prompts.sh`) and the Ubuntu suites short enough not to deserve a runner of
+their own, the sync-routines suite among them, which is unconditional for a reason of its own: the
+routines-table pin it carries is broken by exactly the all-Markdown PR the classification calls
+prompt-only. Every job's `timeout-minutes` is sized from measured runs, by the rule the workflow
+states at its head (ludics-lite#474), since a green job that crosses its cap concludes with no
+verdict.
 
 The reporter and hostile-runner Python controls run on Ubuntu; the driver fixture runs on Windows.
 ship-pr's shell suites run a third time under Git Bash, in the `git-bash` job on `windows-latest`

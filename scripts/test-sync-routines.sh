@@ -1307,7 +1307,8 @@ fi
 # PR prompt-only when every file it touches is Markdown other than the top-level README -- and a PR
 # that adds or relabels a local routine can be exactly that (routines/README.md plus a prompt). So
 # this suite's job must carry no `if:` and no `needs:`, or the one check that compares the table
-# with LOCAL_ROUTINES is skipped on precisely the PRs that can break it.
+# with LOCAL_ROUTINES is skipped on precisely the PRs that can break it. That job is `prompts`,
+# the small guards (ludics-lite#474), which runs this suite as one of its steps.
 WORKFLOW="$ROOT/.github/workflows/skill-scripts.yml"
 # The block of one job: from `  <name>:` to the next line at that indent. A narrow read, like the
 # table read above, and the emptiness guard is the same idea.
@@ -1320,16 +1321,16 @@ job_block() {
   ' "$2"
 }
 if [ -f "$WORKFLOW" ]; then
-  block=$(job_block sync-routines "$WORKFLOW")
+  block=$(job_block prompts "$WORKFLOW")
   if [ -n "$block" ]; then
-    ok "the workflow declares a sync-routines job"
+    ok "the workflow declares a prompts job"
     contains "$block" 'test-sync-routines.sh' \
-      && ok "...that runs this suite" || ko "the sync-routines job does not run this suite"
+      && ok "...that runs this suite" || ko "the prompts job does not run this suite"
     has "$block" '^    (if|needs):' \
-      && ko "the sync-routines job is conditioned on the diff classification, so the routines-table pin is skipped on an all-Markdown PR -- the one shape that breaks it" \
+      && ko "the prompts job is conditioned on the diff classification, so the routines-table pin is skipped on an all-Markdown PR -- the one shape that breaks it" \
       || ok "...unconditionally, so an all-Markdown PR is judged by it too"
   else
-    ko "no sync-routines job in $WORKFLOW -- nothing runs this suite"
+    ko "no prompts job in $WORKFLOW -- nothing runs this suite"
   fi
 else
   ko "no $WORKFLOW to read"
@@ -1337,10 +1338,10 @@ fi
 # The negative controls: the same reader over a scratch workflow, conditioned and unconditioned.
 cat > "$TMP/wf-conditioned.yml" <<'EOF'
 jobs:
-  prompts:
+  lint:
     runs-on: ubuntu-latest
-  sync-routines:
-    name: sync-routines (ubuntu)
+  prompts:
+    name: small guards (ubuntu)
     needs: changes
     if: ${{ needs.changes.outputs.scripts == 'true' }}
     steps:
@@ -1348,20 +1349,20 @@ jobs:
   macos:
     runs-on: macos-latest
 EOF
-has "$(job_block sync-routines "$TMP/wf-conditioned.yml")" '^    (if|needs):' \
+has "$(job_block prompts "$TMP/wf-conditioned.yml")" '^    (if|needs):' \
   && ok "the job reader sees an if:/needs: line when one is there, so the verdict above can fail" \
   || ko "the job reader misses a conditioned job -- the verdict above means nothing"
 cat > "$TMP/wf-plain.yml" <<'EOF'
 jobs:
-  sync-routines:
-    name: sync-routines (ubuntu)
+  prompts:
+    name: small guards (ubuntu)
     steps:
       - run: scripts/test-sync-routines.sh
   macos:
     needs: changes
     if: ${{ always() }}
 EOF
-has "$(job_block sync-routines "$TMP/wf-plain.yml")" '^    (if|needs):' \
+has "$(job_block prompts "$TMP/wf-plain.yml")" '^    (if|needs):' \
   && ko "the job reader read past the end of the job into the next one" \
   || ok "...and stops at the next job, so a neighbour's condition is not read as this job's"
 
