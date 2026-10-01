@@ -114,8 +114,9 @@
 #   fleet-worker.sh execution hold [--why <text>] [--request <id>] -- <command...>   # run under
 #                          # THIS box's OS-level sleep guard alone (a systemd-inhibit block lock;
 #                          # bare where none): the wrapper for an exclusive measurement, and what
-#                          # `slot` runs inside; with --request <id> (the measurement's), an
-#                          # `execution slot` inside it runs under the hold instead of refusing
+#                          # `slot` runs inside; with --request <id> (the measurement's), it
+#                          # first takes every slot of the box (waiting for running batches), and
+#                          # an `execution slot` inside it runs under the hold instead of refusing
 #   fleet-worker.sh execution reserve|dispatch|record|reconcile|conclude <json-file>
 #   fleet-worker.sh execution run <json-file>          # reserve + dispatch in one step
 #   fleet-worker.sh execution window <box> <json-file> # `run` for a measurement that suspends the
@@ -2840,6 +2841,19 @@ if mode == "hold":
                            if name.startswith("slot.") and name[5:].isdigit())
         except OSError:
             pass
+        # A hold nested in a live hold of this same measurement finds the slots held by its
+        # enclosing one, and waiting for them would wait for itself.
+        if os.environ.get("FLEET_MEASUREMENT_HELD") == hold_marker:
+            try:
+                descriptor = os.open(hold_lock, os.O_RDWR)
+            except OSError:
+                pass
+            else:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    indices = set()
+                os.close(descriptor)
         for index in sorted(indices):
             try:
                 descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_CREAT | os.O_RDWR, 0o644)
@@ -2880,11 +2894,17 @@ if mode == "measured":
             return None, "malformed"
         if fields[0] != box:
             return None, "another box's"
+        note = ""
         if measuring != "-":
             outstanding = [i for i in measuring.split(", ") if i]
-            if fields[1] not in outstanding:
+            if not outstanding:
+                # Its measurement is concluded (or never was) while its runner still runs. The live
+                # hold holds every slot of the box (THE DRAIN), so a slot of its own would wait for
+                # that very hold; under it the batch has the box, which is all a slot would give it.
+                note = "the registry has no outstanding measurement %s on %s" % (fields[1], box)
+            elif fields[1] not in outstanding:
                 return None, "the registry has no outstanding measurement %s on %s" % (fields[1], box)
-            if outstanding != [fields[1]]:
+            elif outstanding != [fields[1]]:
                 return None, "other measurements are outstanding on %s too: %s" % (box, measuring)
         # The hold must be live NOW, as an enclosing slot must be: a marker copied into a shell by
         # hand, or left behind by a process that outlived its hold, is not running inside it.
@@ -2896,7 +2916,7 @@ if mode == "measured":
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             os.close(descriptor)
-            return fields[1], ""
+            return fields[1], note
         os.close(descriptor)
         return None, "no `execution hold --request` is live on %s" % box
     request, reason = judged()
@@ -2908,8 +2928,12 @@ if mode == "measured":
                          % (box, marker, reason))
         print("take")
         sys.exit(0)
-    sys.stderr.write("EXECUTION SLOT %s: inside measurement %s, held by an enclosing `execution hold`;"
-                     " no slot taken, for: %s\n" % (box, request, " ".join(command)))
+    if reason:
+        sys.stderr.write("EXECUTION SLOT %s: inside the enclosing `execution hold --request %s`, which holds"
+                         " this box's slots (%s); no slot taken, for: %s\n" % (box, request, reason, " ".join(command)))
+    else:
+        sys.stderr.write("EXECUTION SLOT %s: inside measurement %s, held by an enclosing `execution hold`;"
+                         " no slot taken, for: %s\n" % (box, request, " ".join(command)))
     print("inside")
     sys.exit(0)
 
@@ -3157,6 +3181,13 @@ cmd_execution_slot() {
 # an independent correctness batch on the measured box among them. The hold itself reads no
 # registry, so it never refuses a measurement over the anchor; a mistyped id is caught by the
 # first `slot` inside it, which is refused.
+#
+# THE DRAIN (ludics-lite#481): with --request the hold also takes every slot of the box before the
+# command starts, waiting for a batch that holds one, and the command's tree inherits them, so no
+# batch runs beside a measurement: not one running when it was reserved (a measurement window
+# reserves one on a box whose workers are iterating), nor one that was waiting for a slot then.
+# The slot check reads the registry once, at the batch's start, and cannot see either. A nested
+# hold of the same live measurement takes none, since its enclosing hold holds them.
 # Exit: the command's own status; 127 with `EXECUTION HOLD REFUSED` when it cannot be run; 2 usage.
 cmd_execution_hold() {
   local why="" request="" box dir="" marker="" cap=""

@@ -102,7 +102,8 @@ and a release through five PRs on 2026-09-15 with no stranded worker.
    without `execution slot`, as [executions.md](executions.md#reserve-launch-observe-conclude)
    specifies: under `fleet-worker.sh execution hold --request <request_id> -- <command>`, the
    OS-level sleep guard alone, inside which a runner's own `execution slot` runs instead of
-   being refused. The worker blocks on either kind to completion within the turn ([Blocking on a
+   being refused. The hold first waits for any batch still running on the box (`waits for the
+   batch in slot <n> to end`) and keeps the box's slots until the command's tree ends. The worker blocks on either kind to completion within the turn ([Blocking on a
    run](#blocking-on-a-run)), and ends that turn with one fixed line,
    so the coordinator concludes without grepping run ids out of prose:
 

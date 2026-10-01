@@ -707,6 +707,8 @@ def measurement_window():
         queued = json.loads(out)
         assert (queued['state'], queued['suspended_by'], queued['suspended_from']) == ('suspended', 'window-1', 'launching'), queued
         assert [e['action'] for e in queued['history']] == ['reserve', 'dispatch', 'suspend'], queued['history']
+        # ...and the box being measured is not refreshed for it.
+        assert 'REFRESH DEFERRED mac: measurement window window-1 is measuring there' in err and err.count('REFRESH') == 1, err
         # The window owns a suspended record's state: no dispatch, record or reconcile.
         for action, extra in [('dispatch', {}), ('record', {'state': 'running'}), ('reconcile', {'state': 'reserved'})]:
             out, err = change(action, dict(request_id='iterate-b', evidence='fixture', **extra), expected=1)

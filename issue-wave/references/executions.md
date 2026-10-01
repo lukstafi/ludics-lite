@@ -140,9 +140,25 @@ the verdict, restores every reservation it suspended to its former state, with t
 
 `execution list --active --compact` shows a suspended reservation by its state and its
 `suspended_by`. A retried `window` with the same payload never dispatches twice: it suspends any
-standing reservation still outstanding there and prints the record. A batch already running when
-the window opens runs to its end - the refusal is point-in-time, as for any measurement - so the
-measurement's runner still inspects external activity before timing.
+standing reservation still outstanding there and prints the record. A standing reservation queued
+into a window is not followed by the usual [refresh](#reserve-launch-observe-conclude) of the box,
+which is measuring: `REFRESH DEFERRED <box>` names the refresh to run once the window concludes.
+
+The refusal above is a registry read at the batch's start, so it cannot stop a batch that was
+already running, or already waiting for a slot, when the window opened. **The drain** closes that:
+`execution hold --request <id>` takes every slot of the box (`slot.1` up to the box's count, and
+any other slot file there) before its runner starts, waiting for a running batch to end with
+`EXECUTION HOLD <box>: measurement <id> waits for the batch in slot <n> to end`, and holds them
+for as long as the runner's tree runs. So no batch runs beside the measurement however it was
+admitted: a batch waiting for a slot either ends before the measurement starts or starts after it
+ends. While such a hold is live a `FLEET_SLOT_HELD` marker is not trusted, since the slot it names
+is held by the hold, not by an enclosing batch; the measurement's own runs carry its marker
+instead. A hold nested in a live hold of the same measurement takes no slots (they are its
+enclosing hold's), and a second, concurrent hold of it waits for the first to end. A batch under a
+hold whose measurement is no longer outstanding runs under that hold, which holds the box's
+slots, rather than waiting for one of them. The drain applies to every measurement, though only a
+window's ever had batches to wait for. A slot file the hold cannot lock is a loud `WARNING`, never
+a refused measurement, as with the marker.
 
 **Batching measurements into windows.** When a measurement request arrives for a box where workers
 hold standing reservations, gather every pending measurement request for that box first (the
