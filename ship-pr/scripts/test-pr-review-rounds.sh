@@ -318,19 +318,24 @@ test_the_connector_thread_reply_is_not_a_round() {
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
     "the connector's thread reply opens no round"
   assert_contains "$ROUNDS_OUTPUT" "over 1 head(s)" "and adds no head"
-  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, body:($b + "\n\n")}]')
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, in_reply_to_id:9, body:($b + "\n\n")}]')
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 1 of 12" \
     "trailing whitespace is still the verbatim body"
-  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, body:$b}, {id:2, body:"a real finding"}]')
+  # Only as a THREAD reply (review of #488, round 1): a top-level comment with that text is a finding.
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, body:$b}]')
+  run_rounds
+  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
+    "the text as a top-level comment, replying to nothing, is a round"
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, in_reply_to_id:9, body:$b}, {id:2, body:"a real finding"}]')
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
     "an envelope holding a finding beside the reply is a round"
-  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, body:("The connector answered\n\n> " + $b)}]')
+  INLINE_JSON=$(jq -cn --arg b "$ENV_FAILURE_BODY" '[{id:1, in_reply_to_id:9, body:("The connector answered\n\n> " + $b)}]')
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
     "a finding that quotes the reply is a finding"
-  INLINE_JSON=$(jq -cn '[{id:1, body:"To use Codex here, create an environment for this repo."}]')
+  INLINE_JSON=$(jq -cn '[{id:1, in_reply_to_id:9, body:"To use Codex here, create an environment for this repo."}]')
   run_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
     "a wording the allowlist does not hold verbatim is still a round, loudly"

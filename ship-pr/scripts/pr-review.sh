@@ -1616,8 +1616,10 @@ review_after_nudge() { # <event timestamp> <eligible nudge timestamp, or empty>
 # state read through here, so for both it is not a review of that head.
 #
 # Boundary, as a fail-closed allowlist: CONNECTOR_FIXED_REPLIES holds the verbatim bodies of the
-# replies seen, and a comment matches only when its body, trailing whitespace aside, EQUALS one of
-# them. One body today, taken from comment 4138519259 and the same answer the connector gave six
+# replies seen, and a comment matches only when it IS a thread reply (a numeric `in_reply_to_id`,
+# which the review's own comments endpoint serves) and its body, trailing whitespace aside, EQUALS
+# one of them. A top-level comment carrying that text is a finding, not this reply (review of #488,
+# round 1). One body today, taken from comment 4138519259 and the same answer the connector gave six
 # times in threads of PR #82 (every connector thread reply on this repository and
 # ocannl-staging, read 2026-10-01). Not read: the comment's author (a review's comments are its
 # author's), any other wording, a body that quotes or extends one of these, and an envelope
@@ -1636,7 +1638,7 @@ substantive_reviews() { # <pr>; reviews JSON on stdin
     case "$id" in null | *[!0-9]*) return 1 ;; esac
     inline=$(review_comments "$pr" "$id") || return 1
     if jq -e --argjson fixed "$CONNECTOR_FIXED_REPLIES" '
-        def fixed_reply: (.body | type) == "string"
+        def fixed_reply: (.in_reply_to_id | type) == "number" and (.body | type) == "string"
           and (.body | sub("[[:space:]]+\\z"; "") | IN($fixed[]));
         type == "array" and all(.[]; fixed_reply)' \
       <<<"$inline" >/dev/null; then

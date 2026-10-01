@@ -1021,7 +1021,7 @@ test_empty_reviews_need_their_own_findings() {
   # The connector's environment reply in a thread, which a mention of the handle draws there
   # (ludics-lite#472; inline comment 4138519259 on #465, verbatim), is an envelope too: the head
   # it is filed on was not reviewed.
-  INLINE_JSON='[{"id":4138519259,"body":"To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).","pull_request_review_id":88}]'
+  INLINE_JSON='[{"id":4138519259,"in_reply_to_id":4138480284,"body":"To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).","pull_request_review_id":88}]'
   run_status
   assert_eq "$(state_tok "$STATE")" expected "the connector's thread reply does not review the head"
   FAIL_INLINE=1
