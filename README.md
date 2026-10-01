@@ -233,9 +233,9 @@ mid-sweep destroyed both GPU boxes' VMs and cost that run both GPU units. The sp
 came later, on 2026-09-18: while one lock said both things, the sweep routine's own `--hold` in
 step 1 reserved the boxes against its own sweep in step 2, and three backends went uncovered.
 
-That interlock spans two repositories with nothing enforcing it: the sweep takes the lane lock
-itself, reading only which box an ssh alias belongs to from `wake-lab.sh endpoint-map`, so four
-facts stay equal by hand — the directory, the `<box>.lock` name, the box name that lookup yields, and a negative
+That interlock spans two repositories, and neither side enforces all of it: the sweep takes the
+lane lock itself, reading only which box an ssh alias belongs to from `wake-lab.sh endpoint-map`, so four
+facts must stay equal across the two — the directory, the `<box>.lock` name, the box name that lookup yields, and a negative
 one, that the sweep must never take or honour the **hold** lock. The first three fail open (the two
 sides quietly stop meeting and the interlock is gone) and the fourth fails closed (a held box can
 no longer sweep itself). `test-wake-lab.sh` compares all four against the sweep's own code. It
@@ -247,9 +247,11 @@ lock and checks the other side's real behaviour, since a lock file without a liv
 nothing: a restart is refused while the sweep's own `take_lab_lock` holds the box, and the sweep
 still takes its lane lock while that box's hold lock is held. The checkout is read strictly
 read-only. Where it is absent, as in CI, the case prints a named `SKIP:` line that the summary
-counts, so a green run says what it did not check. The sweep checks the same contract from its
-side at startup: `lab_contract_check` in ocannl-staging's `tools/sweep.sh` asks
-`wake-lab.sh lock-path` for each lane box and refuses the run on a mismatch.
+counts, so a green run says what it did not check. The sweep checks part of the contract from
+its side at startup: `lab_contract_check` in ocannl-staging's `tools/sweep.sh` asks
+`wake-lab.sh lock-path` for each lane box and refuses the run on a mismatch. That covers the
+directory and the `<box>.lock` name for the boxes a run selects; the hold-lock fact, and the
+behaviour behind the files, are `test-wake-lab.sh`'s alone.
 
 `WAKE_LAB_HOSTS` overrides that path. Everything else stays here and reviewable: the common lab
 lore in `wake-lab.sh` and the Windows/WSL lessons in `wake-lab-wsl.sh`, the router endpoints, the
