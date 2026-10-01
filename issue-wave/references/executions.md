@@ -170,8 +170,13 @@ box's endpoints in `wake-lab.sh endpoint-map`) and defers to nothing else; it ho
 and takes no slot itself (ahrefs/ocannl#1097). The other direction is the registry's (#445): a
 `measurement` reserve, run or dispatch refuses a lab box whose lane lock a sweep lane holds, naming
 the holder (`ocannl sweep <stamp> ...`), and holds that lock shared while it writes, so a lane that
-starts after it reads the new record before its first unit. The lock is the anchor's, which is the
-machine that runs `wake-lab.sh` and the sweep. The destroyers (`wake-lab.sh restart-wsl`,
+starts after it reads the new record before its first unit. The lock is read in the anchor's own
+lock directory, which is the lab's only on the machine that runs `wake-lab.sh` and the sweep, so
+before reading it the check verifies that the anchor is that machine (#454): `FLEET_LAB_HOST`
+(default `mac-studio`) must name the anchor, and the anchor must hold a readable wake-lab site
+file. Otherwise the measurement is refused, naming both machines or the missing file, since a
+lane elsewhere could not be seen. Move the anchor and the sweep together, and declare the new
+machine. The destroyers (`wake-lab.sh restart-wsl`,
 `--restart-wsl`, `sleep`, `hibernate`, `down`) likewise refuse a box an outstanding `measurement`
 names, unless `--as=<request_id>` names it as the caller's own; an unreadable registry refuses them,
 and `--force` skips the check. Correctness reservations take part in neither. Before timing

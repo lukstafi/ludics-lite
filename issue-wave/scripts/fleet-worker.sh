@@ -146,6 +146,10 @@
 #   FLEET_BASE_REF: ref from which `launch` starts a worktree when --base is absent; origin/master.
 #   FLEET_ANCHOR: box where lease and halt live; mac-studio.
 #   FLEET_ANCHOR_STATE: anchor state dir; defaults to ISSUE_WAVE_STATE.
+#   FLEET_LAB_HOST: box that runs wake-lab.sh and the lab's sweep, whose lock directory holds the
+#     lab's lane locks; mac-studio. A measurement on a lab box is refused, naming both, unless it is
+#     FLEET_ANCHOR (`local` in either reads as FLEET_LOCAL_BOX), since the registry reads the lane
+#     lock in the anchor's own lock directory (ludics-lite#454; fleet-execution.py's header).
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #     One entry per physical box: the registry refuses a reservation under a roster naming two
 #     aliases of one box, read from wake-lab.sh's endpoint map (ludics-lite#395; endpoint_map).
@@ -247,6 +251,7 @@ detect_local_box() {
 LOCAL_BOX="${FLEET_LOCAL_BOX-$(detect_local_box)}"
 BASE_REF="${FLEET_BASE_REF:-origin/master}"
 ANCHOR="${FLEET_ANCHOR:-mac-studio}"
+LAB_HOST="${FLEET_LAB_HOST:-mac-studio}"
 DEFAULT_BOXES="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
 BOXES="${FLEET_BOXES:-$DEFAULT_BOXES}"
 # A roster as a normalised word list: whitespace-separated, order and repeats ignored, so an
@@ -297,6 +302,8 @@ die() { echo "fleet-worker.sh: $*" >&2; exit 2; }
 feeder_wait_ok() { case "$FEEDER_WAIT" in ''|*[!0-9]*|0*) return 1 ;; esac; }
 
 is_local() { [ "$1" = local ] || { [ -n "$LOCAL_BOX" ] && [ "$1" = "$LOCAL_BOX" ]; }; }
+# A configured box as a fleet name: `local` is this box's own name, or stays `local` when it has none.
+fleet_name() { if [ "$1" = local ] && [ -n "$LOCAL_BOX" ]; then printf '%s' "$LOCAL_BOX"; else printf '%s' "$1"; fi; }
 
 # A configured path, expanded on THIS box (a default keeps a literal $HOME so the same value can
 # also be shipped to another box and expanded there).
@@ -3106,7 +3113,8 @@ python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
 EXECUTION_COMMAND
     cat "$helper"
     printf '\nFLEET_EXECUTION_PY\n'
-  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES" "$SLOTS" "$map"); rc=$?
+  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES" "$SLOTS" "$map" \
+    "$(fleet_name "$ANCHOR")" "$(fleet_name "$LAB_HOST")"); rc=$?
   [ -z "$out" ] || printf '%s\n' "$out"
   if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
   if [ "$rc" -eq 0 ]; then case "$action" in run|dispatch) execution_refresh "$out" >&2 ;; esac; fi

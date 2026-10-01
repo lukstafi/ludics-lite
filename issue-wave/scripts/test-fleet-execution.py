@@ -13,6 +13,13 @@ SCRIPT = Path(__file__).with_name('fleet-worker.sh')
 # every subprocess below inherits this one.
 LAB_LOCKS = tempfile.TemporaryDirectory(prefix='fleet-lab-locks-')
 os.environ['WAKE_LAB_LOCK_DIR'] = LAB_LOCKS.name
+# Before it reads that lock, it verifies the anchor is the lab host and has a wake-lab site file
+# (ludics-lite#454). Every fixture anchor below is `local` on the box `fixture`, declared here as the
+# lab host, and the site file is a fixture's too: no case may read the real one.
+LAB_SITE = Path(LAB_LOCKS.name) / 'hosts.sh'
+LAB_SITE.write_text('# wake-lab site file fixture: never sourced by the registry\n')
+os.environ['WAKE_LAB_HOSTS'] = str(LAB_SITE)
+os.environ['FLEET_LAB_HOST'] = 'fixture'
 with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     root = Path(temporary)
     env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
@@ -527,6 +534,82 @@ def lane_lock_interlock():
 lane_lock_interlock()
 
 
+# ludics-lite#454: the lane lock the registry reads is in the ANCHOR's lock directory, the lab's only
+# when the anchor is the machine that runs wake-lab.sh and the sweep. So a measurement on a lab box
+# is refused, naming both machines, when FLEET_LAB_HOST names another box than the anchor, and
+# refused, naming the path, when the anchor has no wake-lab site file -- with the lane FREE, before
+# the lock is opened (no lock file appears), at reserve, run and dispatch alike.
+def lab_host_identity():
+    with tempfile.TemporaryDirectory(prefix='fleet-lab-host-') as temporary:
+        root = Path(temporary)
+        locks = root / 'locks'
+        env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
+               'ISSUE_WAVE_STATE': str(root), 'FLEET_ANCHOR_STATE': str(root),
+               'FLEET_COORDINATOR': 'first', 'FLEET_LOCK_WAIT': '10', 'WAKE_LAB_LOCK_DIR': str(locks),
+               'FLEET_BOXES': 'mac-studio rog-nv-linux minix-amd-linux'}
+        env.pop('FLEET_BOX_CORRECTNESS_SLOTS', None)
+
+        def change(action, data, expected=0, **extra):
+            with tempfile.NamedTemporaryFile(mode='w', dir=root, suffix='.input') as stream:
+                json.dump(data, stream)
+                stream.flush()
+                result = subprocess.run(['bash', str(SCRIPT), 'execution', action, stream.name],
+                                        env={**env, **extra}, text=True, capture_output=True, timeout=20)
+            assert result.returncode == expected, (action, data, result.returncode, result.stdout, result.stderr)
+            return result.stderr
+
+        def request(identity, host, kind='measurement'):
+            return dict(request_id=identity, wave='wave', worker=identity, transport='subagent',
+                        issue='repo#454', purpose='fixture', agent_host='mac', execution_host=host,
+                        repository='owner/repo', requested_revision='origin/main', kind=kind)
+
+        def records():
+            out = subprocess.run(['bash', str(SCRIPT), 'execution', 'list'], env=env, text=True,
+                                 capture_output=True, timeout=20, check=True).stdout
+            return {r['request_id']: r for r in json.loads(out)}
+
+        moved = ('rog-nv-linux is lab box rog, whose lane lock is a flock on the lab host mac-studio '
+                 "(FLEET_LAB_HOST), but this registry, on the anchor fixture (FLEET_ANCHOR), reads fixture's "
+                 'lock directory')
+        subprocess.run(['bash', str(SCRIPT), 'claim'], env=env, capture_output=True, timeout=20, check=True)
+        for action in ['reserve', 'run']:
+            err = change(action, request('moved-' + action, 'rog-nv-linux'), expected=1, FLEET_LAB_HOST='mac-studio')
+            assert moved in err, err
+        # The default lab host is mac-studio, so an anchor elsewhere that declares nothing is refused too.
+        err = change('reserve', request('moved-default', 'rog-nv-linux'), expected=1,
+                     **{'FLEET_LAB_HOST': ''})
+        assert moved in err, err
+        assert not records() and not (locks / 'rog.lock').exists(), (records(), list(locks.glob('*')))
+        # Only a measurement on a lab box asks: a correctness run there, and a measurement on a host
+        # that is no lab box, are admitted under the same mismatch.
+        change('reserve', request('moved-check', 'rog-nv-linux', 'correctness'), FLEET_LAB_HOST='mac-studio')
+        change('reserve', request('moved-mac', 'mac-studio'), FLEET_LAB_HOST='mac-studio')
+        # One name up to case is the anchor; dispatch asks again, and the record stays reserved.
+        change('reserve', request('lab-minix', 'minix-amd-linux'), FLEET_LAB_HOST='FIXTURE')
+        err = change('dispatch', dict(request_id='lab-minix', evidence='fixture dispatch'), expected=1,
+                     FLEET_LAB_HOST='mac-studio')
+        assert moved.replace('rog-nv-linux is lab box rog', 'minix-amd-linux is lab box minix') in err, err
+        # Declared, but with no site file the anchor cannot be the machine that drives the lab.
+        absent = root / 'no-site' / 'hosts.sh'
+        err = change('dispatch', dict(request_id='lab-minix', evidence='fixture dispatch'), expected=1,
+                     WAKE_LAB_HOSTS=str(absent))
+        assert (f'minix-amd-linux is lab box minix, and the anchor fixture, declared the lab host, has no '
+                f'readable wake-lab site file ({absent})') in err, err
+        assert records()['lab-minix']['state'] == 'reserved'
+        change('dispatch', dict(request_id='lab-minix', evidence='fixture dispatch'))
+        assert records()['lab-minix']['state'] == 'launching'
+        # A caller that passes no identity is refused rather than read as the lab host.
+        with tempfile.TemporaryDirectory(prefix='fleet-lab-bare-') as state:
+            result = subprocess.run(['python3', str(SCRIPT.with_name('fleet-execution.py')), state, 'reserve',
+                                     'owner', 'token', json.dumps(request('bare', 'rog-nv-linux')),
+                                     'rog-nv-linux', '', 'rog rog-nv-linux'], text=True, capture_output=True)
+            assert result.returncode == 1 and "the anchor's and lab host's names were not passed" in result.stderr, result
+    print('PASS: a lab-box measurement refuses an anchor that is not the declared lab host or has no site file')
+
+
+lab_host_identity()
+
+
 # Exercise real fsync calls and their publication order, including first directory creation.
 import runpy
 import stat
@@ -584,7 +667,7 @@ with tempfile.TemporaryDirectory(prefix='fleet-lane-held-') as temporary:
         return real_replace(source, target)
 
     with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload),
-                            'rog-nv-linux', '', 'rog rog-nv-linux rog-nv-wsl']), \
+                            'rog-nv-linux', '', 'rog rog-nv-linux rog-nv-wsl', 'mac-studio', 'mac-studio']), \
             patch.dict(os.environ, {'WAKE_LAB_LOCK_DIR': str(locks)}), \
             patch('os.replace', side_effect=replace), redirect_stdout(io.StringIO()):
         helper = runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
