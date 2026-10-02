@@ -24,7 +24,11 @@
 # the same `start` on the same directory, so every verdict below reads it as it reads any other.
 # What differs is who can kill it: a detached run is no background task of the harness's, so the
 # harness's own kill of a long task (the DIED case below) does not reach it, and neither does a
-# task-stop; `kill` on the pid in <dir>/cpid (the command) or <dir>/pid (its wrapper) does. A start
+# task-stop; a `kill` of the pid on <dir>/cpid's first line does (the command; <dir>/pid names its
+# wrapper the same way), once the file's second line still matches the process's start time as
+# `alive` checks it. It signals that one process: a child the command is running then runs on to
+# its own end. Never signal a process group: `spawn` makes none of its own, so the run shares its
+# caller's and a group kill reaches the caller. A start
 # that has not published its pid by the time `spawn` returns is said so on stderr, and `wait` then
 # reads it as STARTING, as for any start. `fleet-worker.sh execution slot --bg <parent>` is this
 # around a slot-held batch.

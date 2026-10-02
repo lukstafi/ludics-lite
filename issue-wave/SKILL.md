@@ -625,9 +625,8 @@ controlled through the tools in your coordinator's file, never through those com
   holds locally-verified commits unpushed with their threads deliberately unresolved (resolving
   would claim work not visible on the PR).
 - **Roll-forward merges and the integration loop (ahrefs/ocannl#861, decided 2026-08-30).**
-  The merge gate is one green full-matrix run for the PR's *last commit*. A clean merge does
-  not restart verification, and only a merge that needed a conflict-RESOLVING commit waits for
-  green CI on that commit. `pr-review.sh merge` warns loudly on a stale base but no longer
+  The merge gate is ship-pr's (*How stale the base has grown*): one build verdict for the PR's
+  own head, never the base's tip. `pr-review.sh merge` warns loudly on a stale base but no longer
   refuses. The complement is the coordinator's **integration loop**, whose value is a verdict
   that keeps pace with the merges: a master CI that cancels superseded runs leaves most merges
   without one (2026-09-25: 9 of 16 master pushes cancelled, no master tip with a verdict for
