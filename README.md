@@ -795,7 +795,14 @@ folded away as superseded, per workflow and event, so a re-triggered invocation 
 gate on its cancelled predecessor while one file's `push` and `pull_request` runs still count
 separately and a queued invocation is never hidden behind a finished twin; and a run whose red is
 explained entirely by advisory jobs is not a red build signal, since those checks were dropped on
-purpose.
+purpose. Nor does a run still in flight hold the gate once its every unfinished job is advisory
+(ludics-lite#500), and the cases pin each way that release fails closed: a required job still
+listed as running, a run with no jobs yet, a jobs read that failed, a run with nothing unfinished
+(between jobs), a required job that finished red or stopped, a job with no timestamp, and a job
+list that changed inside the settle (`ADVISORY_SETTLE`). The settle is there because GitHub creates
+a `needs:`-blocked job only once its dependencies finish, so the jobs feed does not list it before
+then. That is also the boundary of `SHIP_PR_ADVISORY_CHECKS`: a required job must not `needs:` an
+advisory one, or the run is released before the required job exists.
 
 `test-pr-review-retry.sh` drives `retry`: the plain retry's classification, and `retry run
 watch`, which addresses its run as
@@ -1109,7 +1116,7 @@ one jq read per belief, and reports each on its own line (`ok`, `MOVED` with the
 read, or `skip` with the reason it cannot be checked here), so a failure localizes to the field
 that moved; its exit code separates a moved belief (1), an addressed endpoint answering 4xx (4) and
 a read the token was refused (5) from the API not answering or throttling (3), and the reporter
-files everything but the last, naming which: the fields `run_signal`, `build_checks`, `run_red_is_advisory_only`, `pr_head_read`,
+files everything but the last, naming which: the fields `run_signal`, `build_checks`, `run_jobs` (both advisory job reads), `pr_head_read`,
 `warn_base_drift` and `status_state` index; the workflow file `base_push_trigger` reads under
 the raw media type (the base64 envelope arriving instead would cost every paths-ignore recognition
 silently); the newest-first order of `actions/runs`; the two feeds `cmd_base` reads and nothing checked until

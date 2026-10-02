@@ -1381,6 +1381,118 @@ test_unreadable_jobs_keep_the_red() {
   assert_contains "$GATE_OUTPUT" ": RED" "the red should still headline"
 }
 
+# --- an in-flight run whose only unfinished jobs are advisory (ludics-lite#500) -----------------
+# `macos` stands for the advisory leg a wave sets SHIP_PR_ADVISORY_CHECKS to skip; build_checks
+# drops its check run, so the check list below carries only the required job's. Each row's times
+# are given as AGES in seconds (created_ago, completed_ago; an absent age is a null field), since
+# what run_inflight_is_advisory_only weighs is how long the run's job list has been still.
+inflight_jobs() {
+  jq -cn --argjson jobs "$1" \
+    '{jobs: [$jobs[] | {name, conclusion: (.conclusion // null),
+      created_at: (if .created_ago == null then null else ((now - .created_ago) | floor | todateiso8601) end),
+      completed_at: (if .completed_ago == null then null else ((now - .completed_ago) | floor | todateiso8601) end)}]}'
+}
+advisory_inflight_fixture() { # <jobs, as inflight_jobs takes them>
+  reset_fixture
+  retune BUILD_ADVISORY='^(claude|macos)$'
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"in_progress","conclusion":null}]')")
+  JOBS_JSON=$(inflight_jobs "$1")
+}
+
+# The issue itself: every required job finished green a while ago and only the advisory leg is
+# still running, so `--wait` ends on the green instead of sitting out the advisory runner queue —
+# and the report says which run it did not wait for.
+test_a_run_with_only_advisory_jobs_left_does_not_hold() {
+  advisory_inflight_fixture '[{"name":"build","conclusion":"success","created_ago":900,"completed_ago":600},
+                              {"name":"macos","created_ago":900}]'
+  run_gate 30
+  assert_eq "$GATE_RC" 0 "an in-flight run whose only unfinished job is advisory has no verdict on its way"
+  assert_contains "$GATE_OUTPUT" "green — 1 build checks passed" "the check fold's verdict stands"
+  assert_contains "$GATE_OUTPUT" "1 of them still running, but only advisory jobs" \
+    "the report names the run it did not wait for"
+  assert_eq "$(grep -c "actions/runs/101/jobs" "$REQUEST_LOG")" 1 "one jobs read for the one in-flight run"
+}
+
+# A required job the check list does not show yet (its check run lags its job) keeps the run held,
+# however advisory the rest of it is.
+test_a_pending_required_job_holds_its_run() {
+  advisory_inflight_fixture '[{"name":"build","conclusion":"success","created_ago":900,"completed_ago":600},
+                              {"name":"test","created_ago":900},
+                              {"name":"macos","created_ago":900}]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a required job still running is a verdict on its way"
+  assert_contains "$GATE_OUTPUT" "1 workflow run(s) for this head have no conclusion yet" "the run holds"
+}
+
+# Fail closed on what the read cannot show: a run that has not created its jobs, and a read that
+# did not answer, both hold — neither is evidence that only advisory work is left.
+test_an_inflight_run_without_jobs_holds() {
+  advisory_inflight_fixture '[]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a run with no jobs yet holds"
+  assert_contains "$GATE_OUTPUT" "have no conclusion yet" "as a run in flight"
+}
+
+test_an_unreadable_jobs_read_holds_its_run() {
+  advisory_inflight_fixture '[{"name":"build","conclusion":"success","created_ago":900,"completed_ago":600},
+                              {"name":"macos","created_ago":900}]'
+  FAIL_ENDPOINT="*/jobs?per_page=100"
+  run_gate
+  assert_eq "$GATE_RC" 4 "an unread job list holds the run"
+  assert_contains "$GATE_OUTPUT" "have no conclusion yet" "as a run in flight"
+}
+
+# The `needs:` race. GitHub creates a dependent job only once its dependencies finish, so in the
+# instant after `build` finishes its dependents are not listed yet; a job list that changed inside
+# ADVISORY_SETTLE is not taken as the run's whole job set. The control is the first case above:
+# the same run with `build` finished ten minutes ago is released.
+test_a_job_list_inside_the_settle_holds_its_run() {
+  advisory_inflight_fixture '[{"name":"build","conclusion":"success","created_ago":900,"completed_ago":5},
+                              {"name":"macos","created_ago":900}]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a required job that has only just finished may have dependents on the way"
+  advisory_inflight_fixture '[{"name":"build","conclusion":"success","created_ago":900,"completed_ago":600},
+                              {"name":"macos","created_ago":5}]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a job created inside the settle is a job list still moving"
+}
+
+# A run still in flight with NO unfinished job is between jobs, or finishing: its next job may not
+# exist yet, and its row's conclusion is what settles it.
+test_a_run_between_jobs_holds() {
+  advisory_inflight_fixture '[{"name":"build","conclusion":"success","created_ago":900,"completed_ago":600},
+                              {"name":"macos","conclusion":"success","created_ago":900,"completed_ago":600}]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "an in-flight run with nothing unfinished in its list holds"
+}
+
+# This read only ever releases. A required job that finished red or stopped, which the check list
+# has not caught up with, holds the run until its row says what the run concluded.
+test_a_red_or_stopped_required_job_holds_its_run() {
+  local concl
+  for concl in failure cancelled; do
+    advisory_inflight_fixture "$(jq -cn --arg c "$concl" \
+      '[{name:"build",conclusion:"success",created_ago:900,completed_ago:600},
+        {name:"test",conclusion:$c,created_ago:900,completed_ago:600},
+        {name:"macos",created_ago:900}]')"
+    run_gate
+    assert_eq "$GATE_RC" 4 "a required job that concluded $concl is not released past"
+  done
+}
+
+# A job with no timestamp cannot be placed against the settle, so it proves nothing.
+test_an_untimed_job_holds_its_run() {
+  advisory_inflight_fixture '[{"name":"build","conclusion":"success","created_ago":900,"completed_ago":600},
+                              {"name":"macos"}]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a job with no created_at holds"
+  advisory_inflight_fixture '[{"name":"build","conclusion":"success","created_ago":900},
+                              {"name":"macos","created_ago":900}]'
+  run_gate
+  assert_eq "$GATE_RC" 4 "a finished job with no completed_at holds"
+}
+
 # A successor never inherits the observed head's checks, even when those checks passed
 # or were cancelled. The unchanged sequence is the control for the additional head reads.
 test_wait_superseded_head() {
@@ -1553,6 +1665,14 @@ tests=(
   test_a_waived_leg_does_not_redden_its_run
   test_a_run_level_red_is_waived_only_from_the_first_read
   test_unreadable_jobs_keep_the_red
+  test_a_run_with_only_advisory_jobs_left_does_not_hold
+  test_a_pending_required_job_holds_its_run
+  test_an_inflight_run_without_jobs_holds
+  test_an_unreadable_jobs_read_holds_its_run
+  test_a_job_list_inside_the_settle_holds_its_run
+  test_a_run_between_jobs_holds
+  test_a_red_or_stopped_required_job_holds_its_run
+  test_an_untimed_job_holds_its_run
   test_wait_holds_until_the_checks_appear
   test_wait_ceiling_with_a_queued_run_is_no_verdict
 )

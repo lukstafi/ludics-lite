@@ -200,9 +200,9 @@ world_healthy() {
   answer "$R/actions/workflows/11/runs?branch=main&event=push&per_page=10" \
     "{\"total_count\":2,\"workflow_runs\":[$(run_row 202 11 402 push completed '"success"' 2026-09-30T10:00:05Z "$TIP"),$(run_row 150 11 350 push completed '"success"' 2026-09-29T10:00:00Z "$P1")]}"
   answer "$R/actions/runs/201/jobs?per_page=100" \
-    '{"total_count":2,"jobs":[{"name":"lint","status":"completed","conclusion":"success"}]}' \
-    '{"total_count":2,"jobs":[{"name":"test","status":"completed","conclusion":"failure"}]}'
-  answer "$R/actions/runs/202/jobs?per_page=100" '{"total_count":1,"jobs":[{"name":"test","status":"completed","conclusion":"success"}]}'
+    '{"total_count":2,"jobs":[{"name":"lint","status":"completed","conclusion":"success","created_at":"2026-09-30T10:00:01Z","completed_at":"2026-09-30T10:01:00Z"}]}' \
+    '{"total_count":2,"jobs":[{"name":"test","status":"completed","conclusion":"failure","created_at":"2026-09-30T10:00:01Z","completed_at":"2026-09-30T10:02:00Z"}]}'
+  answer "$R/actions/runs/202/jobs?per_page=100" '{"total_count":1,"jobs":[{"name":"test","status":"completed","conclusion":"success","created_at":"2026-09-30T10:00:06Z","completed_at":"2026-09-30T10:02:00Z"}]}'
   answer "$R/commits/$TIP/check-runs?filter=latest&per_page=100" \
     "{\"total_count\":2,\"check_runs\":[$(check_run 502 test 402 success),$(check_run 501 test 401 failure)]}"
   answer "$R/commits/$TIP/check-runs?filter=all&per_page=100" \
@@ -487,6 +487,7 @@ ok    the page comes back newest-first (created_at non-increasing over its 2 row
 ok    the feed is jobs[] (run 201, the latest red run: failure)
 ok    jobs[] rows carry a non-empty name (run_red_is_advisory_only skips a row with none) and conclusion (present, null while unfinished)
 ok    job conclusions are in the same vocabulary as run conclusions
+ok    jobs[] rows carry an ISO created_at, and every finished job an ISO completed_at (run_inflight_is_advisory_only's settle)
 ok    a red run's jobs carry the red: at least one job concluded failure, timed_out or startup_failure, or no jobs at all (the startup_failure shape)
 ok    the feed is check_runs[]
 ok    every check run carries a non-empty name (build_checks skips a row with none), conclusion (present, null while unfinished), html_url and app.slug
@@ -596,6 +597,7 @@ test_a_doctored_response_moves_its_pin_and_only_it() {
     "$R/actions/runs?head_sha=$TIP&per_page=100^.workflow_runs[0] |= (.status = \"surprise\" | .conclusion = null)^MOVED status strings are in the known vocabulary" \
     "$R/actions/runs?head_sha=$TIP&per_page=100^.workflow_runs[0] |= del(.conclusion)^MOVED every row carries conclusion (present, null until completed) and it is in the vocabulary" \
     "$R/actions/workflows?per_page=100^.workflows[0].state = \"paused\"^MOVED every workflow carries a state drawn from the vocabulary" \
+    "$R/actions/runs/201/jobs?per_page=100^.jobs[0] |= del(.completed_at)^MOVED jobs[] rows carry an ISO created_at, and every finished job an ISO completed_at" \
     "$R/commits/$TIP/check-runs?filter=latest&per_page=100^.check_runs[0].conclusion = \"surprise\"^MOVED check-run conclusions are in the vocabulary" \
     "$R/commits/$M7^.commit.verification.verified = false^MOVED GitHub's merge commit is committed by noreply@github.com" \
     "$R/pulls/12^.mergeable_state = \"surprise\"^MOVED ... and a mergeable_state in the vocabulary" \

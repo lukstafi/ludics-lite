@@ -481,7 +481,7 @@ else
 fi
 
 # --- actions/runs/<id>/jobs ---------------------------------------------------------------------
-section "actions/runs/<id>/jobs — run_red_is_advisory_only's feed"
+section "actions/runs/<id>/jobs — run_jobs' feed (run_red_is_advisory_only, run_inflight_is_advisory_only)"
 all_runs="${all_runs:-$(api "repos/$REPO/actions/runs?per_page=100" | pages workflow_runs)}"
 # The sample is the latest run of ANY conclusion conclusion_class calls red, since the advisory
 # read runs for each of them, not only for `failure`.
@@ -494,14 +494,21 @@ if is_num "$red_run"; then
   jobs=$(api --paginate "repos/$REPO/actions/runs/$red_run/jobs?per_page=100" | pages jobs)
   pin "the feed is jobs[] (run $red_run, the latest red run: $red_concl)" 'type == "array"' "$jobs"
   is_list "$jobs" || jobs='[]'
-  # `.status` is deliberately NOT pinned here: run_red_is_advisory_only projects `.name` and
-  # `.conclusion` and nothing else, and a claim about a field no projection reads would file a
-  # drift issue over a harmless change (ludics-lite#70, from #66's round 13). The field stays
-  # pinned on `workflow_runs[]` above, where run_signal does read it.
+  # `.status` is deliberately NOT pinned here: run_jobs projects `.name`, `.conclusion`,
+  # `.created_at` and `.completed_at` and nothing else, and a claim about a field no projection
+  # reads would file a drift issue over a harmless change (ludics-lite#70, from #66's round 13).
+  # The field stays pinned on `workflow_runs[]` above, where run_signal does read it.
   pin "jobs[] rows carry a non-empty name (run_red_is_advisory_only skips a row with none) and conclusion (present, null while unfinished)" \
     'all(.[]; (.name | type == "string" and length > 0) and has("conclusion") and (.conclusion == null or (.conclusion | type == "string")))' "$jobs"
   pin "job conclusions are in the same vocabulary as run conclusions" \
     "all(.[]; .conclusion == null or (.conclusion as \$c | $CONCLUSION_VOCAB | index(\$c)))" "$jobs"
+  # The settle run_inflight_is_advisory_only waits out is measured on these two fields, and a
+  # missing one HOLDS the run (ludics-lite#500) — so a field that moved would not merge anything
+  # early, it would quietly turn SHIP_PR_ADVISORY_CHECKS back into a full wait. That is the drift
+  # this names.
+  pin "jobs[] rows carry an ISO created_at, and every finished job an ISO completed_at (run_inflight_is_advisory_only's settle)" \
+    "all(.[]; (.created_at | type == \"string\" and test(\"$ISO\"))
+              and (.conclusion == null or (.completed_at | type == \"string\" and test(\"$ISO\"))))" "$jobs"
   # The belief run_red_is_advisory_only rests on: it discards a run's red when no non-advisory
   # job is HARD red (failure, timed_out, startup_failure — conclusion_class's red), so a red run
   # whose jobs were all cancelled or stale would lose its red silently. A MOVED here is a gap in

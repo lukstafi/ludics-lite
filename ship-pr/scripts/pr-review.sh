@@ -274,7 +274,12 @@
 #      started, so they are reached ACROSS windows — a 900s window cannot outrun a 1200s grace.
 #      SHIP_PR_ADVISORY_CHECKS=ERE of check, job and workflow names the build gate ignores
 #      (default: the review app's check and the github-pages deploys) — a run whose red is
-#      explained entirely by advisory JOBS is not a red build signal either, SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
+#      explained entirely by advisory JOBS is not a red build signal either, and a run still in
+#      flight whose every unfinished job is advisory does not hold a `--wait` (ludics-lite#500).
+#      BOUNDARY: GitHub creates a `needs:`-blocked job only once its dependencies finish, so a
+#      required job that `needs:` an advisory one is not visible while that advisory job runs —
+#      such a workflow is released early. A required job must not `needs:` an advisory one.
+#      SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
 #      between the one-line "still waiting" progress notes a `--wait` prints (600),
@@ -4520,6 +4525,18 @@ run_reason() {
   printf '%s' "$@"
 }
 
+# Prints "name<TAB>conclusion<TAB>created_at<TAB>completed_at" per job of run <id> — the one
+# projection both job reads below share, so a red run and an in-flight one are read the same way.
+# Every field gets the "-" placeholder, empty strings included, for the reason gate_checks' PR read
+# gives: one empty field collapses under tab-IFS `read` and shifts every later column into the
+# slot before it. An unfinished job's null conclusion renders `pending`, as it always has.
+run_jobs() {
+  gh_retry read api --paginate "repos/$REPO/actions/runs/$1/jobs?per_page=100" \
+    --jq '.jobs[] | [(.name // "-"), (.conclusion // "pending"), (.created_at // "-"),
+          (.completed_at // "-")]
+          | map(if type == "string" and length > 0 then . else "-" end) | @tsv'
+}
+
 # A workflow run's aggregate conclusion is not always a build verdict. The advisory list is a
 # deny-list of CHECK names (SHIP_PR_ADVISORY_CHECKS), and build_checks applies it per check run —
 # so a non-advisory workflow carrying one advisory JOB reports `failure` at the run level when
@@ -4534,17 +4551,16 @@ run_reason() {
 # waived row read the head as GREEN, with no OVERRIDE record, and past --require-green (review
 # round 5). The caller reports it as a waived red instead.
 run_red_is_advisory_only() {
-  local id="$1" suite="${2:--}" raw rc jname jconcl jobs=0 hard=0 waived=0 names=""
-  raw=$(gh_retry read api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
-    --jq '.jobs[] | [(.name // "-"), (.conclusion // "pending")] | @tsv')
+  local id="$1" suite="${2:--}" raw rc jname jconcl jtimes jobs=0 hard=0 waived=0 names=""
+  raw=$(run_jobs "$id")
   rc=$?
   [ "$rc" -eq 0 ] || return 1
   # The run's job names, read first: a job is waived only while it is the one job of its name
-  # (see is_waived).
-  while IFS=$'\t' read -r jname jconcl; do
+  # (see is_waived). `jtimes` takes the columns only the in-flight read needs.
+  while IFS=$'\t' read -r jname jconcl jtimes; do
     [ -n "$jname" ] && names="${names}${jname}"$'\n'
   done <<<"$raw"
-  while IFS=$'\t' read -r jname jconcl; do
+  while IFS=$'\t' read -r jname jconcl jtimes; do
     [ -n "$jname" ] || continue
     jobs=$((jobs + 1))
     is_advisory "$jname" && continue
@@ -4562,11 +4578,69 @@ run_red_is_advisory_only() {
   return 0
 }
 
+# The in-flight half of the same question (ludics-lite#500). An unfinished run used to hold the
+# gate on its row alone, so a run whose only unfinished jobs were advisory held `merge --wait` for
+# the whole of them: on 2026-10-01 two PRs merged under an advisory macOS setting and both still
+# waited out the ~55 min macOS runner queue (#489 sat 21 minutes after its last required job). The
+# advisory list is about JOBS as much as runs, so a run whose every unfinished job is advisory has
+# no build verdict on the way and does not hold. True (0) only when ALL of these hold, and every
+# doubt holds the run (1), because releasing a run too early merges over a verdict nobody read:
+#   - the jobs read answered (a failed read proves nothing);
+#   - the run lists at least one unfinished job, and every unfinished job is advisory. No jobs at
+#     all is a run that has not created them yet; no unfinished job in a run that is still in
+#     flight is a run between jobs (below), or finishing — its row's own conclusion settles it;
+#   - every finished non-advisory job is green. A red or stopped one is the check fold's to
+#     report, and the run's row says the rest once it concludes — this read only ever RELEASES,
+#     it never decides a red;
+#   - the run's job list has been still for ADVISORY_SETTLE seconds: no job of it was created or
+#     finished more recently than that.
+# That last clause is the `needs:` boundary, and the reason this is not a plain name check. GitHub
+# creates a job only once its `needs:` are met, and the jobs feed does not list it before then.
+# Read live on 2026-10-02: skill-scripts.yml run 36988361670 listed 3 jobs (total_count=3) while
+# `changes` was queued, and all 11 once it had finished; base-watch run 36988361969 listed `read`
+# alone while `report` (needs: read) waited. On every earlier run of skill-scripts.yml read the
+# same day, each `needs: changes` job's created_at equals `changes`' completed_at to the second. So a
+# required job waiting on a finished job can be missing from a read taken in the instant between
+# the one finishing and the other being created, while an advisory job still runs; the settle
+# outlasts that instant, and costs at most one more poll after the last required job. What no read
+# can see is a required job that `needs:` an ADVISORY job still running: it does not exist yet,
+# so the run is released before it ever runs. That is a boundary of this read, stated where the
+# advisory list is configured (the usage text above): a required job must not `needs:` an
+# advisory one.
+ADVISORY_SETTLE=60
+run_inflight_is_advisory_only() {
+  local raw rc jname jconcl jcreated jdone unfinished=0 last="" age
+  raw=$(run_jobs "$1")
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  while IFS=$'\t' read -r jname jconcl jcreated jdone; do
+    [ -n "$jname" ] || continue
+    # A job with no creation time cannot be placed against the settle, so it proves nothing.
+    [ "${jcreated:--}" != - ] || return 1
+    last=$(newest "$last" "$jcreated")
+    if [ "$(conclusion_class "$jconcl")" = pending ]; then
+      is_advisory "$jname" || return 1
+      unfinished=$((unfinished + 1))
+      continue
+    fi
+    [ "${jdone:--}" != - ] || return 1
+    last=$(newest "$last" "$jdone")
+    is_advisory "$jname" && continue
+    [ "$(conclusion_class "$jconcl")" = green ] || return 1
+  done <<<"$raw"
+  [ "$unfinished" -gt 0 ] || return 1
+  # age_of answers "-" for a missing or FUTURE timestamp, and either is no settle.
+  age=$(age_of "$last")
+  case "$age" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$age" -ge "$ADVISORY_SETTLE" ]
+}
+
 run_signal() {
   local sha="$1" pr_at="${2:-}" checks="${3:-0}" base_sha="${4:-}" head_ref="${5:-}" pr="${6:-}"
   local raw rc rid wid event name status concl suite
   local seen_ids=" " red_rows="" rname rconcl rsuite created
   local runs=0 inflight=0 nogo=0 red=0 red_note="" pushed_at age seen waived_runs=""
+  local inflight_ids="" released=0
   raw=$(gh_retry read api --paginate \
     "repos/$REPO/actions/runs?head_sha=$sha&per_page=100" \
     --jq '.workflow_runs[] | [(.created_at // "-"), ((.id // 0) | tostring),
@@ -4618,9 +4692,10 @@ run_signal() {
     # projection renders that null as `pending`, which is neither red nor stopped, and counting it
     # as finished-and-judged would let a green check — or, on a checkless head, the eventual
     # ABSENT — carry a workflow that has concluded nothing (round 4).
+    # Counted as in flight only after its jobs are read, below.
     if [ "$status" != completed ] || [ "$(conclusion_class "$concl")" = pending ]; then
       runs=$((runs + 1))
-      inflight=$((inflight + 1))
+      inflight_ids="${inflight_ids}${rid}"$'\n'
       continue
     fi
     case "$seen_ids" in *" $wid/$event "*) continue ;; esac
@@ -4665,6 +4740,18 @@ run_signal() {
       " check list"
     return 1
   fi
+  # Each in-flight run gets its jobs read before it holds — one call per in-flight run, made only
+  # once no red has already decided the answer, and a run whose every unfinished job is advisory
+  # is released (see run_inflight_is_advisory_only). It still counts among `runs`: it is an Actions
+  # run behind the head's checks, and its finished jobs are among them.
+  while IFS= read -r rid; do
+    [ -n "$rid" ] || continue
+    if run_inflight_is_advisory_only "$rid"; then
+      released=$((released + 1))
+    else
+      inflight=$((inflight + 1))
+    fi
+  done <<<"$inflight_ids"
   if [ "$inflight" -gt 0 ]; then
     run_reason 0 "$waived_runs" "$inflight workflow run(s) for this head have no conclusion yet (queued," \
       " running, or completed with none recorded) — their check runs may not exist yet"
@@ -4685,7 +4772,12 @@ run_signal() {
   # checkless head (ludics-lite#38, round 3).
   case "$checks" in '' | *[!0-9]*) checks=0 ;; esac
   if [ "$checks" -gt 0 ] && [ "$runs" -gt 0 ]; then
-    run_reason 0 "$waived_runs" "$runs workflow run(s) for this head are finished and judged"
+    if [ "$released" -gt 0 ]; then
+      run_reason 0 "$waived_runs" "$runs workflow run(s) for this head are judged — $released of them" \
+        " still running, but only advisory jobs (SHIP_PR_ADVISORY_CHECKS)"
+    else
+      run_reason 0 "$waived_runs" "$runs workflow run(s) for this head are finished and judged"
+    fi
     return 0
   fi
   # Checkless: how long there has been to create a run. Two clocks, and the FRESHER wins, because
@@ -4861,7 +4953,15 @@ gate_checks() {
       # for the run that was still coming (round 4). The stopped checks stay in the report below.
       4) case "$VERDICT" in pending) ;; *) VERDICT=unjudged ;; esac ;;
       # Everything judged, and the only red a run-level one the override waived.
-      0) [ "$RUN_WAIVED" -eq 0 ] || case "$VERDICT" in green | absent) VERDICT=waived ;; esac ;;
+      # A run released while still running (only advisory jobs left in it) is named in the
+      # report: the verdict stands over work that has not finished, and the reader should see
+      # that it was the advisory list that let it (ludics-lite#500).
+      0)
+        [ "$RUN_WAIVED" -eq 0 ] || case "$VERDICT" in green | absent) VERDICT=waived ;; esac
+        case "$run_why" in
+        *"only advisory jobs"*) CHECK_LINES="${CHECK_LINES}  running  $run_why — not waited for"$'\n' ;;
+        esac
+        ;;
       esac
     fi
     # The first read is the one the override was given against; every later one applies it.
