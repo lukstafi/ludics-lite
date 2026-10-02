@@ -172,13 +172,16 @@ counts as "no longer runs on push" is narrow on purpose: its file at the tip was
 `push` trigger. A workflow that still declares `push`, or whose file the reader refuses, reads as
 it always did.
 
-A tip whose own run is **in flight** over a window with no judged run (a merge burst: each merge's
-push run cancelled by the next) reads **pending** — `NO VERDICT YET`, exit 4 — not "never judged":
-the run that will judge it is running (ludics-lite#308). With `--interim` such a tip is green
-meanwhile when it is GitHub's clean merge of a PR whose head built that workflow green, and the
-verdict line says `green, interim` and names the PR. That is the wave gate's opt-in and the base
-watch's; it is never the tip's own verdict, so a read that needs that (`base --wait` after a merge)
-does not pass it.
+A tip whose own run is **in flight** over a window with no judged run reads **pending** — `NO
+VERDICT YET`, exit 4 — not "never judged": the run that will judge it is running (ludics-lite#308).
+A merge burst makes that window, two ways. Where each push run on the base cancels the one before
+(OCANNL's `ci`), every merge but the last is left without a finished run. Where each push keeps its
+own run (this repository's `main`, ludics-lite#517), the burst's older runs are in flight beside the
+tip's. With `--interim` such a tip is green meanwhile when it is GitHub's clean merge of a PR whose
+head built that workflow green and no run at an older commit is still in flight (that run judges
+base changes the PR head may never have met); the verdict line says `green, interim` and names the
+PR. That is the wave gate's opt-in and the base watch's; it is never the tip's own verdict, so a
+read that needs that (`base --wait` after a merge) does not pass it.
 
 ## Open
 
@@ -401,11 +404,9 @@ the branch is, the file overlap with the base's advance — split into paths who
 (the same regions edited on both sides) and paths changed in DISJOINT hunks only (a sibling's
 appended stanza; nothing to act on) — and whether the PR CONFLICTS. That is the moment it is
 cheap to act on — the round's fixes are about to be written. "CONFLICTS" means merge the base in
-*first*, so the next push is one CI can test. A same-region overlap is information under the
-roll-forward policy (*How stale the base has grown*, below): read those files for semantic drift,
-and merge the base in only if you want CI to test the next push against the current base — the
-merge proceeds either way. Read only at merge time, the same information arrives after every
-round has been paid for.
+*first*, so the next push is one CI can test; an overlap, same-region or not, is information only.
+*How stale the base has grown* (below) is the rule for both. Read only at merge time, the same
+information arrives after every round has been paid for.
 
 An exit 0 is not always a round: `watch` also returns when it can tell that **nothing is coming** —
 the 👀 went spent without a review of the head, or never landed, or a push has been sitting
@@ -662,8 +663,9 @@ ludics-lite#39 (2026-09-04) a sibling landed on `main` during round 6, and round
 findings, "the next move is yours", and no CI at all, over eight pushes and 80 minutes; one of
 them landed a broken test suite, and two of them built machinery the sibling had already
 superseded. The first thing that noticed was `merge`. When the line says CONFLICTS, the next
-move is `git merge origin/<base>`, resolve, push — before addressing anything else. Commit and
-push that merge on its own *before* writing the round's fixes, because a merge left uncommitted
+move is `git merge origin/<base>`, resolve, push (once the head's own run has finished, *How
+stale the base has grown*) — before addressing anything else. Commit and push that merge on its
+own *before* writing the round's fixes, because a merge left uncommitted
 absorbs whatever you edit next: on ludics-lite#102 (2026-09-10) the resolved merge sat
 uncommitted while the round's fixes were written on top of it, and one `git add -A && git
 commit` swept both in, so the round's commit — the one that names its findings and their
@@ -1018,15 +1020,16 @@ merge call would fail on it.
 It warns and merges anyway. That is the **roll-forward policy** (ahrefs/ocannl#861, decided
 2026-08-30 after a wave where every sibling merge invalidated every open PR's verification —
 staging#533 ran three clean rebases and three full CI cycles over an unchanged topic diff): a PR
-merges on one build verdict for its own head, the one *The approval is one gate* (above) reads.
-It never waits on the base branch's tip; the base enters only an `absent` verdict, whose
-workflow-file recognition reads it. GitHub merging a green head cleanly into a base that has
-moved on restarts nothing. A push that moves the head to a commit no run has built restarts the
-wait. That wait is meant for a conflict-RESOLVING commit; a clean rebase pays it too, for now
-(accepting a clean rebase on its green predecessor's run is #496, low priority). What owns
-semantic drift instead is the wave coordinator's post-merge **integration loop** (issue-wave
-skill): the full `@runtest @train` suites on merged master, on a quiet, strong fleet machine,
-with stop-the-world triage on a regression.
+merges on one build verdict for its own head, the one *The approval is one gate* (above) reads. It
+never waits on the base branch's tip; the base enters only an `absent` verdict, whose workflow-file
+recognition reads it. GitHub merging a green head cleanly into a base that has moved on restarts
+nothing: `merge` merges with `--merge`, whose merge commit combines the head with the newer base,
+and the PR's `pull_request` run already built `refs/pull/N/merge`, the head merged with the base as
+it stood then. A push that moves the head to a commit no run has built restarts the wait, a clean
+rebase included (until #496), which is why the head moves only for a conflict (below). What owns
+semantic drift instead is the wave coordinator's post-merge **integration loop** (issue-wave skill):
+the full `@runtest @train` suites on merged master, on a quiet, strong fleet machine, with
+stop-the-world triage on a regression.
 
 **When a wave coordinator is actively running that integration loop**, the division is strict
 on the landing side too: after `merge` confirms `merged`, the worker's verification is over.
@@ -1052,13 +1055,16 @@ GitHub could build and so stands still on precisely the conflicted PR that is fu
 contribute both the old and new path, and paths remain JSON strings so spaces and unusual
 characters are not split. `none` is an exact empty intersection. `UNKNOWN` means an API call failed
 or GitHub's 300-file compare cap made a list potentially incomplete; it never means none, so retry
-the read before deciding whether to rebase.
+the read.
 
-When the base's advance touches the files this PR changes, rebase (or merge the base in, where the
-branch is shared), push, and let the checks re-run first — any commit that moves the head waits
-for its own green run, conflicts or not; otherwise a clean merge on a green head is the policy,
-not a corner cut. A count the compare API could not answer prints `UNKNOWN`, which is not "not
-behind": check it by hand.
+**A green head merges as it is.** An overlap with the base, same-region or not, is information, not
+a reason to rebase: read those files for semantic drift, then merge. Interactions with the siblings
+merged meanwhile are the integration loop's to catch on the merged tip (standalone, the post-merge
+owner's, below), as for any clean merge. Rebase, or merge the base in where the branch is shared,
+only for a textual conflict: `CONFLICTS`, or `merge` refusing the PR as not mergeable. Push that
+resolution once the head's own run has finished, never while it is in flight: a CI with
+`cancel-in-progress` cancels that run, and its verdict on the change itself with it. A count the
+compare API could not answer prints `UNKNOWN`, which is not "not behind": check it by hand.
 
 **Standalone use does not watch CI at all** (since 2026-08-31): trailing failures on the merged
 base belong to the repository's **post-merge owner**, the watch or triage routine its agent notes

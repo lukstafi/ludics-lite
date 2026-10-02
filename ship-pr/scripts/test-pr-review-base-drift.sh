@@ -309,8 +309,10 @@ test_meeting_hunks_state_the_policy() {
     "meeting hunks should be loud and say what they are"
   assert_contains "$DRIFT_OUTPUT" "roll-forward policy" \
     "the guidance is the policy the merge follows, not an instruction the merge then ignores"
-  assert_contains "$DRIFT_OUTPUT" "only if you want CI to test this head" \
-    "the rebase is offered as an option, never as a prerequisite"
+  assert_contains "$DRIFT_OUTPUT" "The overlap is not a reason to rebase" \
+    "an overlap is information; only a conflict moves the head"
+  assert_not_contains "$DRIFT_OUTPUT" "only if you want CI to test this head" \
+    "the overlap no longer offers a rebase as an option"
   assert_not_contains "$DRIFT_OUTPUT" "let checks re-run" \
     "the wording six wave workers read as an unmet instruction is gone"
 }
