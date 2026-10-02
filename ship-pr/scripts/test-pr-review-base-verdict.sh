@@ -272,6 +272,41 @@ test_a_same_second_tie_goes_to_the_higher_run_id() {
     "the superseded row of the tie is not what the report is about"
 }
 
+# A branch whose pushes never cancel each other (skill-scripts.yml keys main's concurrency group on
+# the commit, ludics-lite#511) has runs for two merges going at once, finishing in either order.
+# The fold reads them by creation, never by finish: the newer merge's finished run is the verdict
+# whether the older run is still going or finished red after it (the newer tree holds that merge),
+# and an older merge's red while the tip's run is going is that merge's red, not the tip's.
+test_overlapping_push_runs_are_read_by_creation_not_by_finish() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
+    '[{conclusion:"success", head_sha:$c, id:6091},
+      {status:"in_progress", conclusion:null, head_sha:$b, id:6090}]')")
+  run_base --wait=2
+  assert_eq "$BASE_RC" 0 "the tip's own green covers it while an older merge's run is still going"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" "the verdict is the tip's"
+  assert_eq "$(rounds_polled)" 1 "and the older run going is not waited for"
+
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
+    '[{conclusion:"success", head_sha:$c, id:6093}, {conclusion:"failure", head_sha:$b, id:6092}]')")
+  run_base
+  assert_eq "$BASE_RC" 0 \
+    "an older merge's red that finished after the tip's green does not displace it"
+  assert_not_contains "$BASE_OUTPUT" "RED" "the tip's tree holds that merge and passed"
+
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[{status:"in_progress", conclusion:null, head_sha:$c, id:6096},
+      {conclusion:"failure", head_sha:$b, id:6095}, {conclusion:"success", head_sha:$a, id:6094}]')")
+  JOBS_6095=$(jobs_json '[{"name":"fixtures (ubuntu)","conclusion":"failure"}]')
+  run_base
+  assert_eq "$BASE_RC" 1 "an older merge's red is a red on the branch while the tip's run is going"
+  assert_contains "$BASE_OUTPUT" "failure at ${SHA_B:0:8}" "and it is that merge's red"
+  assert_contains "$BASE_OUTPUT" "(ci is running now at ${SHA_C:0:8})" \
+    "with the tip's run named as going"
+}
+
 tests=(
   test_a_red_at_the_tip_ends_the_wait_at_once
   test_the_red_break_reconfirms_the_tip
@@ -281,6 +316,7 @@ tests=(
   test_a_red_under_a_cancelled_run_at_the_tip_still_stands
   test_an_unreadable_tip_is_unknown_under_wait_and_decoration_without_it
   test_a_same_second_tie_goes_to_the_higher_run_id
+  test_overlapping_push_runs_are_read_by_creation_not_by_finish
 )
 
 run_tests "${tests[@]}" -- "$@"

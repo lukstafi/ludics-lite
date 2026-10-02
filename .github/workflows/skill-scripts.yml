@@ -48,10 +48,22 @@ on:
 permissions:
   contents: read
 
-# One run per ref: a new push supersedes the previous run instead of stacking behind it.
+# One run per pull request, one per push to main. A pull request's new push supersedes its
+# previous run instead of stacking behind it: nobody merges the head that run was judging. A push
+# to main is never superseded: each one is a merge, and its run is the verdict on that merged tree
+# (ludics-lite#511). Grouped per ref, with cancel-in-progress, seven merges on 2026-10-01 each
+# cancelled the run before, main had no verdict for about three hours, and a cross-PR red
+# (#91 x #472) surfaced only on the first main run that finished. So main's group is keyed on the
+# commit and only a pull request cancels. Both halves are needed: with `cancel-in-progress: false`
+# alone, a newer PENDING run in a shared group still cancels an older pending one, so a burst
+# would still judge only its first and last merges. The cost is a macOS runner per merge, which a
+# pull request's run may queue behind (THE MACOS QUEUE above). Overlapping main runs need nothing
+# from `pr-review.sh base`, which folds them per workflow newest-created first: the newest finished
+# run is main's verdict, an older one finishing after it does not displace it, and a red at an
+# older merge while the tip's run is going is reported as that merge's, not the tip's.
 concurrency:
-  group: skill-scripts-${{ github.ref }}
-  cancel-in-progress: true
+  group: skill-scripts-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ---- always run: the verdict every head carries -----------------------------------------
