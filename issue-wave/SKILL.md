@@ -336,14 +336,15 @@ which takes the tip's verdict from a record at the tip first, else from the PR t
 GitHub's clean merge of, when that workflow ran green on its head (roll-forward), and names the
 source it used. A tip with neither reads `NO VERDICT` at once, and dispatch waits; an unreadable
 registry refuses too, since a failed record there would outrank the PR head (ludics-lite#401).
-Through a merge burst each tip's push run is cancelled by the next merge's, so the tip's own run
-is always in flight and the wait used to reach its ceiling and refuse every launch (20-40 min per
-launch on 09-24 and 09-25). The gate now passes `--interim` (ludics-lite#308): a tip whose own
-push run is in flight, with nothing red and nothing else in flight, is green meanwhile when it is
-GitHub's clean merge of a PR whose head built that workflow green, and the verdict line reads
-`green, interim (...; judged meanwhile by PR #N's head run ...)`. A tip that is not such a
-merge stays pending and refused. So a wave launches through a burst, and the integration loop,
-which reads `base --wait` WITHOUT `--interim`, still waits for the tip's own run: an interim is
+Through a merge burst the tip's own run is always in flight, and the wait used to reach its
+ceiling and refuse every launch (20-40 min per launch on 09-24 and 09-25). The gate now passes
+`--interim` (ludics-lite#308): a tip whose own push run is in flight, with nothing red and
+nothing else in flight, is green meanwhile when it is GitHub's clean merge of a PR whose head
+built that workflow green, and the verdict line reads `green, interim (...; judged meanwhile by
+PR #N's head run ...)`. A tip that is not such a merge stays pending and refused. So an OCANNL
+wave launches through a burst, while a ludics-lite launch is refused until the burst's older runs
+finish (ship-pr's *Read the base before you branch* says why the two differ). The integration
+loop, which reads `base --wait` WITHOUT `--interim`, still waits for the tip's own run: an interim is
 never its verdict. This is a bounded pre-dispatch check, not another observer, and it is
 point-in-time: not atomic with the spawn or launch that follows, so an adoption reconciles
 pending dispatches before replacing anything.
@@ -375,10 +376,12 @@ requirements for every transport with transport-specific setup and identity, and
   summary (ludics-lite#70 and #76, 2026-09-10).
 - Verification expectations: scoped test runs, negative controls where the work is a checker
   (new fixtures shown to FAIL on base: `~/ludics-lite/scripts/run-against-base.sh <suite>`, slot-wrapped),
-  and the box's known environmental traps. **On mac-studio**: Gatekeeper/XProtect stalls
-  fresh executables for minutes - sample the pid before assuming a hang; never start a second
-  dune against a running _build; and **targeted test aliases only** (`dune build
-  @<dir>/runtest-<name>` for the tests the change reaches, plus the scanners), never a full
+  and the box's known environmental traps. **OCANNL's formatter batch** is `tools/fmt-check.sh`,
+  run last, slot-wrapped and read by its final `fmt-check: PASSED|FAILED` line (its AGENTS.md
+  says why), never the `build @fmt` alias, which passes trees CI rejects. **On mac-studio**:
+  Gatekeeper/XProtect stalls fresh executables for minutes - sample the pid before assuming a
+  hang; never start a second dune against a running _build; and **targeted test aliases only**
+  (`dune build @<dir>/runtest-<name>` for the tests the change reaches, plus the scanners), never a full
   directory suite, full suites are CI's - the XProtect scanner is one single-threaded service
   for the machine and each worktree links its own copies of every test exe, so N parallel full
   suites queue N x ~200 fresh binaries behind it and every worker's run freezes (2026-08-22: 34
@@ -441,6 +444,23 @@ requirements for every transport with transport-specific setup and identity, and
   worker's shell sits inside it (removing your own cwd is the "Unable to read current working
   directory" failure ship-pr warns about), and the coordinator may still resume the session
   there for the hand-back. The coordinator removes worktrees at close-out.
+- **In a ludics-lite wave, workers merge with the two macOS jobs advisory** (the maintainer's
+  decision). Before merging, the worker runs every suite it touched under `/bin/bash` (3.2, the
+  macOS jobs' shell), slot-wrapped, and the brief's merge line is
+
+  ```bash
+  env SHIP_PR_ADVISORY_CHECKS='^(claude|Claude Code|github pages docs|bash 3\.2 suites, .* \(macos\))$' \
+    ~/.claude/skills/ship-pr/scripts/pr-review.sh merge lukstafi/ludics-lite#<pr> --wait
+  ```
+
+  blocked on as any merge wait; the `env` form is what runs after `bg-run.sh spawn`'s `--`,
+  which execs its command, where a bare assignment would be taken for the command. The value replaces the default list, so it spells the default's
+  names in; the rest matches exactly the two macOS jobs of `skill-scripts.yml`. Re-check it
+  against the job names when the workflow changes, and that no required job `needs:` either
+  (the boundary in `SHIP_PR_ADVISORY_CHECKS`'s entry in `pr-review.sh`'s usage text). If the
+  permission system refuses the prefixed command, the worker sends `MERGE_READY <pr> <sha>` to
+  the coordinator, who merges it. The macOS jobs still run on the merged tip, as the integration
+  loop's to read.
 - **The worker's verification ends at its own merge** (2026-08-30: seven workers chased
   master's moving tip for 100-120 minutes each): after `merge` confirms `merged`, the worker
   does NOT watch master's subsequent CI - "the latest tip's workflows" is a moving target under
@@ -616,9 +636,9 @@ controlled through the tools in your coordinator's file, never through those com
   the ubuntu leg (~28 min when the runners are free; 1h20m with six PRs queued), so a fix that
   only x86 can confirm stays unconfirmed for as long as pushes keep coming - and with "rebase
   before opening": CI builds the MERGE commit, so a repo-wide scan green on the branch can be
-  red against what landed on master meanwhile. Rebasing before MERGING is no longer mandated:
-  under the roll-forward policy a clean merge proceeds on the head's green run. Where the ci
-  workflow has NO concurrency group, pushes do not supersede - they queue serially behind runs
+  red against what landed on master meanwhile. Before merging, a green head is not rebased
+  (ship-pr's *How stale the base has grown*). Where the ci workflow has NO concurrency group,
+  pushes do not supersede - they queue serially behind runs
   for commits nobody will merge (2026-08-28: 13 queued runs starved one PR's head for an hour).
   The play: freeze pushes, cancel exactly the runs for superseded intermediate commits, let the
   head's run through, then one batched push carrying the held fixes. A worker told to freeze

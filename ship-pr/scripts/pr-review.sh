@@ -275,10 +275,13 @@
 #      SHIP_PR_ADVISORY_CHECKS=ERE of check, job and workflow names the build gate ignores
 #      (default: the review app's check and the github-pages deploys) — a run whose red is
 #      explained entirely by advisory JOBS is not a red build signal either, and a run still in
-#      flight whose every unfinished job is advisory does not hold a `--wait` (ludics-lite#500).
-#      BOUNDARY: GitHub creates a `needs:`-blocked job only once its dependencies finish, so a
-#      required job that `needs:` an advisory one is not visible while that advisory job runs —
-#      such a workflow is released early. A required job must not `needs:` an advisory one.
+#      flight whose every unfinished job is advisory does not hold a `--wait` once its finished
+#      non-advisory jobs are all green and its job list has been still for a minute
+#      (ludics-lite#500; run_inflight_is_advisory_only). BOUNDARY: GitHub creates a
+#      `needs:`-blocked job only once its dependencies finish, so a required job that `needs:` an
+#      advisory one is not visible while that advisory job runs — such a workflow is released
+#      early. A required job must not `needs:` an advisory one. A value REPLACES the default list,
+#      so a caller that adds names spells the default's in too.
 #      SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
@@ -2923,8 +2926,8 @@ cmd_status() {
 # What `merge` reads last — how far behind its base the branch is, whether the base's advance
 # touched the PR's files, whether the PR conflicts — read at the moment a round lands instead,
 # because that is when it is cheap to act on: the round's fixes are about to be written, and
-# "the base touched these files" or "CONFLICTS" is the instruction to merge the base in FIRST,
-# so the next push is one CI can test. Read only at merge time, it arrives after every round has
+# "CONFLICTS" is the instruction to resolve it in that push, so the push is one CI can test. An
+# overlap is information only (ship-pr SKILL.md, *How stale the base has grown*). Read only at merge time, it arrives after every round has
 # been paid for (ludics-lite#44: seven rounds on a conflicted #39, 80 minutes, no CI). On stderr
 # with the rest of the context, so a round's stdout stays byte-identical to poll's; not on the
 # `approved` exit, whose next step is `merge`, which prints the same read on stdout.
@@ -5332,7 +5335,7 @@ warn_base_drift() {
     [ -n "$overlap_reason" ] || overlap_reason="a compare response was incomplete or invalid"
     echo "base-drift file overlap $REPO#$pr: UNKNOWN — $overlap_reason"
     warn "BASE-DRIFT FILE OVERLAP UNKNOWN for $REPO#$pr — this is not 'none'; retry the merge" \
-      "read before deciding whether the branch needs a rebase."
+      "read."
   elif [ "$overlap_count" -eq 0 ]; then
     echo "base-drift file overlap $REPO#$pr: none"
   elif [ "$overlap_meet_count" -eq 0 ]; then
@@ -5343,11 +5346,10 @@ warn_base_drift() {
       "DISJOINT hunks (the base's lines and this PR's do not meet, which git merges by" \
       "construction): $overlap_disjoint"
   else
-    # The wording is the policy: six workers of the 2026-09-04 wave read the old "rebase, push,
-    # and let checks re-run" as an instruction they had just failed to follow, then watched the
-    # merge proceed anyway (ludics-lite#54). Under roll-forward a clean merge lands on the run
-    # that went green; the rebase is an option for a head one wants CI to test against the
-    # current base, not a requirement.
+    # The wording is the policy (ship-pr SKILL.md, *How stale the base has grown*): a clean merge
+    # lands on the run that went green, and only a conflict moves the head. Six workers of the
+    # 2026-09-04 wave read an older "rebase, push, and let checks re-run" as an instruction they
+    # had just failed to follow, then watched the merge proceed anyway (ludics-lite#54).
     echo "!!! BASE-DRIFT FILE OVERLAP: the base's advance touched the SAME REGIONS of" \
       "$overlap_meet_count path(s) changed by"
     printf '!!! %s#%s: %s\n' "$REPO" "$pr" "$overlap_meet"
@@ -5360,8 +5362,8 @@ warn_base_drift() {
     fi
     echo "!!! Merging under the roll-forward policy (ahrefs/ocannl#861): a clean merge proceeds on"
     echo "!!! the run that went green, and the post-merge integration loop verifies merged $base."
-    echo "!!! Read those files for semantic drift; rebase (or merge $base in where the branch is"
-    echo "!!! shared) only if you want CI to test this head against the current $base first."
+    echo "!!! Read those files for semantic drift. The overlap is not a reason to rebase: rebase"
+    echo "!!! (or merge $base in) only to resolve a conflict."
     printf 'pr-review.sh: BASE-DRIFT FILE OVERLAP for %s#%s in the same regions: %s — noted even below %s\n' \
       "$REPO" "$pr" "$overlap_meet" \
       "SHIP_PR_STALE_BASE; it does not block the merge under the roll-forward policy." >&2
