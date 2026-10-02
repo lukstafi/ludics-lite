@@ -4999,9 +4999,8 @@ esac
 # Returns 0 fresh enough with no such overlap, 1 for either warning, 3 when the count or overlap is
 # unknown. For one day (2026-08-29) the merge path treated 1 as a GATE; the
 # ahrefs/ocannl#861 decision (2026-08-30) reverted it to a WARNING under the roll-forward policy:
-# a PR merges on one green full-matrix run for its LAST commit, a clean merge does not restart
-# verification, and only a conflict-RESOLVING commit needs green CI after it — which the checks
-# gate reads naturally, that commit being the new head. The gate's cost was structural (every
+# a PR merges on one green run for its own head, never on the base's tip (ship-pr SKILL.md, *How
+# stale the base has grown*, states the gate). The gate's cost was structural (every
 # sibling merge invalidated every open PR's verification; #533 ran three complete rebase+CI
 # cycles over an unchanged topic diff), and #488's semantic-drift risk is owned after the fact by
 # the wave's integration loop (issue-wave skill: full suites on merged master, stop-the-world on
