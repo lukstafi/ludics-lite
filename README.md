@@ -799,10 +799,9 @@ purpose. Nor does a run still in flight hold the gate once its every unfinished 
 (ludics-lite#500), and the cases pin each way that release fails closed: a required job still
 listed as running, a run with no jobs yet, a jobs read that failed, a run with nothing unfinished
 (between jobs), a required job that finished red or stopped, a job with no timestamp, and a job
-list that changed inside the settle (`ADVISORY_SETTLE`). The settle is there because GitHub creates
-a `needs:`-blocked job only once its dependencies finish, so the jobs feed does not list it before
-then. That is also the boundary of `SHIP_PR_ADVISORY_CHECKS`: a required job must not `needs:` an
-advisory one, or the run is released before the required job exists.
+list that changed inside the settle (`ADVISORY_SETTLE`, whose reason is at
+`run_inflight_is_advisory_only`). The `needs:` boundary the release leaves is stated once, in
+`SHIP_PR_ADVISORY_CHECKS`'s entry in `pr-review.sh`'s usage text.
 
 `test-pr-review-retry.sh` drives `retry`: the plain retry's classification, and `retry run
 watch`, which addresses its run as

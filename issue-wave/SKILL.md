@@ -444,6 +444,23 @@ requirements for every transport with transport-specific setup and identity, and
   worker's shell sits inside it (removing your own cwd is the "Unable to read current working
   directory" failure ship-pr warns about), and the coordinator may still resume the session
   there for the hand-back. The coordinator removes worktrees at close-out.
+- **In a ludics-lite wave, workers merge with the two macOS jobs advisory** (the maintainer's
+  decision). Before merging, the worker runs every suite it touched under `/bin/bash` (3.2, the
+  macOS jobs' shell), slot-wrapped, and the brief's merge line is
+
+  ```bash
+  env SHIP_PR_ADVISORY_CHECKS='^(claude|Claude Code|github pages docs|bash 3\.2 suites, .* \(macos\))$' \
+    ~/.claude/skills/ship-pr/scripts/pr-review.sh merge lukstafi/ludics-lite#<pr> --wait
+  ```
+
+  blocked on as any merge wait; the `env` form is what runs after `bg-run.sh spawn`'s `--`,
+  which execs its command, where a bare assignment would be taken for the command. The value replaces the default list, so it spells the default's
+  names in; the rest matches exactly the two macOS jobs of `skill-scripts.yml`. Re-check it
+  against the job names when the workflow changes, and that no required job `needs:` either
+  (the boundary in `SHIP_PR_ADVISORY_CHECKS`'s entry in `pr-review.sh`'s usage text). If the
+  permission system refuses the prefixed command, the worker sends `MERGE_READY <pr> <sha>` to
+  the coordinator, who merges it. The macOS jobs still run on the merged tip, as the integration
+  loop's to read.
 - **The worker's verification ends at its own merge** (2026-08-30: seven workers chased
   master's moving tip for 100-120 minutes each): after `merge` confirms `merged`, the worker
   does NOT watch master's subsequent CI - "the latest tip's workflows" is a moving target under

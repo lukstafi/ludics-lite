@@ -883,11 +883,9 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   say) is exit 1 — nothing in the check list can carry that failure, and it outranks a green,
   pending or stopped check on the same head;
 - a queued or running non-advisory run is exit 4, **including under a green check** — one
-  workflow's green says nothing about a sibling that has not judged the head. The exception is a
-  run whose every unfinished job is advisory, with every finished required job green and its job
-  list unchanged for a minute (ludics-lite#500): it has no verdict on the way, so it does not hold.
-  GitHub lists a `needs:`-blocked job only once its dependencies finish, so **a required job must
-  not `needs:` an advisory one** — the run would be released before that job exists;
+  workflow's green says nothing about a sibling that has not judged the head. A run whose every
+  unfinished job is advisory does not hold (ludics-lite#500); `SHIP_PR_ADVISORY_CHECKS` in
+  `pr-review.sh`'s usage text says when, and the `needs:` boundary that comes with it;
 - a run that completed `cancelled`/`stale`/`action_required` with nothing behind it is exit 4,
   stopped-not-judged like everywhere else, as is one reported `completed` with no conclusion
   recorded yet;

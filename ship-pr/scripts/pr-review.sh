@@ -275,10 +275,13 @@
 #      SHIP_PR_ADVISORY_CHECKS=ERE of check, job and workflow names the build gate ignores
 #      (default: the review app's check and the github-pages deploys) — a run whose red is
 #      explained entirely by advisory JOBS is not a red build signal either, and a run still in
-#      flight whose every unfinished job is advisory does not hold a `--wait` (ludics-lite#500).
-#      BOUNDARY: GitHub creates a `needs:`-blocked job only once its dependencies finish, so a
-#      required job that `needs:` an advisory one is not visible while that advisory job runs —
-#      such a workflow is released early. A required job must not `needs:` an advisory one.
+#      flight whose every unfinished job is advisory does not hold a `--wait` once its finished
+#      non-advisory jobs are all green and its job list has been still for a minute
+#      (ludics-lite#500; run_inflight_is_advisory_only). BOUNDARY: GitHub creates a
+#      `needs:`-blocked job only once its dependencies finish, so a required job that `needs:` an
+#      advisory one is not visible while that advisory job runs — such a workflow is released
+#      early. A required job must not `needs:` an advisory one. A value REPLACES the default list,
+#      so a caller that adds names spells the default's in too.
 #      SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
 #      out for a build verdict (7200 — the runner queue alone ran ~2h deep on 2026-08-23),
 #      SHIP_PR_CHECKS_INTERVAL=seconds between re-reads (60), SHIP_PR_CHECKS_HEARTBEAT=seconds
