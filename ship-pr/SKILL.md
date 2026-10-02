@@ -1014,12 +1014,15 @@ merge call would fail on it.
 It warns and merges anyway. That is the **roll-forward policy** (ahrefs/ocannl#861, decided
 2026-08-30 after a wave where every sibling merge invalidated every open PR's verification —
 staging#533 ran three clean rebases and three full CI cycles over an unchanged topic diff): a PR
-merges on one green full-matrix run for its *last commit*; a clean merge does not restart
-verification; only a merge that needed a conflict-RESOLVING commit waits for green CI on that
-commit, which the checks gate reads naturally as the new head. What owns semantic drift instead is
-the wave coordinator's post-merge **integration loop** (issue-wave skill): the full `@runtest
-@train` suites on merged master, on a quiet, strong fleet machine, with
-stop-the-world triage on a regression.
+merges on one green run for its own head. The gate judges the checks and workflow runs on the
+head SHA it read, and nothing else: it never waits on the base branch's tip (`merge` reads the tip
+only for the drift report above), and GitHub merging that head cleanly into a base that has moved
+on restarts nothing. Only a push that moves the head restarts the wait, because the new head has
+no run yet. That wait is meant for a conflict-RESOLVING commit; a clean rebase pays it too, for
+now (accepting a clean rebase on its green predecessor's run is #496, low priority). What owns
+semantic drift instead is the wave coordinator's post-merge **integration loop** (issue-wave
+skill): the full `@runtest @train` suites on merged master, on a quiet, strong fleet machine,
+with stop-the-world triage on a regression.
 
 **When a wave coordinator is actively running that integration loop**, the division is strict
 on the landing side too: after `merge` confirms `merged`, the worker's verification is over.

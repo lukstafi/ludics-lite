@@ -43,11 +43,14 @@ woken. What holds a turn is a foreground Bash call, capped at 600 s. So:
   reading: re-arm it, and for `merge --wait` first re-read the merge state as ship-pr's *The
   approval is one gate* says. `REFUSED` (6): the directory held a run that had ended; a directory
   `spawn` allocated never does. Every re-arm takes a new `spawn`. A spawned run is no background
-  task of the harness's, so a task-stop does not reach it: stop it with `kill` on the pid in
-  `<dir>/cpid`. The older form, `new` and then `start` as a Bash `run_in_background: true` task,
-  still works; the harness killed such a task at ~40 min into a `merge --wait`, which is `DIED`.
-  The script's header is the full contract, the run directory's layout included, and
-  `test-bg-run.sh` beside it pins the races each verdict closes (ludics-lite#357, #388).
+  task of the harness's, so a task-stop does not reach it: stop it with
+  `kill "$(head -n 1 <dir>/cpid)"` (the file's second line is the start time, so a bare `cat`
+  fails). That signals the command's own process, never a process group: a spawned run shares
+  its caller's group, so a group kill takes the caller down with it. The older form, `new` and
+  then `start` as a Bash `run_in_background: true` task, still works; the harness killed such a
+  task at ~40 min into a `merge --wait`, which is `DIED`. The script's header is the full
+  contract, the run directory's layout included, and `test-bg-run.sh` beside it pins the races
+  each verdict closes (ludics-lite#357, #388).
 
 ## Worker channel
 
