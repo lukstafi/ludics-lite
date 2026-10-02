@@ -2,11 +2,13 @@
 """Isolated bootstrap safety checks; never installs packages or contacts the fleet."""
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
 
 SCRIPT = Path(__file__).with_name('install-linux.sh').resolve()
+SETUP_JQ = SCRIPT.parents[1] / '.github/actions/setup-jq/action.yml'
 
 
 class BootstrapSafety(unittest.TestCase):
@@ -271,6 +273,49 @@ class BootstrapSafety(unittest.TestCase):
         calls = (self.root / 'calls').read_text()
         self.assertNotIn('/usr/include/rocwmma', calls)
         self.assertNotIn('preferences.d', calls)
+
+    # A stub curl writes FAKE_JQ's bytes; the test sets the pinned sum to those bytes' own, so the
+    # sum check is exercised without a download. sudo is recorded, never run.
+    JQ_STUB = ('scratch=$PWD; FAKE_JQ=$PWD/fake-jq; printf "#!/bin/sh\\necho jq-fake\\n" > "$FAKE_JQ"; chmod +x "$FAKE_JQ"; '
+               'curl() { echo "curl $*" >> calls; cp "$FAKE_JQ" "${@: -1}"; }; '
+               'sudo() { echo "$*" >> calls; [ "$1" != install ] || command install "${@:2}"; }; '
+               'uname() { echo x86_64; }; JQ_DEST=$PWD/bin/jq; mkdir -p bin; ')
+
+    def test_jq_pin_matches_ci(self):
+        action = SETUP_JQ.read_text()
+        version = self.run_shell('echo "$JQ_VERSION"').stdout.strip()
+        self.assertIn('\n        version=' + version + '\n', action)
+        amd64 = self.run_shell('echo "$JQ_SHA256_amd64"').stdout.strip()
+        arm64 = self.run_shell('echo "$JQ_SHA256_arm64"').stdout.strip()
+        self.assertRegex(action, r'Linux/X64\) asset=jq-linux-amd64 sum=' + re.escape(amd64) + r' ')
+        self.assertRegex(action, r'Linux/ARM64\) asset=jq-linux-arm64 sum=' + re.escape(arm64) + r' ')
+        self.assertTrue(version.startswith('1.8.'), version)
+
+    def test_jq_arch_maps_the_fleet_machines_and_refuses_others(self):
+        self.assertEqual(self.run_shell('jq_arch x86_64; echo; jq_arch aarch64').stdout, 'amd64\narm64')
+        self.run_shell('jq_arch riscv64', False)
+
+    def test_jq_installs_a_verified_download(self):
+        self.run_shell(self.JQ_STUB + 'JQ_SHA256_amd64=$(sha256_of "$FAKE_JQ"); install_jq')
+        calls = (self.root / 'calls').read_text()
+        self.assertIn('/releases/download/jq-1.8.2/jq-linux-amd64', calls)
+        self.assertIn('install -m 755 ' + str(self.root) + '/jq ' + str(self.root) + '/bin/jq', calls)
+        self.assertEqual((self.root / 'bin/jq').read_text(), '#!/bin/sh\necho jq-fake\n')
+
+    def test_jq_refuses_a_download_that_misses_its_sum_before_sudo(self):
+        self.run_shell(self.JQ_STUB + 'install_jq', False)
+        self.assertNotIn('install -m', (self.root / 'calls').read_text())
+        self.assertFalse((self.root / 'bin/jq').exists())
+
+    def test_jq_rerun_with_the_pinned_binary_in_place_downloads_nothing(self):
+        self.run_shell(self.JQ_STUB + 'cp "$FAKE_JQ" bin/jq; JQ_SHA256_amd64=$(sha256_of "$FAKE_JQ"); install_jq')
+        self.assertFalse((self.root / 'calls').exists())
+
+    def test_jq_only_refuses_before_sudo(self):
+        stub = 'sudo() { echo "$*" >> calls; }; curl() { echo "$*" >> calls; }; '
+        self.run_shell(stub + 'uname() { echo Darwin; }; jq_only', False)
+        self.run_shell(stub + 'uname() { echo Linux; }; jq_only extra', False)
+        self.assertFalse((self.root / 'calls').exists())
 
     def test_endpoint_names_exclude_the_local_sentinel(self):
         self.run_shell('valid_endpoint rog-nv-linux && ! valid_endpoint local && ! valid_endpoint macbook-air && ! valid_endpoint user@host')

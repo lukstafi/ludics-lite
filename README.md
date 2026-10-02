@@ -319,9 +319,12 @@ before and after. Nothing re-applies those, and a feature update can reset them,
 **Before every push, run `scripts/preflight.sh` from the checkout.** It is CI's `lint` job — the
 same command the workflow runs, not a reconstruction of it: shell syntax, the two-way mode rule,
 shellcheck at error severity, the PowerShell parse, and the parse, prompt, jq-shape and
-scratch-directory guards with their fixtures, about 25 seconds for the lot. A
+scratch-directory guards with their fixtures, and the jq version, about 25 seconds for the lot. A
 step whose interpreter this box lacks (`pwsh` on the macs) is a named SKIP rather than a failure;
-CI passes `--require-tools`, where the same absence is red. `preflight.sh steps` lists what it
+CI passes `--require-tools`, where the same absence is red. The `jq-version` step is the fleet's
+jq minor, 1.8 (ludics-lite#508), and names the jq it found and where: another minor is a named
+WARN that leaves the exit status alone here, and red in CI, which pins the binary
+(`.github/actions/setup-jq`). `preflight.sh steps` lists what it
 runs, `preflight.sh globs` the file list every sweep here is spelled from, and a single step runs
 alone (`preflight.sh shellcheck`) while you iterate. `--as-ci` exports `GITHUB_ACTIONS=true` for
 the run, so a refusal prints the `::error file=` annotation the lint job prints and every step

@@ -1,0 +1,80 @@
+name: setup jq
+description: Put the fleet's pinned jq release ahead of the runner image's own jq, checksum-verified, and print which jq the job runs.
+
+# THE FLEET'S jq IS 1.8 (ludics-lite#508). jq 1.7.1 and 1.8 parse `A and X as $b | B`
+# differently -- `jq -nc '[true and ("x") as $b | ($b == "x")]'` prints [true] on 1.7.1 and
+# [false] on 1.8 -- and the runner images disagreed: ubuntu-latest's apt jq is 1.7.1, macos-latest
+# and windows-latest ship 1.8.1. So every job that runs jq installs the same release binary here,
+# exact to the patch, rather than taking whatever its image carries. The fleet's macs run
+# Homebrew's jq (1.8, by minor: Homebrew cannot pin a patch) and the Linux and WSL boxes run this
+# same pin from scripts/install-linux.sh; scripts/preflight.sh's jq-version step checks the minor
+# on any box, and scripts/test-install-linux.py holds the installer's linux-amd64 pin to this one.
+#
+# Not used by the jobs that run no jq: the diff classification, the PowerShell windows-driver
+# job, and the reporters, whose `gh --jq` is gh's own embedded gojq, not a jq on PATH.
+#
+# To move the pin: the version and all five sha256 sums below, the same pair in
+# scripts/install-linux.sh, and the minor in scripts/preflight.sh if it changes. Take the sums from
+# the release's sha256sum.txt and check them against the API's asset digests
+# (`gh release view jq-<v> --repo jqlang/jq --json assets`).
+
+runs:
+  using: composite
+  steps:
+    - name: Install the pinned jq release
+      shell: bash
+      run: |
+        set -euo pipefail
+        version=1.8.2
+        exe=jq
+        case "$RUNNER_OS/$RUNNER_ARCH" in
+        Linux/X64) asset=jq-linux-amd64 sum=b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f ;;
+        Linux/ARM64) asset=jq-linux-arm64 sum=8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309 ;;
+        macOS/ARM64) asset=jq-macos-arm64 sum=2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e ;;
+        macOS/X64) asset=jq-macos-amd64 sum=e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0 ;;
+        # A native jq.exe, as the image's own (Chocolatey's) is: the Git Bash leg exists to run
+        # the suites over a jq that ends its lines CRLF (ludics-lite#335), and the job's proof step
+        # records which line ending this one has.
+        Windows/X64) asset=jq-windows-amd64.exe sum=a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627 exe=jq.exe ;;
+        *)
+          echo "::error title=no pinned jq::no jq $version asset is pinned for $RUNNER_OS/$RUNNER_ARCH; add one to .github/actions/setup-jq/action.yml"
+          exit 1
+          ;;
+        esac
+        dir="$RUNNER_TEMP/jq-$version"
+        # Under Git Bash RUNNER_TEMP is a Windows path: the shell works in its POSIX spelling, and
+        # GITHUB_PATH takes the Windows one, which is what the runner prepends to PATH.
+        if command -v cygpath >/dev/null 2>&1; then dir=$(cygpath -u "$dir"); fi
+        mkdir -p "$dir"
+        curl --fail --silent --show-error --location --retry 3 --proto '=https' --tlsv1.2 \
+          -o "$dir/$exe" "https://github.com/jqlang/jq/releases/download/jq-$version/$asset"
+        if command -v sha256sum >/dev/null 2>&1; then
+          got=$(sha256sum "$dir/$exe" | cut -d' ' -f1)
+        else
+          got=$(shasum -a 256 "$dir/$exe" | cut -d' ' -f1)
+        fi
+        if [ "$got" != "$sum" ]; then
+          echo "::error title=jq checksum mismatch::$asset from jq-$version has sha256 $got, pinned $sum"
+          exit 1
+        fi
+        chmod +x "$dir/$exe"
+        if command -v cygpath >/dev/null 2>&1; then
+          cygpath -w "$dir" >>"$GITHUB_PATH"
+        else
+          echo "$dir" >>"$GITHUB_PATH"
+        fi
+        echo "JQ_PINNED_VERSION=$version" >>"$GITHUB_ENV"
+    # A step of its own, so it reads PATH as every later step will: the prepend takes effect
+    # between steps, and a jq resolved anywhere else would make the job's runs prove nothing about
+    # the pin.
+    - name: Show the jq this job runs
+      shell: bash
+      run: |
+        set -euo pipefail
+        path=$(command -v jq) || { echo '::error title=no jq::no jq on PATH after the pinned install'; exit 1; }
+        v=$(jq --version | tr -d '\r')
+        echo "jq: $v at $path"
+        if [ "$v" != "jq-$JQ_PINNED_VERSION" ]; then
+          echo "::error title=wrong jq::the jq on PATH is $v at $path, not the pinned jq-$JQ_PINNED_VERSION"
+          exit 1
+        fi

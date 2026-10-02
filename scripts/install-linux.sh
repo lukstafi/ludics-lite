@@ -8,9 +8,11 @@ usage() {
 Usage: bash scripts/install-linux.sh [--help]
        bash scripts/install-linux.sh --setup-peers [--apply] [--peer USER@HOST ...]
        bash scripts/install-linux.sh --wake-timer [HH:MM]
+       bash scripts/install-linux.sh --jq
 --setup-peers runs on Mac Studio, without installing packages or contacting MacBook Air.
 --wake-timer installs only the laptop's daily RTC wake for the OCANNL sweep (default 06:55
 local), for a box bootstrapped before that step existed.
+--jq installs only the fleet's pinned jq into /usr/local/bin, on native Linux or WSL.
 Interactive setup for native Ubuntu 26.04, with Tailscale already connected.
 Installs development tools, Codex, Claude Code, Bun and ludics-lite skills;
 optionally configures SSH, logins and an OCANNL OCaml 5.5.1 switch.
@@ -259,6 +261,61 @@ install_rocwmma() {
   sudo cp -r "$src/library/include/rocwmma/." /usr/include/rocwmma/
 }
 
+# THE FLEET'S jq IS 1.8 (ludics-lite#508): 1.7.1 and 1.8 parse `A and X as $b | B` differently, and
+# CI runs this same release (.github/actions/setup-jq/action.yml, which scripts/test-install-linux.py
+# holds this pin to). Ubuntu 26.04's apt jq is already 1.8 (1.8.1); this copy makes the patch CI's,
+# and an older WSL distro's apt jq the fleet's minor. apt's jq stays installed, and this copy in
+# /usr/local/bin precedes /usr/bin on Ubuntu's default PATH -- not under the hipjit opam package's
+# setenv, which prepends /usr/bin, hence the check below. The sums are the release's
+# sha256sum.txt. Homebrew is the macs' route.
+JQ_VERSION=1.8.2
+JQ_SHA256_amd64=b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f
+JQ_SHA256_arm64=8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309
+JQ_DEST=${FLEET_JQ_DEST:-/usr/local/bin/jq}
+
+sha256_of() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+
+jq_arch() {
+  case $1 in
+    x86_64|amd64) printf amd64 ;;
+    aarch64|arm64) printf arm64 ;;
+    *) fail "No jq $JQ_VERSION release pinned for $1." ;;
+  esac
+}
+
+# Idempotent: a JQ_DEST already holding the pinned binary is left alone, and nothing reaches sudo
+# until the download matches its sum.
+install_jq() {
+  local arch sum
+  arch=$(jq_arch "$(uname -m)")
+  sum=JQ_SHA256_$arch; sum=${!sum}
+  if [[ -f $JQ_DEST && $(sha256_of "$JQ_DEST") == "$sum" ]]; then
+    printf 'jq %s already at %s\n' "$JQ_VERSION" "$JQ_DEST"
+  else
+    curl --fail --show-error --silent --location --proto '=https' --tlsv1.2 \
+      "https://github.com/jqlang/jq/releases/download/jq-$JQ_VERSION/jq-linux-$arch" -o "$scratch/jq"
+    [[ $(sha256_of "$scratch/jq") == "$sum" ]] || fail "jq-linux-$arch from jq-$JQ_VERSION does not match its pinned sha256; nothing installed."
+    sudo install -m 755 "$scratch/jq" "$JQ_DEST"
+  fi
+  hash -r
+  # A PATH that puts /usr/bin first would keep running apt's jq: say so rather than claim success.
+  [[ $(command -v jq) == "$JQ_DEST" ]] ||
+    printf 'WARNING: jq on PATH is %s, not %s: put %s before /usr/bin.\n' "$(command -v jq)" "$JQ_DEST" "${JQ_DEST%/*}"
+  "$JQ_DEST" --version
+}
+
+# jq alone, non-interactively apart from sudo, for native Linux and WSL boxes alike:
+#   ssh -t <box> "bash <(printf %s <base64 of this script> | base64 -d) --jq"
+jq_only() {
+  [[ $# -eq 0 ]] || fail 'Usage: --jq'
+  [[ $(uname -s) == Linux ]] || fail 'Run this on the target Linux machine (a mac takes brew install jq).'
+  [[ $EUID -ne 0 ]] || fail 'Run as your normal user; the script invokes sudo for the install.'
+  scratch=$(mktemp -d)
+  scratch=$(cd "$scratch" && pwd -P)
+  trap 'rm -rf -- "$scratch"' EXIT
+  install_jq
+}
+
 # The timer alone, non-interactively apart from sudo, for a box bootstrapped before it existed:
 #   ssh -t <box> "bash <(printf %s <base64 of this script> | base64 -d) --wake-timer [HH:MM]"
 wake_timer_only() {
@@ -337,6 +394,11 @@ main() {
     wake_timer_only "$@"
     return
   fi
+  if [[ ${1:-} == --jq ]]; then
+    shift
+    jq_only "$@"
+    return
+  fi
   case ${1:-} in -h|--help) usage; return ;; '') ;; *) usage >&2; return 2 ;; esac
   [[ $# -eq 0 ]] || fail 'Unexpected arguments.'
   [[ $(uname -s) == Linux ]] || fail 'Run this on the target Linux machine.'
@@ -376,6 +438,7 @@ main() {
   scratch=$(cd "$scratch" && pwd -P)
   trap 'printf "Setup stopped at line %s. Fix the reported error and rerun.\n" "$LINENO" >&2' ERR
   trap 'rm -rf -- "$scratch"' EXIT
+  install_jq
   mkdir -p "$HOME/.local/bin" "$HOME/.config/fleet" "$HOME/.claude/skills" "$HOME/.codex/skills"
   export PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"
   installer codex https://chatgpt.com/codex/install.sh sh

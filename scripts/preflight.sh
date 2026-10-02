@@ -27,12 +27,23 @@
 #   - scratch-fixtures scripts/test-check-scratch-dirs.sh
 #   - preflight-fixtures scripts/test-preflight.sh (this script's own controls; the lint job runs
 #                      them too, so leaving them out here made the local command a subset of CI)
+#   - jq-version       the jq on PATH is the fleet's minor, 1.8 (ludics-lite#508), and says which
+#                      jq it found and where
 #
 # MISSING TOOLS. Without --require-tools a step whose interpreter is absent is SKIPped by name and
 # does not fail the run: pwsh is on neither fleet mac, and a preflight that goes red for a tool
 # the reader cannot install is a preflight the reader stops running. CI passes --require-tools, so
 # an image that loses pwsh or shellcheck is a red step there rather than a quiet pass. A step named
 # on the command line is still only skipped under that rule -- the flag, not the form, decides.
+#
+# A WRONG jq IS A WARNING HERE AND A FAILURE IN CI, by the same flag. jq 1.7.1 and 1.8 parse
+# `A and X as $b | B` differently, and macos-latest's 1.8 turned a PR red that no fleet box could
+# reproduce on its 1.7.1 (ludics-lite#508), so the fleet and CI run 1.8. Locally another minor is
+# a named WARN that leaves the exit status alone: no step here evaluates a jq program, so the
+# box's jq changes none of this script's verdicts, and a red the push will not have is what teaches
+# the reader to stop running the preflight. The warning is for the suites, which do run jq, and it
+# names the jq it found and where -- on mac-studio a clean `bash -l` puts /usr/bin (Apple's 1.7.1)
+# before Homebrew's. Under --require-tools, which is where CI pins the binary, it is red.
 #
 # --root DIR judges DIR instead of this script's own checkout. It is how scripts/test-preflight.sh
 # puts a defective tree in front of each assertion; nothing else needs it.
@@ -82,7 +93,13 @@ STEPS=(
   'scratch-dirs:scripts/check-scratch-dirs.sh'
   'scratch-fixtures:scripts/test-check-scratch-dirs.sh'
   'preflight-fixtures:scripts/test-preflight.sh'
+  'jq-version:-'
 )
+
+# The jq minor the fleet and CI run (ludics-lite#508). CI pins the patch in
+# .github/actions/setup-jq/action.yml and the Linux installer in scripts/install-linux.sh;
+# scripts/test-preflight.sh holds both to this minor.
+JQ_MINOR=1.8
 
 # The read-only words `steps`, `globs` and `files` are dispatched before any step is, so a step
 # that took one of those names would be answered by the query and never run -- and the workflow
@@ -296,6 +313,28 @@ step_powershell() {
   '
 }
 
+# The jq on PATH, by its own `--version`: 0 when it is JQ_MINOR, 4 (a warning) when it is not and
+# --require-tools was not given, 1 when it was. A native jq.exe ends the line CRLF, hence the `tr`.
+# The match is the minor and then a `.`, a `-` or the end, so `jq-1.80` is not 1.8.
+step_jq_version() {
+  local path version why
+  path=$(command -v jq)
+  version=$(jq --version 2>&1 | tr -d '\r')
+  case "$version" in
+  "jq-$JQ_MINOR" | "jq-$JQ_MINOR."* | "jq-$JQ_MINOR-"*)
+    printf 'preflight: jq-version: %s at %s\n' "$version" "$path"
+    return 0
+    ;;
+  esac
+  why="$path says '$version', not jq $JQ_MINOR.x, which the fleet and CI run (ludics-lite#508). On a mac: brew install jq; on Linux or WSL: scripts/install-linux.sh --jq"
+  if [ -n "$REQUIRE_TOOLS" ]; then
+    printf 'preflight: jq-version: %s\n' "$why"
+    return 1
+  fi
+  printf 'preflight: jq-version: WARN (%s)\n' "$why"
+  return 4
+}
+
 # --- running them ----------------------------------------------------------------------------
 
 # The interpreter each step needs, empty when it needs nothing beyond this shell.
@@ -304,10 +343,11 @@ step_tool() { # step_tool <name>
   syntax) printf 'bash' ;;
   shellcheck) printf 'shellcheck' ;;
   powershell) printf 'pwsh' ;;
+  jq-version) printf 'jq' ;;
   esac
 }
 
-run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped
+run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped, 4 passed with a warning
   local name="$1" cmd tool
   cmd=$(step_command "$name") || die "no such step: $name (run 'preflight.sh steps')"
   tool=$(step_tool "$name")
@@ -346,6 +386,7 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped
     modes) step_modes ;;
     shellcheck) step_shellcheck ;;
     powershell) step_powershell ;;
+    jq-version) step_jq_version ;;
     # A `case` that matches nothing exits 0, so an entry added to the table as `name:-` whose arm
     # was never written would print PASS having run nothing -- a claim that cannot fail, and
     # exactly the registration drift this file exists to refuse (round 3). The table is the
@@ -360,6 +401,10 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped
   if [ "$rc" -eq 0 ]; then
     printf 'preflight: %s: PASS\n' "$name"
     return 0
+  fi
+  # Only the jq-version step warns; a 4 from any step's script is that script failing.
+  if [ "$rc" -eq 4 ] && [ "$name" = jq-version ]; then
+    return 4
   fi
   printf 'preflight: %s: FAIL (exit %s)\n' "$name" "$rc"
   return 1
@@ -451,6 +496,7 @@ passed=0
 failed=0
 skipped=0
 skipped_names=
+warned_names=
 for name in "${WANTED[@]}"; do
   run_step "$name"
   case $? in
@@ -459,14 +505,21 @@ for name in "${WANTED[@]}"; do
     skipped=$((skipped + 1))
     skipped_names="$skipped_names $name"
     ;;
+  4)
+    # Passed, and counted so, but named again in the summary: the warning is the step's verdict.
+    passed=$((passed + 1))
+    warned_names="$warned_names $name"
+    ;;
   *) failed=$((failed + 1)) ;;
   esac
 done
 
 if [ -n "$skipped_names" ]; then
-  printf 'preflight: %d passed, %d failed, %d skipped (%s)\n' "$passed" "$failed" "$skipped" "${skipped_names# }"
+  summary=$(printf '%d passed, %d failed, %d skipped (%s)' "$passed" "$failed" "$skipped" "${skipped_names# }")
 else
-  printf 'preflight: %d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
+  summary=$(printf '%d passed, %d failed, %d skipped' "$passed" "$failed" "$skipped")
 fi
+[ -z "$warned_names" ] || summary="$summary; warned: ${warned_names# }"
+printf 'preflight: %s\n' "$summary"
 [ "$failed" -eq 0 ] || exit 1
 exit 0
