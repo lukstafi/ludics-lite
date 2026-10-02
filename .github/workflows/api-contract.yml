@@ -43,6 +43,8 @@ jobs:
       rc: ${{ steps.contract.outputs.rc }}
     steps:
       - uses: actions/checkout@v4
+      # The fleet's pinned jq, ahead of the image's own (ludics-lite#508); it prints which jq runs.
+      - uses: ./.github/actions/setup-jq
       - name: Assert the fixtures' beliefs against this repository's live API
         id: contract
         env:

@@ -50,6 +50,9 @@ jobs:
       # The image's Git carries core.autocrlf=true, and before .gitattributes pinned `eol=lf` this
       # checkout was CRLF; the proof step prints the setting and pr-review.sh's first line in bytes.
       - uses: actions/checkout@v4
+      # The fleet's pinned jq, as a native jq.exe, ahead of the image's Chocolatey one
+      # (ludics-lite#508); the proof step below records its version and its line ending.
+      - uses: ./.github/actions/setup-jq
       - name: Prove the platform from inside the suites' shell
         id: platform
         env:
@@ -71,7 +74,7 @@ jobs:
           *) echo "::error title=Git Bash platform proof failed::git --version is '$gv', not a Git for Windows build (.windows.)"; exit 1 ;;
           esac
           command -v jq || { echo '::error title=Git Bash platform proof failed::no jq on PATH'; exit 1; }
-          # The runner's jq is a native jq.exe, which ends its lines CRLF, and a `$(jq -r ...)`
+          # The pinned jq is a native jq.exe, which ends its lines CRLF, and a `$(jq -r ...)`
           # keeps the \r; pr-review.sh reads every jq through `jq_lf`, which probes for that once
           # (ludics-lite#335). Recorded here, so the day it changes is on the record.
           echo "jq:            $(jq --version), and jq -r ends a line with: $(printf '"x"' | jq -r . | od -An -c | tr -s ' ')"

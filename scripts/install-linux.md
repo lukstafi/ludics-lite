@@ -35,6 +35,19 @@ does not tell us the target Unix username.
 
 - Ubuntu build tools, Git/GitHub CLI, jq, ripgrep, tmux, SSH, Python/venv, Node/npm,
   opam, ShellCheck, OpenBLAS and common native build dependencies; enables Universe.
+- jq **1.8.2** from the jqlang/jq release binary, checksum-verified, at `/usr/local/bin/jq`
+  (ludics-lite#508): the fleet and CI run jq 1.8, since 1.7.1 parses `A and X as $b | B`
+  differently. The pin is the one `.github/actions/setup-jq/action.yml` installs in CI. Ubuntu
+  26.04's apt jq is already 1.8.1 and stays installed; this copy makes the patch CI's. A rerun with
+  the pinned binary in place downloads nothing. On a box where something prepends `/usr/bin` to
+  PATH -- the `hipjit` opam package's setenv does, on minix and tuf -- apt's jq still wins, and the
+  step says so. A box bootstrapped before this step existed, or a WSL box (which the full
+  installer refuses), takes jq alone, from the Mac: `git -C ~/ludics-lite fetch -q origin && ssh
+  -t <box> "bash <(printf %s $(git -C ~/ludics-lite show origin/main:scripts/install-linux.sh |
+  base64 | tr -d '\n') | base64 -d) --jq"`. Check: `command -v jq` is `/usr/local/bin/jq`, `jq
+  --version` prints `jq-1.8.2`, and `jq -nc '[true and ("x") as $b | ($b == "x")]'` prints
+  `[false]`. The macs take Homebrew's: `brew install jq`, which shadows Apple's 1.7.1 wherever
+  `/opt/homebrew/bin` comes first; `scripts/preflight.sh jq-version` says which jq a shell finds.
 - User-local Codex, Claude Code and Bun using their official installers.
   Existing commands are kept. Installers fetch current releases; this is a
   bootstrap, not a version-locked environment reproduction.

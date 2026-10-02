@@ -54,6 +54,9 @@ jobs:
         with:
           repository: lukstafi/ludics-lite
           ref: ${{ github.repository != 'lukstafi/ludics-lite' && 'main' || '' }}
+      # The fleet's pinned jq, ahead of the image's own (ludics-lite#508); it prints which jq runs.
+      # A local action resolves in the workspace, which holds the ludics-lite checkout above.
+      - uses: ./.github/actions/setup-jq
       - name: Read the branch's standing CI verdict
         id: base
         env:

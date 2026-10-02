@@ -296,6 +296,52 @@ expect "...and the run's exit status is still clean" \
 expect "...while --require-tools, which CI passes, makes it a failure" \
   1 'shellcheck: FAIL (shellcheck not found' -- env PATH="$TMP/nobin" "${BASH:-/bin/bash}" "$PF" --root "$T" --require-tools shellcheck
 
+# --- the jq version ---------------------------------------------------------------------------
+#
+# A shim per answer, first on PATH, so the step is judged on what `jq --version` says rather than on
+# whichever jq this box has. The step is the fleet's minor and nothing else (ludics-lite#508).
+
+jq_shim() { # jq_shim <version line>: a jq on $TMP/jqshim that answers --version with it
+  mkdir -p "$TMP/jqshim"
+  printf '#!/bin/sh\nprintf "%%s\\n" %s\n' "'$1'" >"$TMP/jqshim/jq"
+  chmod +x "$TMP/jqshim/jq"
+}
+tree jq
+jq_shim jq-1.8.2
+expect "a 1.8 jq passes the jq-version step" 0 'jq-version: PASS' \
+  -- env PATH="$TMP/jqshim:$PATH" "$PF" --root "$T" jq-version
+expect "...and the step says which jq it found and where" 0 "jq-version: jq-1.8.2 at $TMP/jqshim/jq" \
+  -- env PATH="$TMP/jqshim:$PATH" "$PF" --root "$T" jq-version
+jq_shim jq-1.7.1-apple
+expect "another minor is a named WARN that leaves the exit status alone" 0 "jq-version: WARN ($TMP/jqshim/jq says 'jq-1.7.1-apple'" \
+  -- env PATH="$TMP/jqshim:$PATH" "$PF" --root "$T" jq-version
+expect "...counted as passed, and named again in the summary" 0 '1 passed, 0 failed, 0 skipped; warned: jq-version' \
+  -- env PATH="$TMP/jqshim:$PATH" "$PF" --root "$T" jq-version
+expect "...while under --require-tools, which CI passes, it is a failure" 1 'jq-version: FAIL' \
+  -- env PATH="$TMP/jqshim:$PATH" "$PF" --root "$T" --require-tools jq-version
+jq_shim jq-1.80
+expect "the minor is matched whole: jq-1.80 is not 1.8" 0 'warned: jq-version' \
+  -- env PATH="$TMP/jqshim:$PATH" "$PF" --root "$T" jq-version
+# A native jq.exe ends its --version line CRLF (ludics-lite#335).
+printf '#!/bin/sh\nprintf "jq-1.8.1\\r\\n"\n' >"$TMP/jqshim/jq"
+expect "...and a CRLF line from a native jq.exe is read as its version" 0 'jq-version: PASS' \
+  -- env PATH="$TMP/jqshim:$PATH" "$PF" --root "$T" --require-tools jq-version
+expect "no jq at all is a named SKIP, under the missing-tool rule" 0 'jq-version: SKIP (jq not found' \
+  -- env PATH="$TMP/nobin" "${BASH:-/bin/bash}" "$PF" --root "$T" jq-version
+# The pins the check exists to agree with: the patch CI installs and the patch the Linux installer
+# installs are both ones it accepts, so moving either pin off the minor fails here, not on a box.
+ci_jq=$(sed -n 's/^ *version=\([0-9][0-9.]*\)$/\1/p' "$ROOT/.github/actions/setup-jq/action.yml")
+installer_jq=$(sed -n 's/^JQ_VERSION=\([0-9][0-9.]*\)$/\1/p' "$HERE/install-linux.sh")
+for pinned in "ci:$ci_jq" "installer:$installer_jq"; do
+  if [ -z "${pinned#*:}" ]; then
+    ko "no jq version pin read for ${pinned%%:*}: the file no longer spells it as this suite expects"
+    continue
+  fi
+  jq_shim "jq-${pinned#*:}"
+  expect "the ${pinned%%:*} pin, jq-${pinned#*:}, is one the jq-version step accepts" 0 'jq-version: PASS' \
+    -- env PATH="$TMP/jqshim:$PATH" "$PF" --root "$T" --require-tools jq-version
+done
+
 # --- powershell ---------------------------------------------------------------------------------
 #
 # A shim first, so the step's invocation and its exit status are judged on a box with no pwsh --
@@ -451,13 +497,16 @@ lint_disabled_runs() {
   ' "$WORKFLOW"
 }
 
-# Every `uses:` step of the lint job that is not the checkout. A check added to CI as an action is
-# a blocking assertion preflight cannot run, and the parity this PR claims would fail quietly
-# rather than here (round 12).
+# Every `uses:` step of the lint job that is not the checkout or the pinned jq. A check added to CI
+# as an action is a blocking assertion preflight cannot run, and the parity this PR claims would
+# fail quietly rather than here (round 12). The two exempt by exact name set the job up rather than
+# judge the checkout: setup-jq puts the fleet's jq on PATH for the jq-version step, which IS a
+# preflight step and is pinned like the others (ludics-lite#508).
 lint_uses_steps() {
   awk "$WORKFLOW_AWK"'
     function emit() {
-      if (suses != "" && job == "  lint:" && suses !~ /^actions\/checkout@/) print suses
+      if (suses != "" && job == "  lint:" && suses !~ /^actions\/checkout@/ \
+        && suses != "./.github/actions/setup-jq") print suses
     }
   ' "$WORKFLOW"
 }
