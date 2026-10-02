@@ -1014,13 +1014,13 @@ merge call would fail on it.
 It warns and merges anyway. That is the **roll-forward policy** (ahrefs/ocannl#861, decided
 2026-08-30 after a wave where every sibling merge invalidated every open PR's verification —
 staging#533 ran three clean rebases and three full CI cycles over an unchanged topic diff): a PR
-merges on one green run for its own head. The gate judges the checks and workflow runs on the
-head SHA it read and never waits on the base branch's tip. The base enters only an `absent`
-verdict, whose workflow-file recognition (above) reads it, so a base that moves during that merge
-call sends it back through the gate. GitHub merging a green head cleanly into a base that has
-moved on restarts nothing. Only a push that moves the head restarts the wait, because the new
-head has no run yet. That wait is meant for a conflict-RESOLVING commit; a clean rebase pays it
-too, for now (accepting a clean rebase on its green predecessor's run is #496, low priority).
+merges on one build verdict for its own head, read from every non-advisory check and workflow
+run on the head SHA the gate read (the verdict table above). It never waits on the base branch's
+tip; the base enters only an `absent` verdict, whose workflow-file recognition (above) reads it.
+GitHub merging a green head cleanly into a base that has moved on restarts nothing. Only a push
+that moves the head restarts the wait, because the new head has no run yet. That wait is meant
+for a conflict-RESOLVING commit; a clean rebase pays it too, for now (accepting a clean rebase on
+its green predecessor's run is #496, low priority).
 What owns semantic drift instead is the wave coordinator's post-merge **integration loop**
 (issue-wave skill): the full `@runtest @train` suites on merged master, on a quiet, strong fleet
 machine, with stop-the-world triage on a regression.
