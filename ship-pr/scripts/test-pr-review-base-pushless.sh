@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Focused fixture tests for `pr-review.sh base` on a default branch whose CI no longer runs on push
-# (ludics-lite#401, for ahrefs/ocannl#1057).
+# (ludics-lite#401).
 #
 # A workflow that ran on pushes to the branch and whose file at the tip no longer declares `push`
 # leaves its last push runs standing forever — an `event=push` page never ages out — so before
@@ -46,7 +46,7 @@ SHA_H=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 # The next merge, landing on the branch while a round is being read.
 SHA_D=dddddddddddddddddddddddddddddddddddddddd
 
-# ocannl's `ci` after #1057: pull requests, a schedule and manual runs — no push.
+# A `ci` whose push trigger was dropped: pull requests, a schedule and manual runs — no push.
 PUSHLESS_YAML='name: ci
 on:
   pull_request:
@@ -101,10 +101,11 @@ records() {
 }
 
 # --- source (a): the merged PR's head run, under the roll-forward rule ------------------------
-# The shape #1057 creates: the only push run is a green from before the trigger went. Before #401
-# this read "green", about SHA_A, forever. Now the tip is GitHub's clean merge of PR #7 and #7's
-# head is green, so the tip is green BY THAT SOURCE, and both the verdict line and the workflow's
-# own line say which source it was. Plain and under --wait alike: the gate's read is the second.
+# The shape a dropped push trigger leaves: the only push run is a green from before the trigger
+# went. Before #401 this read "green", about SHA_A, forever. Now the tip is GitHub's clean merge
+# of PR #7 and #7's head is green, so the tip is green BY THAT SOURCE, and both the verdict line
+# and the workflow's own line say which source it was. Plain and under --wait alike: the gate's
+# read is the second.
 test_a_clean_merge_of_a_green_head_is_green_by_the_named_source() {
   local wait
   for wait in "" --wait=2; do

@@ -161,9 +161,9 @@ push a path filter skips produces no run at all, so the newest verdict can legit
 tip by several commits — a gap in coverage, not a stale reading, and the printed SHA tells them
 apart.
 
-A workflow that **no longer runs on push** is the exception (ludics-lite#401; OCANNL's `ci` after
-ahrefs/ocannl#1057). Its last push run stands forever, so its verdict would be a stale reading, and
-`base` prints it as `retired` history instead. The tip's verdict for such a workflow comes only
+A workflow whose file at the tip **no longer declares `push`** is the exception (ludics-lite#401).
+Its last push run stands forever, so its verdict would be a stale reading, and `base` prints it as
+`retired` history instead. The tip's verdict for such a workflow comes only
 from a source the report names: an integration record concluded at exactly the tip (the wave gate
 hands those in), or the head run of the PR the tip merged, under the roll-forward rule, when the
 tip is GitHub's own merge commit of that head and the workflow itself ran green on it. A direct push, a squash or rebase merge, or a merge
