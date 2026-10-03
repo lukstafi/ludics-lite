@@ -341,9 +341,9 @@ ceiling and refuse every launch (20-40 min per launch on 09-24 and 09-25). The g
 `--interim` (ludics-lite#308): a tip whose own push run is in flight, with nothing red and
 nothing else in flight, is green meanwhile when it is GitHub's clean merge of a PR whose head
 built that workflow green, and the verdict line reads `green, interim (...; judged meanwhile by
-PR #N's head run ...)`. A tip that is not such a merge stays pending and refused. So an OCANNL
-wave launches through a burst, while a ludics-lite launch is refused until the burst's older runs
-finish (ship-pr's *Read the base before you branch* says why the two differ). The integration
+PR #N's head run ...)`. A tip that is not such a merge stays pending and refused, and so does one
+with a run at an older merge still going, which a burst leaves in OCANNL and ludics-lite alike
+(ship-pr's *Read the base before you branch*). The integration
 loop, which reads `base --wait` WITHOUT `--interim`, still waits for the tip's own run: an interim is
 never its verdict. This is a bounded pre-dispatch check, not another observer, and it is
 point-in-time: not atomic with the spawn or launch that follows, so an adoption reconciles
@@ -639,9 +639,8 @@ controlled through the tools in your coordinator's file, never through those com
   The merge gate is ship-pr's (*How stale the base has grown*): one build verdict for the PR's
   own head, never the base's tip. `pr-review.sh merge` warns loudly on a stale base but no longer
   refuses. The complement is the coordinator's **integration loop**, whose value is a verdict
-  that keeps pace with the merges: a master CI that cancels superseded runs leaves most merges
-  without one (2026-09-25: 9 of 16 master pushes cancelled, no master tip with a verdict for
-  2.5 h). As each merge lands, pick a quiet, strong box with the whole board in view
+  that keeps pace with the merges: master's CI gives a burst one verdict covering a span of
+  merges (ship-pr's *Read the base before you branch*). As each merge lands, pick a quiet, strong box with the whole board in view
   (`fleet-worker.sh load` - CPU/GPU five-minute averages, dune count, agent sessions per box; a
   box already running this wave's GPU measurement is NOT quiet whatever its CPU says; the
   maintainer chose minix-amd-linux over tuf-amd-linux), take an execution reservation there,

@@ -350,6 +350,9 @@ gh() {
     fi
     response=$(runs_of "$wid")
     [ -n "$response" ] || response=$(runs_json "$wid" '[]')
+    # One page, as the API serves `per_page=10`: a case with more rows has the older ones only in
+    # the hundred-deep read below.
+    response=$(jq -c '.workflow_runs |= .[:10]' <<<"$response") || return 1
     if [ -n "$AGED_RUN_ID" ]; then
       # Stamped HERE, at the read: the row is AGED_RUN_SECS old on the API's clock when it is
       # served, however late the read came (`aged_at_read`).
@@ -362,6 +365,13 @@ gh() {
       printf 'runs read\n' >>"$DELAY_LOG"
       sleep "$RUNS_READ_DELAY"
     fi
+    ;;
+  # A workflow's push runs a hundred deep, every row the case set, as the interim's deeper read asks.
+  "repos/$REPO/actions/workflows/"*"/runs?branch=$BRANCH&event=push&per_page=100")
+    wid=${FIXTURE_ENDPOINT#*/actions/workflows/}
+    wid=${wid%%/*}
+    response=$(runs_of "$wid")
+    [ -n "$response" ] || response=$(runs_json "$wid" '[]')
     ;;
   "repos/$REPO/actions/runs/"*"/jobs?per_page=100")
     rid=${FIXTURE_ENDPOINT#*/actions/runs/}

@@ -554,6 +554,75 @@ test_interim_is_not_asked_outside_its_shape() {
   assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "and no source is asked"
 }
 
+# A push group that does not cancel (OCANNL's `ci`): a burst leaves one run going at an older
+# merge, the tip's run waiting behind it (status `pending`), and the merges between cancelled as
+# each was replaced while pending. That older run judges base changes the PR head never met, so
+# the interim waits for it; once it has finished green the tip's run is all that is coming and a
+# wait's interim answers, and once it has finished red that is the span's red, over the PR head's
+# green.
+test_interim_in_a_group_that_does_not_cancel() {
+  burst_fixture '[{"status":"pending","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7502},
+                  {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7501},
+                  {"status":"in_progress","conclusion":null,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7500}]'
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "the tip pending behind an older run still going is pending"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no interim while the older run judges"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "and no source is asked"
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7512},
+                  {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7511},
+                  {"conclusion":"success","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7510}]'
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 0 "the older run green, the tip's run is all that is coming"
+  assert_contains "$BASE_OUTPUT" "green, interim (tip ${SHA_C:0:8};" "and the interim answers"
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7522},
+                  {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7521},
+                  {"conclusion":"failure","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7520}]'
+  run_base --interim
+  assert_eq "$BASE_RC" 1 "the older run red is the span's red"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "the PR head's green does not cover it"
+}
+
+# A burst longer than the runs page: ten replaced merges' `cancelled` rows push the oldest merge's
+# run off the page the fold reads, so only the interim's deeper read can see it (ludics-lite#533).
+# Held while it runs or waits, and when it finished red; finished green, the interim answers.
+test_interim_finds_an_older_run_off_the_page() {
+  local cancelled
+  cancelled=$(jq -cn '[range(7600; 7610) | {conclusion: "cancelled", head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", id: .}] | reverse')
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{status: "in_progress", conclusion: null, head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 4 "an older run off the page still holds the interim"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no green while it judges"
+  assert_contains "$(cat "$REQUEST_LOG")" "per_page=100" "found by the deeper read"
+  # Every status a run waits in, not only in_progress: the read counts whatever has not completed.
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{status: "waiting", conclusion: null, head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
+  run_base --wait=2 --interim
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "a waiting run off the page holds it too"
+  # And a run off the page that has finished RED is the burst's verdict, not the PR head's green.
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{conclusion: "failure", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 4 "a red off the page holds the interim"
+  assert_contains "$BASE_OUTPUT" "its newest judged push run at an older commit is failure" "and says why"
+  # Two judged runs off the page created in one second: the higher id is the newer, whatever order
+  # the feed serves them in, as newest_first breaks the tie on the page.
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{conclusion: "success", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7589, created_at: "2026-09-10T00:00:00Z"},
+      {conclusion: "failure", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590, created_at: "2026-09-10T00:00:00Z"}]')"
+  run_base --wait=2 --interim
+  assert_contains "$BASE_OUTPUT" "its newest judged push run at an older commit is failure" "a same-second tie goes to the higher id"
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{conclusion: "success", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 0 "the same page with that run finished: the interim answers"
+}
+
 # The interim re-confirms the tip before it is taken, as the covered break does: a merge landing
 # inside the round makes the green one for a tip the branch has left.
 test_interim_reconfirms_the_tip() {
@@ -749,6 +818,8 @@ tests=(
   test_interim_is_never_the_default
   test_interim_without_a_green_source_stays_pending
   test_interim_is_not_asked_outside_its_shape
+  test_interim_in_a_group_that_does_not_cancel
+  test_interim_finds_an_older_run_off_the_page
   test_interim_reconfirms_the_tip
   test_interim_waits_out_a_workflow_the_tip_may_have_added
   test_interim_rereads_the_tips_run_after_the_source
