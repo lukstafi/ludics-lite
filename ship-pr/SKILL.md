@@ -174,8 +174,8 @@ it always did.
 
 A tip whose own run is **in flight** over a window with no judged run reads **pending** — `NO
 VERDICT YET`, exit 4 — not "never judged": the run that will judge it is running (ludics-lite#308).
-A merge burst makes that window, and since neither repository's push CI cancels, it also leaves
-runs at older merges going: one, with the tip's run pending behind it, where pushes share one
+A merge burst makes that window, and since neither repository's push CI cancels a running run, it
+also leaves runs at older merges going: one, with the tip's run pending behind it, where pushes share one
 group (OCANNL's `ci`, where a newer push replaces only a pending run, so a verdict covers a span of
 merges); several beside the tip's where each push has its own (this repository's `main`,
 ludics-lite#517). With `--interim` such a tip is green meanwhile when it is GitHub's clean merge of
