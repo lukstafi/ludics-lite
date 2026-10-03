@@ -4296,42 +4296,92 @@ is_advisory() { printf '%s' "$1" | grep -Eq -- "$BUILD_ADVISORY"; }
 # share its `needs:` boundary. A file with no ERE line, or with a line grep refuses, is a
 # configuration error (exit 2), never an empty list, which would match every name.
 #
-# The read fails closed. Only a 404 means the repository has no file, and then the default list
-# stands. A read that did not answer is exit 3, and a refusal other than 404 (a token that cannot
-# read contents) is exit 2. Neither falls back, because the default list is not the stricter one
-# by construction. A non-empty SHIP_PR_ADVISORY_CHECKS still wins and skips the read, for
-# back-compat. `base` does not read the file: the integration loop reads the advisory jobs on the
-# merged tip, and that read stays the default list's.
+# The read fails closed. Only a 404 that a directory listing confirms means the repository has
+# no file (advisory_absent), and then the default list stands. A read that did not answer is exit
+# 3, and a refusal, or a 404 the listing does not confirm (a token that cannot read contents), is
+# exit 2. Neither falls back, because the default list is not the stricter one by construction.
+# A non-empty SHIP_PR_ADVISORY_CHECKS still wins and skips the read, for back-compat. `base` does
+# not read the file: the integration loop reads the advisory jobs on the merged tip, and that read
+# stays the default list's.
 ADVISORY_FILE=.github/ship-pr-advisory-checks
 ADVISORY_FROM_ENV=""
 [ -z "${SHIP_PR_ADVISORY_CHECKS:-}" ] || ADVISORY_FROM_ENV=1
 
-# advisory_parse <file text> <where, for messages>: sets ADVISORY_RE to the lines' alternation,
-# each line in a group of its own so an anchor binds to its line alone. Returns 2, having said
+# advisory_parse <file text> <where, for messages>: sets ADVISORY_RE to the lines joined by `|`.
+# Alternation binds loosest in an ERE, so each line keeps its own anchors without a wrapping
+# group. A wrapping group would renumber a line's backreferences, and the join renumbers every
+# later line's anyway, so a line with a backreference is refused (an escaped backslash before a
+# digit is refused with it: refusing too much is a file to fix, never a weaker gate). The joined
+# ERE is validated as a whole as well as line by line (review of #531). Returns 2, having said
 # why, on a file that is not a list.
 ADVISORY_RE=""
 advisory_parse() {
-  local line re="" n=0 grc
+  local line re="" n=0
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%$'\r'}"
     case "$line" in *[![:space:]]*) ;; *) continue ;; esac
     case "${line#"${line%%[![:space:]]*}"}" in "#"*) continue ;; esac
-    # grep's status read through `||`, so a caller under `set -e` survives the no-match 1.
-    grc=0
-    printf '' | grep -Eq -- "$line" 2>/dev/null || grc=$?
-    if [ "$grc" -eq 2 ]; then
+    case "$line" in
+    *\\[1-9]*)
+      warn "$2 holds a line with a backreference, which a list cannot keep: $line"
+      return 2
+      ;;
+    esac
+    ere_valid "$line" || {
       warn "$2 holds a line that is not an ERE grep accepts: $line"
       return 2
-    fi
+    }
     n=$((n + 1))
-    re="${re:+$re|}($line)"
+    re="${re:+$re|}$line"
   done <<<"$1"
   if [ "$n" -eq 0 ]; then
     warn "$2 holds no ERE line (blank lines and # comments aside). An empty list would match" \
       "every name; fix the file."
     return 2
   fi
+  ere_valid "$re" || {
+    warn "$2's lines do not join into an ERE grep accepts: $re"
+    return 2
+  }
   ADVISORY_RE="$re"
+}
+
+# ere_valid <ere>: does grep compile it? Its status is read through `||`, so a caller under
+# `set -e` survives the no-match 1 that an empty input answers with.
+ere_valid() {
+  local grc=0
+  printf '' | grep -Eq -- "$1" 2>/dev/null || grc=$?
+  [ "$grc" -ne 2 ]
+}
+
+# advisory_absent: is ADVISORY_FILE ESTABLISHED not to be on the default branch? A 404 from the
+# Contents API does not establish it: GitHub answers 404 for a private repository's file when the
+# token lacks Contents access, and taking that for "no file" would apply the default list in
+# place of a stricter one (review of #531). So the directory is listed, and the file must be
+# missing from a listing that answered. A `.github` that is itself 404 is looked for in the root
+# listing the same way. 0: absent. 2: not established (a refusal, a listing at the Contents API's
+# cap, the file listed though its read was 404, a root that would not list). 3: no answer.
+advisory_absent() {
+  local dir leaf raw rc count
+  for dir in .github ""; do
+    leaf=ship-pr-advisory-checks
+    [ -n "$dir" ] || leaf=.github
+    raw=$(gh_retry read api "repos/$REPO/contents${dir:+/$dir}" \
+      --jq 'if type == "array" then ((length | tostring), (.[].name)) else empty end')
+    rc=$?
+    [ "$rc" -ne 3 ] || return 3
+    if [ "$rc" -ne 0 ]; then
+      [ -n "$dir" ] || return 2
+      case "$(gh_err_line)" in *"HTTP 404"*) continue ;; esac
+      return 2
+    fi
+    count="${raw%%$'\n'*}"
+    case "$count" in '' | *[!0-9]*) return 2 ;; esac
+    [ "$count" -lt "$CONTENTS_DIR_CAP" ] || return 2
+    case $'\n'"$raw"$'\n' in *$'\n'"$leaf"$'\n'*) return 2 ;; esac
+    return 0
+  done
+  return 2
 }
 
 # advisory_policy: BUILD_ADVISORY from the repository's file, when there is one and the variable
@@ -4345,7 +4395,24 @@ advisory_policy() {
   rc=$?
   if [ "$rc" -ne 0 ]; then
     if [ "$rc" -eq 1 ]; then
-      case "$(gh_err_line)" in *"HTTP 404"*) return 0 ;; esac
+      case "$(gh_err_line)" in
+      *"HTTP 404"*)
+        advisory_absent
+        rc=$?
+        [ "$rc" -ne 0 ] || return 0
+        if [ "$rc" -eq 3 ]; then
+          warn "$REPO's advisory list, $ADVISORY_FILE, read as 404, and the listing that would" \
+            "establish its absence did not answer ($(gh_err_line)). The gate's policy is" \
+            "UNKNOWN; nothing was judged. Retry."
+          return 3
+        fi
+        warn "$REPO's advisory list, $ADVISORY_FILE, read as 404, and its absence could not be" \
+          "established from the directory listing: a 404 is also how GitHub answers a token" \
+          "without Contents access to a private repository, so the default list is not a safe" \
+          "stand-in. Give the token Contents read access."
+        return 2
+        ;;
+      esac
       warn "could not read $REPO's advisory list, $ADVISORY_FILE on its default branch" \
         "($(gh_err_line)). The API refused the read, so the gate's policy is unknown, and the" \
         "default list is not a safe stand-in for it."

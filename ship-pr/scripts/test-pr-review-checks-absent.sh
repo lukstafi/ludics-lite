@@ -53,6 +53,10 @@ FAIL_ENDPOINT=""
 # 404, which is every case's state but the ones that are about the file.
 ADVISORY_BODY=""
 ADVISORY_HTTP=""                       # nonempty = the read is refused with this HTTP status
+# The listings a 404 is confirmed against: `.github`'s entries and the root's, as JSON arrays of
+# names; "404" or "500" in place of an array is that answer.
+ADVISORY_DIR=""
+ADVISORY_ROOT=""
 # --- the paths-ignore recognition's own feeds (ludics-lite#176) --------------------------------
 # A run-less head inside the grace is the one place the gate can do better than the clock: if
 # every workflow's own filter says no run can be created for this head, the absence is settled on
@@ -175,6 +179,8 @@ reset_fixture() {
   FAIL_ENDPOINT=""
   ADVISORY_BODY=""
   ADVISORY_HTTP=""
+  ADVISORY_DIR='["workflows"]'
+  ADVISORY_ROOT='[".github","README.md"]'
   PR_BASE="$BASE_SHA"
   PR_HEAD_REF="$HEAD_REF"
   WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:1,name:"ci",state:"active"}]}')
@@ -292,6 +298,8 @@ gh() {
     fi
     response="$ADVISORY_BODY"
     ;;
+  "repos/$REPO/contents/.github") response=$(advisory_listing "$ADVISORY_DIR") || return 1 ;;
+  "repos/$REPO/contents") response=$(advisory_listing "$ADVISORY_ROOT") || return 1 ;;
   "repos/$REPO/contents/"*"?ref=$BASE_SHA")
     response="${WORKFLOW_YAML_BASE:-$WORKFLOW_YAML}"
     ;;
@@ -318,6 +326,14 @@ gh() {
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
   gh_fixture_answer "$response"
+}
+
+advisory_listing() { # <names as a JSON array, or an HTTP status>
+  case "$1" in
+  404) echo "gh: Not Found (HTTP 404)" >&2; return 1 ;;
+  500) echo "gh: unavailable (HTTP 500)" >&2; return 1 ;;
+  esac
+  jq -c '[.[] | {name: ., type: "file"}]' <<<"$1"
 }
 
 run_gate() {
@@ -1564,6 +1580,40 @@ test_no_advisory_file_keeps_the_default_list() {
   assert_eq "$ADVISORY_RC" 0 "a 404 is a repository with no list"
   assert_eq "$ADVISORY_OUT" "$BUILD_ADVISORY" "the default list stands"
   assert_eq "$ADVISORY_ERR" "" "and nothing is said about a file that is not there"
+  assert_eq "$(grep -c 'contents/.github$' "$REQUEST_LOG")" 1 "the 404 is confirmed by the listing"
+  reset_fixture
+  ADVISORY_DIR=404
+  ADVISORY_ROOT='["README.md"]'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 0 "a repository with no .github, by the root listing, has no list"
+}
+
+# A 404 is also GitHub's answer to a token without Contents access on a private repository, so
+# the file counts as absent only when a listing that answered leaves it out (review of #531).
+test_an_unconfirmed_404_is_not_an_absent_file() {
+  reset_fixture
+  ADVISORY_DIR='["workflows","ship-pr-advisory-checks"]'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "a file the listing shows is not absent, whatever its read said"
+  assert_contains "$ADVISORY_ERR" "could not be established" "and says so"
+  reset_fixture
+  ADVISORY_DIR=404
+  ADVISORY_ROOT=404
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "nothing listable is no confirmation"
+  reset_fixture
+  ADVISORY_DIR=404
+  ADVISORY_ROOT='[".github"]'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "a .github the root lists but that reads 404 is no confirmation"
+  reset_fixture
+  ADVISORY_DIR=500
+  advisory_read
+  assert_eq "$ADVISORY_RC" 3 "a listing that did not answer is unknown"
+  reset_fixture
+  ADVISORY_DIR=$(jq -cn --argjson n "$CONTENTS_DIR_CAP" '[range($n) | "f\(.)"]')
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "a listing at the endpoint's cap may have left the file out"
 }
 
 test_the_advisory_file_replaces_the_list() {
@@ -1571,8 +1621,8 @@ test_the_advisory_file_replaces_the_list() {
   ADVISORY_BODY=$'# a comment\n\n  # an indented one\n^claude$\r\n^macos$\n\n'
   advisory_read
   assert_eq "$ADVISORY_RC" 0 "a list file is read"
-  assert_eq "$ADVISORY_OUT" '(^claude$)|(^macos$)' \
-    "its lines are the list, one group each, comments, blanks and the CR aside"
+  assert_eq "$ADVISORY_OUT" '^claude$|^macos$' \
+    "its lines are the list, joined, comments, blanks and the CR aside"
   assert_contains "$ADVISORY_ERR" "advisory checks, from $REPO's .github/ship-pr-advisory-checks" \
     "the log says where the list came from"
   assert_eq "$(grep -c 'contents/.github/ship-pr-advisory-checks$' "$REQUEST_LOG")" 1 \
@@ -1614,6 +1664,12 @@ test_an_advisory_file_that_cannot_be_used_refuses() {
   advisory_read
   assert_eq "$ADVISORY_RC" 2 "a line grep refuses is refused, whatever the other lines say"
   assert_contains "$ADVISORY_ERR" "not an ERE grep accepts: ^(macos" "and names the line"
+  # A backreference would be renumbered by the join, so the list cannot keep it (review of #531).
+  reset_fixture
+  ADVISORY_BODY=$'^claude$\n^(macos)\\1$'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "a line with a backreference is refused"
+  assert_contains "$ADVISORY_ERR" "backreference" "and says why"
 }
 
 # An ERE that starts with `-` is a pattern, never a grep option: GNU grep's `--help` would exit 0
@@ -1637,7 +1693,7 @@ test_the_variable_wins_over_the_file() {
 }
 
 # An anchor binds to its own line: `^claude` still matches a longer name and `macos$` does not.
-test_each_advisory_line_is_its_own_group() {
+test_each_advisory_line_keeps_its_anchors() {
   reset_fixture
   ADVISORY_BODY=$'^claude\nmacos$'
   advisory_read
@@ -1818,7 +1874,8 @@ tests=(
   test_an_advisory_file_that_cannot_be_used_refuses
   test_the_variable_wins_over_the_file
   test_an_option_shaped_advisory_ere_is_a_pattern
-  test_each_advisory_line_is_its_own_group
+  test_each_advisory_line_keeps_its_anchors
+  test_an_unconfirmed_404_is_not_an_absent_file
   test_this_repository_advisory_file_names_the_macos_jobs
   test_a_job_list_inside_the_settle_holds_its_run
   test_a_run_between_jobs_holds

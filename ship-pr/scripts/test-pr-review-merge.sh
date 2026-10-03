@@ -162,6 +162,11 @@ gh() {
     *) bail "unexpected header read: $*" ;;
     esac
     ;;
+  # The listing that confirms the advisory list's 404: a `.github` without the file.
+  "api repos/$REPO/contents/.github")
+    gh_fixture_parse "$@"
+    gh_fixture_answer '[{"name":"workflows","type":"dir"}]'
+    ;;
   "api --paginate")
     case "$*" in
     *"repos/$REPO/pulls/7/commits"*)
