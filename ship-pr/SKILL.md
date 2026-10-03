@@ -174,12 +174,15 @@ it always did.
 
 A tip whose own run is **in flight** over a window with no judged run reads **pending** — `NO
 VERDICT YET`, exit 4 — not "never judged": the run that will judge it is running (ludics-lite#308).
-A merge burst makes that window, two ways. Where each push run on the base cancels the one before
-(OCANNL's `ci`), every merge but the last is left without a finished run. Where each push keeps its
+A merge burst makes that window, two ways. Where push runs share one group that does not cancel
+(OCANNL's `ci`), a newer push replaces only a pending run, so each burst gets a verdict covering a
+span of merges: the tip's run waits behind one still running at an older merge, and the merges
+replaced in between get no verdict of their own. Where each push keeps its
 own run (this repository's `main`, ludics-lite#517), the burst's older runs are in flight beside the
 tip's. With `--interim` such a tip is green meanwhile when it is GitHub's clean merge of a PR whose
 head built that workflow green and no run at an older commit is still in flight (that run judges
-base changes the PR head may never have met); the verdict line says `green, interim` and names the
+base changes the PR head may never have met), which for OCANNL's `ci` means once the run ahead of
+the tip's has finished; the verdict line says `green, interim` and names the
 PR. That is the wave gate's opt-in and the base watch's; it is never the tip's own verdict, so a
 read that needs that (`base --wait` after a merge) does not pass it.
 

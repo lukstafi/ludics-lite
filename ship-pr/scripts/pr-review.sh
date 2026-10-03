@@ -7749,8 +7749,9 @@ cmd_base() {
         fi
         [ "$status" = completed ] || inflight=$((inflight + 1))
         # The tip's OWN run in flight: this workflow's newest run is at the tip and has not
-        # finished. It is what a merge burst leaves on every tip (each merge's push run cancels the
-        # one before under cancel-in-progress), and what the interim verdict below speaks for.
+        # finished. It is what a merge burst leaves on every tip (queued behind an older run in a
+        # group that does not cancel, or beside one in a per-commit group), and what the interim
+        # verdict below speaks for.
         fly=""
         if [ "$status" != completed ] && [ -n "$tip" ] && [ "$sha" = "$tip" ]; then
           fly=1

@@ -554,6 +554,34 @@ test_interim_is_not_asked_outside_its_shape() {
   assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "and no source is asked"
 }
 
+# A push group that does not cancel (OCANNL's `ci`): a burst leaves one run going at an older
+# merge, the tip's run waiting behind it (status `pending`), and the merges between cancelled as
+# each was replaced while pending. That older run judges base changes the PR head never met, so
+# the interim waits for it; once it has finished green the tip's run is all that is coming and a
+# wait's interim answers, and once it has finished red that is the span's red, over the PR head's
+# green.
+test_interim_in_a_group_that_does_not_cancel() {
+  burst_fixture '[{"status":"pending","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7502},
+                  {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7501},
+                  {"status":"in_progress","conclusion":null,"head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7500}]'
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "the tip pending behind an older run still going is pending"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no interim while the older run judges"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "and no source is asked"
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7512},
+                  {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7511},
+                  {"conclusion":"success","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7510}]'
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 0 "the older run green, the tip's run is all that is coming"
+  assert_contains "$BASE_OUTPUT" "green, interim (tip ${SHA_C:0:8};" "and the interim answers"
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7522},
+                  {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7521},
+                  {"conclusion":"failure","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","id":7520}]'
+  run_base --interim
+  assert_eq "$BASE_RC" 1 "the older run red is the span's red"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "the PR head's green does not cover it"
+}
+
 # The interim re-confirms the tip before it is taken, as the covered break does: a merge landing
 # inside the round makes the green one for a tip the branch has left.
 test_interim_reconfirms_the_tip() {
@@ -749,6 +777,7 @@ tests=(
   test_interim_is_never_the_default
   test_interim_without_a_green_source_stays_pending
   test_interim_is_not_asked_outside_its_shape
+  test_interim_in_a_group_that_does_not_cancel
   test_interim_reconfirms_the_tip
   test_interim_waits_out_a_workflow_the_tip_may_have_added
   test_interim_rereads_the_tips_run_after_the_source

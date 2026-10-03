@@ -648,9 +648,8 @@ controlled through the tools in your coordinator's file, never through those com
   The merge gate is ship-pr's (*How stale the base has grown*): one build verdict for the PR's
   own head, never the base's tip. `pr-review.sh merge` warns loudly on a stale base but no longer
   refuses. The complement is the coordinator's **integration loop**, whose value is a verdict
-  that keeps pace with the merges: a master CI that cancels superseded runs leaves most merges
-  without one (2026-09-25: 9 of 16 master pushes cancelled, no master tip with a verdict for
-  2.5 h). As each merge lands, pick a quiet, strong box with the whole board in view
+  that keeps pace with the merges: master's CI gives a burst one verdict covering a span of
+  merges (ship-pr's *Read the base before you branch*). As each merge lands, pick a quiet, strong box with the whole board in view
   (`fleet-worker.sh load` - CPU/GPU five-minute averages, dune count, agent sessions per box; a
   box already running this wave's GPU measurement is NOT quiet whatever its CPU says; the
   maintainer chose minix-amd-linux over tuf-amd-linux), take an execution reservation there,
