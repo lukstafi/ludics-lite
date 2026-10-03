@@ -217,13 +217,18 @@ land the change, then push the new body to the routine through the `schedule` sk
 action, diffing the live prompt against the previous version of this file first in case someone
 edited it in the web UI.
 
+Deployed baseline: the cloud copy holds this file's body as of `ff8f22b3`, pushed 2026-10-03
+(the live copy had lagged the repo until then); the next sync diffs the live prompt against
+`SKILL.md` at that commit.
+
 Its non-prompt configuration, for re-creating it:
 
 | Setting | Value |
 | --- | --- |
+| Model | `claude-sonnet-5-5` |
 | Environment | "Full access" (`anthropic_cloud`) |
 | Sources | `https://github.com/lukstafi/ocannl-staging`, `https://github.com/ahrefs/ocannl` |
-| Allowed tools | `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep` (the GitHub MCP tools load through `ToolSearch` regardless) |
+| Allowed tools | `Bash`, `Read`, `Write`, `Edit`, `Glob`, `Grep` (the GitHub MCP tools, `actions_run_trigger` among them, load through `ToolSearch` regardless) |
 | MCP | `Claude_Code_Remote` (`https://api.anthropic.com/v1/code/mcp/meta`) |
 | Fire API | `ci.yml`'s `notify-triage-routine` job, with the `ROUTINE_FIRE_URL` and `ROUTINE_FIRE_TOKEN` repository secrets |
 | Notifications | none; findings reach people as issues on `ahrefs/ocannl` |
