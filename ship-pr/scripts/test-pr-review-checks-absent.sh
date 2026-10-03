@@ -49,6 +49,10 @@ COMMIT_AGE=""
 PR_UPDATED_AGE=""
 JOBS_JSON=""
 FAIL_ENDPOINT=""
+# The repository's advisory list on its default branch (ludics-lite#530): empty is no such file, a
+# 404, which is every case's state but the ones that are about the file.
+ADVISORY_BODY=""
+ADVISORY_HTTP=""                       # nonempty = the read is refused with this HTTP status
 # --- the paths-ignore recognition's own feeds (ludics-lite#176) --------------------------------
 # A run-less head inside the grace is the one place the gate can do better than the clock: if
 # every workflow's own filter says no run can be created for this head, the absence is settled on
@@ -169,6 +173,8 @@ reset_fixture() {
   PR_UPDATED_AGE=3600
   JOBS_JSON=$(jobs_json '[]')
   FAIL_ENDPOINT=""
+  ADVISORY_BODY=""
+  ADVISORY_HTTP=""
   PR_BASE="$BASE_SHA"
   PR_HEAD_REF="$HEAD_REF"
   WORKFLOWS_JSON=$(jq -cn '{workflows:[{id:1,name:"ci",state:"active"}]}')
@@ -272,6 +278,19 @@ gh() {
   "repos/$REPO/contents/.github/workflows?ref="*)
     response=$(jq -cn --argjson f "$WORKFLOW_DIR_HEAD" --argjson d "$WORKFLOW_DIR_OTHER" \
       '[$f[] | {type:"file", path:.}] + [$d[] | {type:"dir", path:.}]')
+    ;;
+  # Exact, and above every contents glob below, which would serve it a workflow file. No `?ref=`:
+  # the list is read from the default branch.
+  "repos/$REPO/contents/.github/ship-pr-advisory-checks")
+    if [ -n "$ADVISORY_HTTP" ]; then
+      echo "gh: refused (HTTP $ADVISORY_HTTP)" >&2
+      return 1
+    fi
+    if [ -z "$ADVISORY_BODY" ]; then
+      echo "gh: Not Found (HTTP 404)" >&2
+      return 1
+    fi
+    response="$ADVISORY_BODY"
     ;;
   "repos/$REPO/contents/"*"?ref=$BASE_SHA")
     response="${WORKFLOW_YAML_BASE:-$WORKFLOW_YAML}"
@@ -1382,7 +1401,7 @@ test_unreadable_jobs_keep_the_red() {
 }
 
 # --- an in-flight run whose only unfinished jobs are advisory (ludics-lite#500) -----------------
-# `macos` stands for the advisory leg a wave sets SHIP_PR_ADVISORY_CHECKS to skip; build_checks
+# `macos` stands for the advisory leg a repository's advisory list names; build_checks
 # drops its check run, so the check list below carries only the required job's. Each row's times
 # are given as AGES in seconds (created_ago, completed_ago; an absent age is a null field), since
 # what run_inflight_is_advisory_only weighs is how long the run's job list has been still.
@@ -1528,6 +1547,91 @@ test_wait_unchanged_head_turns_green() {
   assert_contains "$GATE_OUTPUT" "green —" "unchanged green is still reported"
 }
 
+# --- the repository's own advisory list (ludics-lite#530) ---------------------------------------
+# What advisory_policy leaves in BUILD_ADVISORY, and its exit status, read in a subshell because a
+# refusal is `fail`, which exits the shell it runs in.
+advisory_read() {
+  set +e
+  ADVISORY_OUT=$( (advisory_policy && printf '%s' "$BUILD_ADVISORY") 2>"$TEST_ROOT/advisory.err")
+  ADVISORY_RC=$?
+  set -e
+  ADVISORY_ERR=$(cat "$TEST_ROOT/advisory.err")
+}
+
+test_no_advisory_file_keeps_the_default_list() {
+  reset_fixture
+  advisory_read
+  assert_eq "$ADVISORY_RC" 0 "a 404 is a repository with no list"
+  assert_eq "$ADVISORY_OUT" "$BUILD_ADVISORY" "the default list stands"
+  assert_eq "$ADVISORY_ERR" "" "and nothing is said about a file that is not there"
+}
+
+test_the_advisory_file_replaces_the_list() {
+  reset_fixture
+  ADVISORY_BODY=$'# a comment\n\n  # an indented one\n^(claude|macos)$\r\n\n'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 0 "a one-ERE file is read"
+  assert_eq "$ADVISORY_OUT" '^(claude|macos)$' \
+    "its ERE is the list, comments, blanks and the CR aside"
+  assert_contains "$ADVISORY_ERR" "advisory checks, from $REPO's .github/ship-pr-advisory-checks" \
+    "the log says where the list came from"
+  assert_eq "$(grep -c 'contents/.github/ship-pr-advisory-checks$' "$REQUEST_LOG")" 1 \
+    "one read, of the default branch (no ref)"
+}
+
+# End to end through `checks`: the in-flight run whose only unfinished job is `macos` holds under
+# a list that does not name it, and is released once the repository's file does.
+test_checks_reads_the_repository_list() {
+  local jobs='[{"name":"build","conclusion":"success","created_ago":900,"completed_ago":600},
+              {"name":"macos","created_ago":900}]'
+  advisory_inflight_fixture "$jobs"
+  retune BUILD_ADVISORY='^claude$'
+  check_trailer 4 unjudged "NO VERDICT YET"
+  advisory_inflight_fixture "$jobs"
+  retune BUILD_ADVISORY='^claude$'
+  ADVISORY_BODY='^(claude|macos)$'
+  check_trailer 0 green "green — 1 build checks passed"
+}
+
+# Fail closed: no read is taken for "no file" but a 404, and a file that does not say one ERE is a
+# configuration error rather than the default list.
+test_an_advisory_file_that_cannot_be_used_refuses() {
+  reset_fixture
+  FAIL_ENDPOINT="*/ship-pr-advisory-checks"
+  advisory_read
+  assert_eq "$ADVISORY_RC" 3 "a read that did not answer is unknown, not the default list"
+  assert_contains "$ADVISORY_ERR" "policy is UNKNOWN" "and says so"
+  reset_fixture
+  ADVISORY_HTTP=403
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "a refusal other than 404 is a configuration error"
+  reset_fixture
+  ADVISORY_BODY=$'^(claude)$\n^(macos)$'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "two ERE lines are refused"
+  assert_contains "$ADVISORY_ERR" "holds 2 ERE lines" "naming the count"
+  reset_fixture
+  ADVISORY_BODY=$'# only a comment\n'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "a file with no ERE is refused, not read as an empty list"
+  reset_fixture
+  ADVISORY_BODY='^(claude'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 2 "an ERE grep refuses is refused"
+  assert_contains "$ADVISORY_ERR" "not an ERE grep accepts" "and says why"
+}
+
+# SHIP_PR_ADVISORY_CHECKS set when the script was sourced still wins, without a read.
+test_the_variable_wins_over_the_file() {
+  reset_fixture
+  retune ADVISORY_FROM_ENV=1
+  ADVISORY_BODY='^(claude|macos)$'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 0 "the variable's list is used"
+  assert_eq "$ADVISORY_OUT" "$BUILD_ADVISORY" "unchanged by the file"
+  assert_eq "$(grep -c 'ship-pr-advisory-checks' "$REQUEST_LOG")" 0 "the file is not read at all"
+}
+
 test_head_reread_unknown() {
   local head
   for head in UNREADABLE ''; do
@@ -1669,6 +1773,11 @@ tests=(
   test_a_pending_required_job_holds_its_run
   test_an_inflight_run_without_jobs_holds
   test_an_unreadable_jobs_read_holds_its_run
+  test_no_advisory_file_keeps_the_default_list
+  test_the_advisory_file_replaces_the_list
+  test_checks_reads_the_repository_list
+  test_an_advisory_file_that_cannot_be_used_refuses
+  test_the_variable_wins_over_the_file
   test_a_job_list_inside_the_settle_holds_its_run
   test_a_run_between_jobs_holds
   test_a_red_or_stopped_required_job_holds_its_run
