@@ -582,6 +582,26 @@ test_interim_in_a_group_that_does_not_cancel() {
   assert_not_contains "$BASE_OUTPUT" "green, interim" "the PR head's green does not cover it"
 }
 
+# A burst longer than the runs page: ten replaced merges' `cancelled` rows push the run still going
+# at the oldest merge off the page the fold reads, so only the interim's status-filtered read can
+# see it (ludics-lite#533). Held while it runs; the same page with that run finished green answers.
+test_interim_finds_an_older_run_off_the_page() {
+  local cancelled
+  cancelled=$(jq -cn '[range(7600; 7610) | {conclusion: "cancelled", head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", id: .}] | reverse')
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{status: "in_progress", conclusion: null, head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 4 "an older run off the page still holds the interim"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no green while it judges"
+  assert_contains "$(cat "$REQUEST_LOG")" "status=in_progress" "found by the status-filtered read"
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{conclusion: "success", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 0 "the same page with that run finished: the interim answers"
+}
+
 # The interim re-confirms the tip before it is taken, as the covered break does: a merge landing
 # inside the round makes the green one for a tip the branch has left.
 test_interim_reconfirms_the_tip() {
@@ -778,6 +798,7 @@ tests=(
   test_interim_without_a_green_source_stays_pending
   test_interim_is_not_asked_outside_its_shape
   test_interim_in_a_group_that_does_not_cancel
+  test_interim_finds_an_older_run_off_the_page
   test_interim_reconfirms_the_tip
   test_interim_waits_out_a_workflow_the_tip_may_have_added
   test_interim_rereads_the_tips_run_after_the_source

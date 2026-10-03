@@ -7519,7 +7519,7 @@ cmd_base() {
   local records="" rsha rverdict rid rwhen pushless="" pushless_ids=() src_pending=0 src_none=0
   local trig_note interim="" fly tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0
   local interim_green="" interim_name="" interim_why="" pushless_name="" norun_ids=() rerounds=0
-  local hold_why moved want rid rstatus pushless_wids older_fly snap_at
+  local hold_why moved want rid rstatus pushless_wids older_fly fly_status fly_n snap_at
   while [ $# -gt 0 ]; do
     case "$1" in
     # Opt in to an INTERIM verdict for a tip whose own push run is still in flight (ludics-lite
@@ -7916,6 +7916,27 @@ cmd_base() {
     if [ "$tipfly" -gt 0 ]; then
       older_fly=$(awk -F'\t' -v t="$tip" -v skip="$pushless_wids" \
         '$1 != "" && $3 != "completed" && $5 != t && index(skip, " " $1 " ") == 0 { n++ } END { print n + 0 }' <<<"$allruns")
+    fi
+    # The rows above are ten per workflow, and a burst in a push group that does not cancel a
+    # running run stacks one `cancelled` row per replaced merge above the run still going at an
+    # older merge: past nine merges that run is off the page and the count above reads zero
+    # (ludics-lite#533). So before an interim, each workflow whose tip run is in flight is asked for
+    # its in-flight push runs by status. Boundary: `in_progress` and `queued`, the two states a
+    # push run runs or waits for a runner in; a read that fails holds the interim with a note.
+    if [ -n "$interim" ] && [ "$tipfly" -gt 0 ] && [ "$older_fly" -eq 0 ]; then
+      for want in "${tipfly_ids[@]}"; do
+        for fly_status in in_progress queued; do
+          if ! fly_n=$(gh_retry read api \
+            "repos/$REPO/actions/workflows/${want%%:*}/runs?branch=$ebranch&event=push&status=$fly_status&per_page=100" \
+            --jq "[.workflow_runs[] | select(.head_sha != \"$tip\")] | length"); then
+            older_fly=1
+            out="${out}           (no interim verdict for ${want#*:}: its $fly_status push runs could not be read ($(gh_err_line)))"$'\n'
+            break 2
+          fi
+          case "$fly_n" in '' | *[!0-9]*) fly_n=1 ;; esac
+          older_fly=$((older_fly + fly_n))
+        done
+      done
     fi
     if [ -n "$interim" ] && [ "$red" -eq 0 ] && [ "$src_pending" -eq 0 ] && [ "$src_none" -eq 0 ] &&
       [ "$tipfly" -gt 0 ] && [ "$inflight" -eq "$tipfly" ] && [ "$uncov_nofly" -eq 0 ] &&
