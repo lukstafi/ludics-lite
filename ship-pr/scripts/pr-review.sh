@@ -282,8 +282,8 @@
 #      advisory one is not visible while that advisory job runs — such a workflow is released
 #      early. A required job must not `needs:` an advisory one. A value REPLACES the default list,
 #      so a caller that adds names spells the default's in too. A repository can set its own list
-#      for `checks` and `merge` instead: one ERE in .github/ship-pr-advisory-checks on its
-#      default branch, read before the gate (ludics-lite#530; advisory_policy). That keeps the
+#      for `checks` and `merge` instead: one ERE per line in .github/ship-pr-advisory-checks on
+#      its default branch, read before the gate (ludics-lite#530; advisory_policy). That keeps the
 #      merge command bare. The variable, when set, still wins over the file, and `base` reads
 #      only the variable and the default.
 #      SHIP_PR_CHECKS_WAIT=seconds `--wait` holds
@@ -4274,7 +4274,10 @@ case "$CHECKS_HEARTBEAT" in
 '' | *[!0-9]*) die "SHIP_PR_CHECKS_HEARTBEAT must be whole seconds, got '$CHECKS_HEARTBEAT'" ;;
 esac
 
-is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
+# `--`, because the list is configuration (a variable, or a repository's file): a pattern that
+# starts with `-` would otherwise be read as an option, and GNU grep's `--help` exits 0 for every
+# name, which makes every check advisory (review of #531).
+is_advisory() { printf '%s' "$1" | grep -Eq -- "$BUILD_ADVISORY"; }
 
 # --- the repository's own advisory list (ludics-lite#530) --------------------------------------
 # A repository can name the advisory checks of its PRs in ADVISORY_FILE on its DEFAULT branch,
@@ -4282,24 +4285,60 @@ is_advisory() { printf '%s' "$1" | grep -Eq "$BUILD_ADVISORY"; }
 # the call. It used to travel as an `env SHIP_PR_ADVISORY_CHECKS=… pr-review.sh merge …` prefix
 # in the wave brief, which is a different command from the plain merge the user's standing
 # auto-mode rule clears. A flag would be no better: it would be a regex on the command line that
-# can waive any check. The file changes only through a merge, and it is read from the default
-# branch, never from the PR's head or base, so no PR can loosen its own gate, a stacked one
-# included.
+# can waive any check. The file changes only through a merge. It is read over the API from the
+# default branch, never from the local checkout (a worker's worktree is the PR head) and never
+# from the PR's base, which for a stacked PR is a branch no review has merged. So no PR can
+# loosen its own gate.
 #
-# The file holds ONE ERE, in SHIP_PR_ADVISORY_CHECKS's own sense: it REPLACES the default list
-# and has the same `needs:` boundary. Blank lines and lines whose first non-blank character is
-# `#` are skipped; any other second line, or an ERE grep refuses, is a configuration error (exit
-# 2). The read fails closed: only a 404 means the repository has no file, and then the default
-# list stands. A read that did not answer is exit 3, and a refusal other than 404 (a token that
-# cannot read contents) is exit 2. Neither falls back, because the default list is not the
-# stricter one by construction. A non-empty SHIP_PR_ADVISORY_CHECKS still wins and skips the
-# read, for back-compat. `base` does not read the file: the integration loop reads the advisory
-# jobs on the merged tip, and that read stays the default list's.
+# The format: one ERE per line, in SHIP_PR_ADVISORY_CHECKS's own sense, and a name is advisory
+# when any line matches it. Blank lines and lines whose first non-blank character is `#`
+# are skipped, and so is a trailing CR. The lines together REPLACE the default list, and they
+# share its `needs:` boundary. A file with no ERE line, or with a line grep refuses, is a
+# configuration error (exit 2), never an empty list, which would match every name.
+#
+# The read fails closed. Only a 404 means the repository has no file, and then the default list
+# stands. A read that did not answer is exit 3, and a refusal other than 404 (a token that cannot
+# read contents) is exit 2. Neither falls back, because the default list is not the stricter one
+# by construction. A non-empty SHIP_PR_ADVISORY_CHECKS still wins and skips the read, for
+# back-compat. `base` does not read the file: the integration loop reads the advisory jobs on the
+# merged tip, and that read stays the default list's.
 ADVISORY_FILE=.github/ship-pr-advisory-checks
 ADVISORY_FROM_ENV=""
 [ -z "${SHIP_PR_ADVISORY_CHECKS:-}" ] || ADVISORY_FROM_ENV=1
+
+# advisory_parse <file text> <where, for messages>: sets ADVISORY_RE to the lines' alternation,
+# each line in a group of its own so an anchor binds to its line alone. Returns 2, having said
+# why, on a file that is not a list.
+ADVISORY_RE=""
+advisory_parse() {
+  local line re="" n=0 grc
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in *[![:space:]]*) ;; *) continue ;; esac
+    case "${line#"${line%%[![:space:]]*}"}" in "#"*) continue ;; esac
+    # grep's status read through `||`, so a caller under `set -e` survives the no-match 1.
+    grc=0
+    printf '' | grep -Eq -- "$line" 2>/dev/null || grc=$?
+    if [ "$grc" -eq 2 ]; then
+      warn "$2 holds a line that is not an ERE grep accepts: $line"
+      return 2
+    fi
+    n=$((n + 1))
+    re="${re:+$re|}($line)"
+  done <<<"$1"
+  if [ "$n" -eq 0 ]; then
+    warn "$2 holds no ERE line (blank lines and # comments aside). An empty list would match" \
+      "every name; fix the file."
+    return 2
+  fi
+  ADVISORY_RE="$re"
+}
+
+# advisory_policy: BUILD_ADVISORY from the repository's file, when there is one and the variable
+# is unset. Runs in the calling shell, after the repo is resolved. It RETURNS its refusal (2 or 3,
+# said on stderr) rather than exiting, so `checks` can still end with its verdict trailer.
 advisory_policy() {
-  local body rc line re="" n=0
+  local body rc
   [ -z "$ADVISORY_FROM_ENV" ] || return 0
   body=$(gh_retry read api -H "Accept: application/vnd.github.raw" \
     "repos/$REPO/contents/$ADVISORY_FILE")
@@ -4307,26 +4346,18 @@ advisory_policy() {
   if [ "$rc" -ne 0 ]; then
     if [ "$rc" -eq 1 ]; then
       case "$(gh_err_line)" in *"HTTP 404"*) return 0 ;; esac
-      die "could not read $REPO's advisory list, $ADVISORY_FILE on its default branch" \
+      warn "could not read $REPO's advisory list, $ADVISORY_FILE on its default branch" \
         "($(gh_err_line)). The API refused the read, so the gate's policy is unknown, and the" \
         "default list is not a safe stand-in for it."
+      return 2
     fi
-    fail 3 "could not read $REPO's advisory list, $ADVISORY_FILE on its default branch" \
+    warn "could not read $REPO's advisory list, $ADVISORY_FILE on its default branch" \
       "($(gh_err_line)). The gate's policy is UNKNOWN; nothing was judged. Retry."
+    return 3
   fi
-  while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%$'\r'}"
-    case "$line" in *[![:space:]]*) ;; *) continue ;; esac
-    case "${line#"${line%%[![:space:]]*}"}" in "#"*) continue ;; esac
-    n=$((n + 1))
-    re="$line"
-  done <<<"$body"
-  [ "$n" -eq 1 ] || die "$REPO's $ADVISORY_FILE holds $n ERE lines; it takes exactly one" \
-    "(blank lines and # comments aside). Fix the file on the default branch."
-  printf '' | grep -Eq -- "$re" 2>/dev/null
-  [ $? -ne 2 ] || die "$REPO's $ADVISORY_FILE is not an ERE grep accepts: $re"
-  BUILD_ADVISORY="$re"
-  warn "advisory checks, from $REPO's $ADVISORY_FILE: $re"
+  advisory_parse "$body" "$REPO's $ADVISORY_FILE" || return 2
+  BUILD_ADVISORY="$ADVISORY_RE"
+  warn "advisory checks, from $REPO's $ADVISORY_FILE: $BUILD_ADVISORY"
 }
 
 # --- what `merge --override` waives (ludics-lite#392) ------------------------------------------
@@ -5106,10 +5137,14 @@ cmd_checks() {
     shift
   done
   pr_arg "$pr"
-  advisory_policy
   VERDICT=""
-  gate_checks "$PR_NUM" "$wait_for"
-  rc=$?
+  if advisory_policy; then
+    gate_checks "$PR_NUM" "$wait_for"
+    rc=$?
+  else
+    rc=$?
+    VERDICT=unknown
+  fi
   # The trailer (see count_token): gate_checks's VERDICT, from its closed vocabulary, or unknown.
   case "$VERDICT" in
   green | absent | red | runred | waived | pending | mixed | unjudged | superseded | unknown) ;;
@@ -6250,7 +6285,7 @@ cmd_merge() {
   # once here, before a wait that can run two hours, and once more right before the call, since
   # the base can be retargeted or a queue enabled during the wait.
   [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
-  advisory_policy
+  advisory_policy || exit $?
   # An override waives the reds of the gate's first read and nothing else (ludics-lite#392, see
   # is_waived): what is still running is waited for or refused as no verdict, and what turns red
   # after that read is a red the override was never given for.

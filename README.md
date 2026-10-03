@@ -803,9 +803,9 @@ list that changed inside the settle (`ADVISORY_SETTLE`, whose reason is at
 `run_inflight_is_advisory_only`). The `needs:` boundary the release leaves is stated once, in
 `SHIP_PR_ADVISORY_CHECKS`'s entry in `pr-review.sh`'s usage text. The list itself can come from
 the repository (ludics-lite#530): `checks` reads `.github/ship-pr-advisory-checks` from the default
-branch, and its ERE replaces the default list end to end. Only a 404 counts as no file. A read
-that did not answer is exit 3. A refusal other than 404, a file without exactly one ERE, and an
-ERE grep refuses are each exit 2, and a set `SHIP_PR_ADVISORY_CHECKS` skips the read.
+branch, and its lines, one ERE each, replace the default list end to end. Only a 404 counts as no
+file. A read that did not answer is exit 3. A refusal other than 404, a file with no ERE line, and
+a line grep refuses are each exit 2, and a set `SHIP_PR_ADVISORY_CHECKS` skips the read.
 `test-pr-review-merge.sh` pins that `merge` reads the list too, and does not merge when the read
 did not answer.
 

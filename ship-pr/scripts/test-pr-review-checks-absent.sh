@@ -1568,11 +1568,11 @@ test_no_advisory_file_keeps_the_default_list() {
 
 test_the_advisory_file_replaces_the_list() {
   reset_fixture
-  ADVISORY_BODY=$'# a comment\n\n  # an indented one\n^(claude|macos)$\r\n\n'
+  ADVISORY_BODY=$'# a comment\n\n  # an indented one\n^claude$\r\n^macos$\n\n'
   advisory_read
-  assert_eq "$ADVISORY_RC" 0 "a one-ERE file is read"
-  assert_eq "$ADVISORY_OUT" '^(claude|macos)$' \
-    "its ERE is the list, comments, blanks and the CR aside"
+  assert_eq "$ADVISORY_RC" 0 "a list file is read"
+  assert_eq "$ADVISORY_OUT" '(^claude$)|(^macos$)' \
+    "its lines are the list, one group each, comments, blanks and the CR aside"
   assert_contains "$ADVISORY_ERR" "advisory checks, from $REPO's .github/ship-pr-advisory-checks" \
     "the log says where the list came from"
   assert_eq "$(grep -c 'contents/.github/ship-pr-advisory-checks$' "$REQUEST_LOG")" 1 \
@@ -1589,12 +1589,12 @@ test_checks_reads_the_repository_list() {
   check_trailer 4 unjudged "NO VERDICT YET"
   advisory_inflight_fixture "$jobs"
   retune BUILD_ADVISORY='^claude$'
-  ADVISORY_BODY='^(claude|macos)$'
+  ADVISORY_BODY=$'^claude$\n^macos$'
   check_trailer 0 green "green — 1 build checks passed"
 }
 
-# Fail closed: no read is taken for "no file" but a 404, and a file that does not say one ERE is a
-# configuration error rather than the default list.
+# Fail closed: no read is taken for "no file" but a 404, and a file that is not a list of EREs is
+# a configuration error rather than the default list.
 test_an_advisory_file_that_cannot_be_used_refuses() {
   reset_fixture
   FAIL_ENDPOINT="*/ship-pr-advisory-checks"
@@ -1606,19 +1606,23 @@ test_an_advisory_file_that_cannot_be_used_refuses() {
   advisory_read
   assert_eq "$ADVISORY_RC" 2 "a refusal other than 404 is a configuration error"
   reset_fixture
-  ADVISORY_BODY=$'^(claude)$\n^(macos)$'
-  advisory_read
-  assert_eq "$ADVISORY_RC" 2 "two ERE lines are refused"
-  assert_contains "$ADVISORY_ERR" "holds 2 ERE lines" "naming the count"
-  reset_fixture
   ADVISORY_BODY=$'# only a comment\n'
   advisory_read
   assert_eq "$ADVISORY_RC" 2 "a file with no ERE is refused, not read as an empty list"
   reset_fixture
-  ADVISORY_BODY='^(claude'
+  ADVISORY_BODY=$'^claude$\n^(macos'
   advisory_read
-  assert_eq "$ADVISORY_RC" 2 "an ERE grep refuses is refused"
-  assert_contains "$ADVISORY_ERR" "not an ERE grep accepts" "and says why"
+  assert_eq "$ADVISORY_RC" 2 "a line grep refuses is refused, whatever the other lines say"
+  assert_contains "$ADVISORY_ERR" "not an ERE grep accepts: ^(macos" "and names the line"
+}
+
+# An ERE that starts with `-` is a pattern, never a grep option: GNU grep's `--help` would exit 0
+# for every name (review of #531). The variable's path, which the file's grouping cannot protect.
+test_an_option_shaped_advisory_ere_is_a_pattern() {
+  reset_fixture
+  retune BUILD_ADVISORY='--help'
+  if is_advisory "build"; then bail "an option-shaped ERE made 'build' advisory"; fi
+  is_advisory "x--helpy" || bail "the ERE is still matched as a pattern"
 }
 
 # SHIP_PR_ADVISORY_CHECKS set when the script was sourced still wins, without a read.
@@ -1630,6 +1634,33 @@ test_the_variable_wins_over_the_file() {
   assert_eq "$ADVISORY_RC" 0 "the variable's list is used"
   assert_eq "$ADVISORY_OUT" "$BUILD_ADVISORY" "unchanged by the file"
   assert_eq "$(grep -c 'ship-pr-advisory-checks' "$REQUEST_LOG")" 0 "the file is not read at all"
+}
+
+# An anchor binds to its own line: `^claude` still matches a longer name and `macos$` does not.
+test_each_advisory_line_is_its_own_group() {
+  reset_fixture
+  ADVISORY_BODY=$'^claude\nmacos$'
+  advisory_read
+  printf '%s' "claude-nightly" | grep -Eq "$ADVISORY_OUT" ||
+    bail "the first line's prefix match was lost"
+  if printf '%s' "macos-extra" | grep -Eq "$ADVISORY_OUT"; then
+    bail "the second line's suffix anchor leaked"
+  fi
+}
+
+# This repository's own file, parsed as the gate parses the fetched one, names exactly the two
+# macOS jobs of skill-scripts.yml beside the default names.
+test_this_repository_advisory_file_names_the_macos_jobs() {
+  local re name
+  advisory_parse "$(cat "$SCRIPT_DIR/../../.github/ship-pr-advisory-checks")" "the file"
+  re="$ADVISORY_RE"
+  for name in claude "Claude Code" "github pages docs" "bash 3.2 suites, ship-pr (macos)" \
+    "bash 3.2 suites, repo and fleet (macos)"; do
+    printf '%s' "$name" | grep -Eq "$re" || bail "the repository's list does not name '$name'"
+  done
+  for name in "pr-review fixtures (ubuntu)" "small guards (ubuntu)" "macos"; do
+    if printf '%s' "$name" | grep -Eq "$re"; then bail "the repository's list names '$name'"; fi
+  done
 }
 
 test_head_reread_unknown() {
@@ -1695,6 +1726,14 @@ test_checks_ends_with_its_verdict_trailer() {
   )
   RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
   check_trailer 5 superseded "SUPERSEDED" --wait=30
+  # A policy that could not be read is not a verdict either, and the trailer still closes the
+  # output (review of #531).
+  reset_fixture
+  FAIL_ENDPOINT="*/ship-pr-advisory-checks"
+  check_trailer 3 unknown ""
+  reset_fixture
+  ADVISORY_BODY='^(macos'
+  check_trailer 2 unknown ""
 }
 
 tests=(
@@ -1778,6 +1817,9 @@ tests=(
   test_checks_reads_the_repository_list
   test_an_advisory_file_that_cannot_be_used_refuses
   test_the_variable_wins_over_the_file
+  test_an_option_shaped_advisory_ere_is_a_pattern
+  test_each_advisory_line_is_its_own_group
+  test_this_repository_advisory_file_names_the_macos_jobs
   test_a_job_list_inside_the_settle_holds_its_run
   test_a_run_between_jobs_holds
   test_a_red_or_stopped_required_job_holds_its_run
