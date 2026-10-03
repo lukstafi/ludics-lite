@@ -329,8 +329,8 @@ blocks at the ceiling (unless the interim below answers), and a tip with no run 
 when the checker recognizes the tip's diff as entirely within the workflow's `paths-ignore`,
 otherwise once that absence outlives the grace (ludics-lite#156). A run in flight or stopped at
 the tip keeps the refusal. A workflow that no longer runs on push (its file at the tip names no
-`push`; ship-pr's *Read the base before you branch*) never settles for its old push verdict: the
-gate reads the execution registry's integration records for the target - concluded records marked
+`push`) never settles for its old push verdict: the gate
+reads the execution registry's integration records for the target - concluded records marked
 `"integration": true`, with a pass or fail at an exact SHA - and hands them to the checker,
 which takes the tip's verdict from a record at the tip first, else from the PR the tip is
 GitHub's clean merge of, when that workflow ran green on its head (roll-forward), and names the
