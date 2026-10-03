@@ -1039,9 +1039,9 @@ under `--wait` the tip is the question, so a tip read that failed is UNKNOWN rat
 to wait through; without `--wait` the same failure costs only the "not the tip" notes.
 
 `test-pr-review-base-pushless.sh` covers a default branch whose CI no longer runs on push
-(ludics-lite#401, for ahrefs/ocannl#1057). A workflow that ran on pushes and whose file at the tip
-no longer declares `push` keeps its last push runs forever, so the fold would present a months-old
-green as the base's. Such a workflow's push rows are now history, and the tip's verdict for it
+(ludics-lite#401). A workflow that ran on pushes and whose file at the tip no longer declares
+`push` keeps its last push runs forever, so the fold would present a months-old green as the
+base's. Such a workflow's push rows are now history, and the tip's verdict for it
 comes from a NAMED source or not at all: a coordinator's integration record (a registry record
 marked `"integration": true`) concluded at exactly the tip (`fleet-worker.sh gate` hands them in
 as `--integration-records`), else the merged PR's

@@ -7319,7 +7319,7 @@ head_within_paths_ignore() {
 
 # --- a default branch without push CI: the tip's verdict from NAMED sources (ludics-lite#401) --
 # A workflow that used to run on pushes to this branch and whose file at the tip no longer
-# declares `push` (ahrefs/ocannl#1057 drops it from `ci`) leaves its push runs standing forever:
+# declares `push` leaves its push runs standing forever:
 # `event=push` pages never age out, so the fold would keep presenting the last push run's verdict
 # — days or months old — as the base's. A stale green is worse than none. So such a workflow's
 # push rows are not read as a verdict at all, and the tip's verdict for it comes only from a

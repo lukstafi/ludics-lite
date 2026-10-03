@@ -161,27 +161,29 @@ push a path filter skips produces no run at all, so the newest verdict can legit
 tip by several commits — a gap in coverage, not a stale reading, and the printed SHA tells them
 apart.
 
-A workflow that **no longer runs on push** is the exception (ludics-lite#401; OCANNL's `ci` after
-ahrefs/ocannl#1057). Its last push run stands forever, so its verdict would be a stale reading, and
-`base` prints it as `retired` history instead. The tip's verdict for such a workflow comes only
+A workflow whose file at the tip **no longer declares `push`** is the exception (ludics-lite#401).
+Its last push run stands forever, so its verdict would be a stale reading, and `base` prints it as
+`retired` history instead. The tip's verdict for such a workflow comes only
 from a source the report names: an integration record concluded at exactly the tip (the wave gate
 hands those in), or the head run of the PR the tip merged, under the roll-forward rule, when the
 tip is GitHub's own merge commit of that head and the workflow itself ran green on it. A direct push, a squash or rebase merge, or a merge
 made outside GitHub has neither, and reads **no verdict** (exit 4), never an older green. What
 counts as "no longer runs on push" is narrow on purpose: its file at the tip was read and names no
 `push` trigger. A workflow that still declares `push`, or whose file the reader refuses, reads as
-it always did.
+it always did. OCANNL's `ci` still declares it today, each push run cancelled by the next
+(`cancel-in-progress`), so it is the cancelling burst below; ahrefs/ocannl#1057 plans to drop the
+trigger, which would make `ci` this exception.
 
 A tip whose own run is **in flight** over a window with no judged run reads **pending** — `NO
 VERDICT YET`, exit 4 — not "never judged": the run that will judge it is running (ludics-lite#308).
 A merge burst makes that window, two ways. Where each push run on the base cancels the one before
-(OCANNL's `ci`), every merge but the last is left without a finished run. Where each push keeps its
-own run (this repository's `main`, ludics-lite#517), the burst's older runs are in flight beside the
-tip's. With `--interim` such a tip is green meanwhile when it is GitHub's clean merge of a PR whose
-head built that workflow green and no run at an older commit is still in flight (that run judges
-base changes the PR head may never have met); the verdict line says `green, interim` and names the
-PR. That is the wave gate's opt-in and the base watch's; it is never the tip's own verdict, so a
-read that needs that (`base --wait` after a merge) does not pass it.
+(`cancel-in-progress`), every merge but the last is left without a finished run. Where each push
+keeps its own run (this repository's `main`, ludics-lite#517), the burst's older runs are in flight
+beside the tip's. With `--interim` such a tip is green meanwhile when it is GitHub's clean merge of
+a PR whose head built that workflow green and no run at an older commit is still in flight (that
+run judges base changes the PR head may never have met); the verdict line says `green, interim` and
+names the PR. That is the wave gate's opt-in and the base watch's; it is never the tip's own
+verdict, so a read that needs that (`base --wait` after a merge) does not pass it.
 
 ## Open
 
