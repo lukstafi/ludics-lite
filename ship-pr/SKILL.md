@@ -1121,11 +1121,12 @@ override costs whoever branches next their afternoon. And an override is never t
 red you caused: an unrelated red is a fact about the world, and a related one is your commit.
 
 Which checks the gate reads is a deny-list, not an allow-list: every check on the commit counts
-unless it is named advisory (`SHIP_PR_ADVISORY_CHECKS`), so a renamed job or a new matrix leg keeps
-gating instead of silently falling out of it. Advisory by default: the review app's own
-permanently-skipped check, and a publishing workflow that compiles none of the tree (ocannl's
-`github pages docs` runs slipshow, pandoc and latexmk over `docs/**`, so its red is about a font
-package, never about the code).
+unless it is named advisory (`SHIP_PR_ADVISORY_CHECKS`, or for `checks` and `merge` the
+repository's own `.github/ship-pr-advisory-checks` on its default branch), so a renamed job or a
+new matrix leg keeps gating instead of silently falling out of it. Advisory by default: the review
+app's own permanently-skipped check, and a publishing workflow that compiles none of the tree
+(ocannl's `github pages docs` runs slipshow, pandoc and latexmk over `docs/**`, so its red is about
+a font package, never about the code).
 
 Exclude by name only what **cannot carry a build verdict** — not merely what is red today. ocannl's
 `github pages api` was excluded on the latter reasoning, being red on every master push, and the

@@ -56,6 +56,7 @@ SERIES_JSON=""                         # the PR's commits as the endpoint serves
 SERIES_JSON_LATER=""                   # nonempty = what the SECOND series read on answers with
 SERIES_COUNT=""                        # nonempty = the commit count the PR states, over the rows'
 SERIES_FAIL=""                         # nonempty = the commits read answers with a 503
+ADVISORY_FAIL=""                       # nonempty = the advisory-list read answers with a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
 # the names body, base and default-branch: gh_retry calls the fixture inside a command
 # substitution, so a variable it increments dies with that subshell, and the count has to travel
@@ -145,6 +146,26 @@ gh() {
       return 1
     fi
     printf '%s\n' "$DEFAULT_BRANCH"
+    ;;
+  # The repository's advisory list (ludics-lite#530): no file, a 404, unless a case says otherwise.
+  "api -H")
+    case "$*" in
+    *"repos/$REPO/contents/.github/ship-pr-advisory-checks")
+      printf 'CALL advisory\n' >>"$CALLS_FILE"
+      if [ -n "$ADVISORY_FAIL" ]; then
+        printf 'gh: 503 No server is currently available to service your request\n' >&2
+        return 1
+      fi
+      printf 'gh: Not Found (HTTP 404)\n' >&2
+      return 1
+      ;;
+    *) bail "unexpected header read: $*" ;;
+    esac
+    ;;
+  # The listing that confirms the advisory list's 404: a `.github` without the file.
+  "api repos/$REPO/contents/.github")
+    gh_fixture_parse "$@"
+    gh_fixture_answer '[{"name":"workflows","type":"dir"}]'
     ;;
   "api --paginate")
     case "$*" in
@@ -272,6 +293,7 @@ reset() {
   SERIES_JSON_LATER=""
   SERIES_COUNT=""
   SERIES_FAIL=""
+  ADVISORY_FAIL=""
 }
 
 # The merge is bound to the head the gate read: a push during a long --wait must not land a head
@@ -282,6 +304,20 @@ test_merge_binds_to_the_gated_head() {
   assert_eq "$MERGE_RC" 0 "a green head merges ($MERGE_OUTPUT)"
   assert_contains "$MERGE_CALLS" "--match-head-commit head-sha " "merge is bound to the gated head"
   assert_contains "$MERGE_CALLS" " --merge" "the repo convention stays"
+}
+
+# The repository's advisory list is read before the gate, and a read that did not answer is an
+# unknown policy: exit 3, and no merge call (ludics-lite#530).
+test_an_unread_advisory_list_never_merges() {
+  reset
+  run_merge
+  assert_contains "$MERGE_CALLS" "CALL advisory" "the list is read on every merge"
+  reset
+  ADVISORY_FAIL=1
+  run_merge
+  assert_eq "$MERGE_RC" 3 "an unread advisory list is unknown, not the default list"
+  assert_contains "$MERGE_OUTPUT" "policy is UNKNOWN" "and says so"
+  assert_no_merge_call
 }
 
 test_forwarded_head_binding_is_refused() {
@@ -1836,6 +1872,7 @@ tests=(
   test_a_refused_merge_call_is_the_scripts_only_without_forwarded_flags
   test_superseded_head_never_merges
   test_merge_binds_to_the_gated_head
+  test_an_unread_advisory_list_never_merges
   test_forwarded_head_binding_is_refused
   test_require_green_refuses_green_by_skips_only
   test_require_green_refuses_auto

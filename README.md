@@ -801,7 +801,16 @@ listed as running, a run with no jobs yet, a jobs read that failed, a run with n
 (between jobs), a required job that finished red or stopped, a job with no timestamp, and a job
 list that changed inside the settle (`ADVISORY_SETTLE`, whose reason is at
 `run_inflight_is_advisory_only`). The `needs:` boundary the release leaves is stated once, in
-`SHIP_PR_ADVISORY_CHECKS`'s entry in `pr-review.sh`'s usage text.
+`SHIP_PR_ADVISORY_CHECKS`'s entry in `pr-review.sh`'s usage text. The list itself can come from
+the repository (ludics-lite#530): `checks` reads `.github/ship-pr-advisory-checks` from the default
+branch, and its lines, one ERE each, replace the default list end to end. Only a 404 that a
+directory listing confirms counts as no file, since a token without Contents access to a private
+repository gets a 404 too. A read or listing that did not answer is exit 3. A refusal, an
+unconfirmed 404, a file with no ERE line, a line grep refuses and a line with a backreference
+(which the join would renumber) are each exit 2, and a set `SHIP_PR_ADVISORY_CHECKS` skips the
+read.
+`test-pr-review-merge.sh` pins that `merge` reads the list too, and does not merge when the read
+did not answer.
 
 `test-pr-review-retry.sh` drives `retry`: the plain retry's classification, and `retry run
 watch`, which addresses its run as
