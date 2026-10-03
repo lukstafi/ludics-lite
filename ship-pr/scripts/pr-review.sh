@@ -7918,24 +7918,35 @@ cmd_base() {
         '$1 != "" && $3 != "completed" && $5 != t && index(skip, " " $1 " ") == 0 { n++ } END { print n + 0 }' <<<"$allruns")
     fi
     # The rows above are ten per workflow, and a burst in a push group that does not cancel a
-    # running run stacks one `cancelled` row per replaced merge above the run still going at an
-    # older merge: past nine merges that run is off the page and the count above reads zero
-    # (ludics-lite#533). So before an interim, each workflow whose tip run is in flight is asked for
-    # its in-flight push runs by status. Boundary: `in_progress` and `queued`, the two states a
-    # push run runs or waits for a runner in; a read that fails holds the interim with a note.
+    # running run stacks one `cancelled` row per replaced merge above the older merge's run: past
+    # nine merges, that run is off the page, whether it is still going or has finished (red
+    # included), and the fold above never saw it (ludics-lite#533). So before an interim, each
+    # workflow whose tip run is in flight is read again a hundred rows deep, newest first: any
+    # run at another commit that has not completed holds the interim, and so does a newest
+    # JUDGED run there that is red (none in reach is #308's window of stopped runs). Boundary: a hundred push runs, far past one
+    # run length of merges; a read that fails holds the interim with a note.
     if [ -n "$interim" ] && [ "$tipfly" -gt 0 ] && [ "$older_fly" -eq 0 ]; then
       for want in "${tipfly_ids[@]}"; do
-        for fly_status in in_progress queued; do
-          if ! fly_n=$(gh_retry read api \
-            "repos/$REPO/actions/workflows/${want%%:*}/runs?branch=$ebranch&event=push&status=$fly_status&per_page=100" \
-            --jq "[.workflow_runs[] | select(.head_sha != \"$tip\")] | length"); then
-            older_fly=1
-            out="${out}           (no interim verdict for ${want#*:}: its $fly_status push runs could not be read ($(gh_err_line)))"$'\n'
-            break 2
-          fi
-          case "$fly_n" in '' | *[!0-9]*) fly_n=1 ;; esac
-          older_fly=$((older_fly + fly_n))
-        done
+        if ! fly_n=$(gh_retry read api \
+          "repos/$REPO/actions/workflows/${want%%:*}/runs?branch=$ebranch&event=push&per_page=100" \
+          --jq "[.workflow_runs[] | select(.head_sha != \"$tip\")] as \$o
+                | ([\$o[] | select(.status != \"completed\")] | length | tostring) + \" \"
+                + (first(\$o[] | select(.status == \"completed\") | .conclusion
+                   | select(. == \"success\" or . == \"neutral\" or . == \"skipped\" or
+                            . == \"failure\" or . == \"timed_out\" or . == \"startup_failure\")) // \"none\")"); then
+          older_fly=1
+          out="${out}           (no interim verdict for ${want#*:}: its push runs could not be read past the first page ($(gh_err_line)))"$'\n'
+          break
+        fi
+        fly_status=${fly_n#* } fly_n=${fly_n%% *}
+        case "$fly_n" in '' | *[!0-9]*) fly_n=1 ;; esac
+        older_fly=$((older_fly + fly_n))
+        case "$(conclusion_class "$fly_status")" in
+        red)
+          older_fly=$((older_fly + 1))
+          out="${out}           (no interim verdict for ${want#*:}: its newest judged push run at an older commit is ${fly_status} — the burst's verdict, not the PR head's)"$'\n'
+          ;;
+        esac
       done
     fi
     if [ -n "$interim" ] && [ "$red" -eq 0 ] && [ "$src_pending" -eq 0 ] && [ "$src_none" -eq 0 ] &&

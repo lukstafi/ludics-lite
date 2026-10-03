@@ -582,9 +582,9 @@ test_interim_in_a_group_that_does_not_cancel() {
   assert_not_contains "$BASE_OUTPUT" "green, interim" "the PR head's green does not cover it"
 }
 
-# A burst longer than the runs page: ten replaced merges' `cancelled` rows push the run still going
-# at the oldest merge off the page the fold reads, so only the interim's status-filtered read can
-# see it (ludics-lite#533). Held while it runs; the same page with that run finished green answers.
+# A burst longer than the runs page: ten replaced merges' `cancelled` rows push the oldest merge's
+# run off the page the fold reads, so only the interim's deeper read can see it (ludics-lite#533).
+# Held while it runs or waits, and when it finished red; finished green, the interim answers.
 test_interim_finds_an_older_run_off_the_page() {
   local cancelled
   cancelled=$(jq -cn '[range(7600; 7610) | {conclusion: "cancelled", head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", id: .}] | reverse')
@@ -594,7 +594,20 @@ test_interim_finds_an_older_run_off_the_page() {
   run_base --wait=2 --interim
   assert_eq "$BASE_RC" 4 "an older run off the page still holds the interim"
   assert_not_contains "$BASE_OUTPUT" "green, interim" "no green while it judges"
-  assert_contains "$(cat "$REQUEST_LOG")" "status=in_progress" "found by the status-filtered read"
+  assert_contains "$(cat "$REQUEST_LOG")" "per_page=100" "found by the deeper read"
+  # Every status a run waits in, not only in_progress: the read counts whatever has not completed.
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{status: "waiting", conclusion: null, head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
+  run_base --wait=2 --interim
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "a waiting run off the page holds it too"
+  # And a run off the page that has finished RED is the burst's verdict, not the PR head's green.
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{conclusion: "failure", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 4 "a red off the page holds the interim"
+  assert_contains "$BASE_OUTPUT" "its newest judged push run at an older commit is failure" "and says why"
   burst_fixture "$(jq -cn --argjson c "$cancelled" \
     '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
      [{conclusion: "success", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"
