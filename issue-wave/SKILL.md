@@ -341,9 +341,9 @@ ceiling and refuse every launch (20-40 min per launch on 09-24 and 09-25). The g
 `--interim` (ludics-lite#308): a tip whose own push run is in flight, with nothing red and
 nothing else in flight, is green meanwhile when it is GitHub's clean merge of a PR whose head
 built that workflow green, and the verdict line reads `green, interim (...; judged meanwhile by
-PR #N's head run ...)`. A tip that is not such a merge stays pending and refused. So an OCANNL
-wave launches through a burst, while a ludics-lite launch is refused until the burst's older runs
-finish (ship-pr's *Read the base before you branch* says why the two differ). The integration
+PR #N's head run ...)`. A tip that is not such a merge stays pending and refused, and so does one
+with a run at an older merge still going, which a burst leaves in OCANNL and ludics-lite alike
+(ship-pr's *Read the base before you branch*). The integration
 loop, which reads `base --wait` WITHOUT `--interim`, still waits for the tip's own run: an interim is
 never its verdict. This is a bounded pre-dispatch check, not another observer, and it is
 point-in-time: not atomic with the spawn or launch that follows, so an adoption reconciles
