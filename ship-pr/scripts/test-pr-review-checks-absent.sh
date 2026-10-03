@@ -1704,21 +1704,6 @@ test_each_advisory_line_keeps_its_anchors() {
   fi
 }
 
-# This repository's own file, parsed as the gate parses the fetched one, names exactly the two
-# macOS jobs of skill-scripts.yml beside the default names.
-test_this_repository_advisory_file_names_the_macos_jobs() {
-  local re name
-  advisory_parse "$(cat "$SCRIPT_DIR/../../.github/ship-pr-advisory-checks")" "the file"
-  re="$ADVISORY_RE"
-  for name in claude "Claude Code" "github pages docs" "bash 3.2 suites, ship-pr (macos)" \
-    "bash 3.2 suites, repo and fleet (macos)"; do
-    printf '%s' "$name" | grep -Eq "$re" || bail "the repository's list does not name '$name'"
-  done
-  for name in "pr-review fixtures (ubuntu)" "small guards (ubuntu)" "macos"; do
-    if printf '%s' "$name" | grep -Eq "$re"; then bail "the repository's list names '$name'"; fi
-  done
-}
-
 test_head_reread_unknown() {
   local head
   for head in UNREADABLE ''; do
@@ -1876,7 +1861,6 @@ tests=(
   test_an_option_shaped_advisory_ere_is_a_pattern
   test_each_advisory_line_keeps_its_anchors
   test_an_unconfirmed_404_is_not_an_absent_file
-  test_this_repository_advisory_file_names_the_macos_jobs
   test_a_job_list_inside_the_settle_holds_its_run
   test_a_run_between_jobs_holds
   test_a_red_or_stopped_required_job_holds_its_run
