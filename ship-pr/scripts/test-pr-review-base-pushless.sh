@@ -608,6 +608,14 @@ test_interim_finds_an_older_run_off_the_page() {
   run_base --wait=2 --interim
   assert_eq "$BASE_RC" 4 "a red off the page holds the interim"
   assert_contains "$BASE_OUTPUT" "its newest judged push run at an older commit is failure" "and says why"
+  # Two judged runs off the page created in one second: the higher id is the newer, whatever order
+  # the feed serves them in, as newest_first breaks the tie on the page.
+  burst_fixture "$(jq -cn --argjson c "$cancelled" \
+    '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
+     [{conclusion: "success", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7589, created_at: "2026-09-10T00:00:00Z"},
+      {conclusion: "failure", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590, created_at: "2026-09-10T00:00:00Z"}]')"
+  run_base --wait=2 --interim
+  assert_contains "$BASE_OUTPUT" "its newest judged push run at an older commit is failure" "a same-second tie goes to the higher id"
   burst_fixture "$(jq -cn --argjson c "$cancelled" \
     '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7620}] + $c +
      [{conclusion: "success", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7590}]')"

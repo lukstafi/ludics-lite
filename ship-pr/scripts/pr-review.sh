@@ -7923,13 +7923,14 @@ cmd_base() {
     # included), and the fold above never saw it (ludics-lite#533). So before an interim, each
     # workflow whose tip run is in flight is read again a hundred rows deep, newest first: any
     # run at another commit that has not completed holds the interim, and so does a newest
-    # JUDGED run there that is red (none in reach is #308's window of stopped runs). Boundary: a hundred push runs, far past one
+    # JUDGED run there (newest by creation, then id, as newest_first orders) that is red (none in
+    # reach is #308's window of stopped runs). Boundary: a hundred push runs, far past one
     # run length of merges; a read that fails holds the interim with a note.
     if [ -n "$interim" ] && [ "$tipfly" -gt 0 ] && [ "$older_fly" -eq 0 ]; then
       for want in "${tipfly_ids[@]}"; do
         if ! fly_n=$(gh_retry read api \
           "repos/$REPO/actions/workflows/${want%%:*}/runs?branch=$ebranch&event=push&per_page=100" \
-          --jq "[.workflow_runs[] | select(.head_sha != \"$tip\")] as \$o
+          --jq "[.workflow_runs[] | select(.head_sha != \"$tip\")] | sort_by(.created_at, .id) | reverse | . as \$o
                 | ([\$o[] | select(.status != \"completed\")] | length | tostring) + \" \"
                 + (first(\$o[] | select(.status == \"completed\") | .conclusion
                    | select(. == \"success\" or . == \"neutral\" or . == \"skipped\" or
