@@ -28,6 +28,40 @@ slot; an exclusively reserved measurement runs the bounded project runner direct
 `fleet-worker.sh execution hold --request <request_id> -- <command>` (the OS-level sleep guard
 alone, inside which a runner's own `execution slot` runs instead of being refused).
 
+## Local managed command sessions
+
+For local long-running commands on a native Codex runtime with managed exec sessions, keep
+the command in the foreground of `exec_command`, retain the returned session ID and observe
+it with the runtime's stdin/wait tool until it actually exits. This also applies to review
+watchers and merge waits. Keep the turn open; a returned handle or run directory is launch
+evidence, never a terminal verdict.
+
+When a `bg-run.sh` record is needed, allocate a fresh directory with `bg-run.sh new <parent>`,
+then run `bg-run.sh start <dir> -- <command> [arg...]` in that managed foreground session.
+Retrieve its terminal status and read the recorded `rc` and `log`; `bg-run.sh wait <dir>`
+reporting `rc=<n>` means the command finished, and `<n>` is the command's verdict. Preserve the
+session ID, run directory, log path and observed revision in the board or worker report.
+Verification still uses its assigned correctness slot or measurement hold, as above.
+
+This shape recovered local runs in the 2026-10-04 mac-studio wave
+([ludics-lite#540](https://github.com/lukstafi/ludics-lite/issues/540)). Local `bg-run.sh spawn`
+calls returned directories but later reported `DIED`, with vanished pid/cpid, empty logs and
+no `rc`: the coordinator's integration command and a worker's review/checks watchers both
+hit it. Managed foreground `start` sessions stayed running and reached actual command
+evidence; remote spawn over SSH stayed live. The termination cause is unknown, so this is a
+local native-runtime observation, not a universal claim about `spawn` or a change to the
+Claude and remote CLI instructions.
+
+Before retrying a `DIED` or uncertain run, reconcile its session, pid/cpid and any surviving
+command processes against the runner records and Git/PR state. In particular, re-read merge
+state before restarting a merge wait. `DIED` supplies no command exit status and cannot prove
+that all child work stopped: do not credit a result, launch duplicate verification or start
+a replacement writer until ownership and outstanding execution reservations are accounted
+for. Resume the same worker with the same model when it is still resumable. If the worker
+itself is gone, use the shared [finisher and reconciliation policy](native-workers.md#supervision-recovery-and-evidence)
+only after proving the old writer stopped; the coordinator handles reservation
+reconciliation before dispatching further work.
+
 ## Coordinator supervision
 
 Keep a current snapshot at the top of the board (worker, PR/head, gate, runner handle and
