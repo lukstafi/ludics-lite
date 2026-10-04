@@ -46,7 +46,7 @@ Verification still uses its assigned correctness slot or measurement hold, as ab
 This shape recovered local runs in the 2026-10-04 mac-studio wave
 ([ludics-lite#540](https://github.com/lukstafi/ludics-lite/issues/540)). Local `bg-run.sh spawn`
 calls returned directories but later reported `DIED`, with vanished pid/cpid, empty logs and
-no `rc`: the coordinator's integration watcher and a worker's review/checks watchers both
+no `rc`: the coordinator's integration command and a worker's review/checks watchers both
 hit it. Managed foreground `start` sessions stayed running and reached actual command
 evidence; remote spawn over SSH stayed live. The termination cause is unknown, so this is a
 local native-runtime observation, not a universal claim about `spawn` or a change to the
@@ -57,7 +57,9 @@ command processes against the runner records and Git/PR state. In particular, re
 state before restarting a merge wait. `DIED` supplies no command exit status and cannot prove
 that all child work stopped: do not credit a result, launch duplicate verification or start
 a replacement writer until ownership and outstanding execution reservations are accounted
-for. Keep the same worker and model for recovery; the coordinator handles reservation
+for. Resume the same worker with the same model when it is still resumable. If the worker
+itself is gone, use the shared [finisher and reconciliation policy](native-workers.md#supervision-recovery-and-evidence)
+only after proving the old writer stopped; the coordinator handles reservation
 reconciliation before dispatching further work.
 
 ## Coordinator supervision

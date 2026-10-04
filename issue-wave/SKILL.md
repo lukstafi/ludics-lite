@@ -398,9 +398,14 @@ requirements for every transport with transport-specific setup and identity, and
   runner that takes the slot itself runs inside the wrapper, [nested
   slots](references/executions.md#exclusivity-and-the-run-time-slots); a refusal naming a
   measurement window is retried once the window closes, with no request), and
-  is reported by run directory; a batch that can outlast the 600 s tool cap is one call, `execution
-  slot --bg <parent> -- <batch>`, which prints a run directory to block on with `bg-run.sh wait`
-  ([Blocking on a run](references/native-claude.md#blocking-on-a-run)). Every other run - a
+  is reported by run directory. For a Claude batch that can outlast the 600 s tool cap, use
+  `execution slot --bg <parent> -- <batch>`, which prints a run directory to block on with
+  `bg-run.sh wait` ([Blocking on a run](references/native-claude.md#blocking-on-a-run)). For
+  local native Codex with managed exec sessions, use `bg-run.sh new <parent>`, then foreground
+  `bg-run.sh start <dir> -- fleet-worker.sh execution slot -- <batch>` (add `--cpu` for a
+  CPU-only batch); retain and observe that session to completion, as
+  [local managed command sessions](references/native-codex.md#local-managed-command-sessions)
+  says. Every other run - a
   measurement (only for a timing-grade claim or a run that needs the box to itself, a
   [rule](references/executions.md#exclusivity-and-the-run-time-slots) the brief carries), a
   cross-box leg, a full suite - needs a request first, in the transport's shape:
