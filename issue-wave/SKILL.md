@@ -462,7 +462,8 @@ requirements for every transport with transport-specific setup and identity, and
 - Process discipline, stated explicitly because workers re-derive it badly under load: never
   end a turn with only an unobserved detached process outstanding - use the harness's tracked
   wait mechanism (a native Codex worker keeps the turn open or schedules an authorized
-  heartbeat; a native Claude worker blocks as [Blocking on a run](references/native-claude.md#blocking-on-a-run) says; a CLI
+  heartbeat, using [local managed command sessions](references/native-codex.md#local-managed-command-sessions)
+  where available; a native Claude worker blocks as [Blocking on a run](references/native-claude.md#blocking-on-a-run) says; a CLI
   worker as [Blocking in a headless turn](references/cli-claude.md#blocking-in-a-headless-turn) says); if a review watch goes quiet
   suspiciously long, read the PR feed directly (`gh pr view --comments`) rather than re-arming
   the watch (reactions persist across rounds and strand it); commit early and often - commits
