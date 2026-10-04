@@ -124,7 +124,9 @@ applicable, with the repository's base and explicitly regenerable directories (f
 rebuilding its ref/ancestry checks in an ad-hoc cleanup script; Dune can copy a worktree's `.git`
 file into `_build/default`, which a plain `git clean -fdX` will preserve as a nested repository.
 App-managed worktrees follow [separate-codex.md](separate-codex.md#close-out) instead.
-Consolidate workers' after-merge proposals, persist the final board and release the lease last.
+Consolidate workers' after-merge proposals and persist the completed wave's board. Route chips
+through SKILL.md's selected mode; retain the lease across the default post-wave coordination
+loop and release it only at final close-out.
 
 For a bounded transport smoke, create two disposable external worktrees with distinct branches
 at one verified base. Spawn two workers with explicit-cwd, absolute-path briefs. Each reports

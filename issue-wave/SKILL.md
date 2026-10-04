@@ -9,6 +9,20 @@ Runs: plan -> scope -> decision gate -> launch -> supervise -> close out. Each w
 lifecycle is implement -> ship-pr -> issue close; the wave coordinator never implements, only
 sequences, briefs, places, unsticks, and reports.
 
+Regular waves still use `sequencing_plan.md` by default, or the user's explicit task list.
+At close-out, **task chips** have two modes, independent of worker transport:
+
+- **Post-wave coordination loop (default)**: the same coordinator recursively runs this
+  workflow on the non-discarded follow-ups that did not get their own issue. Each post-wave
+  supplies the next one's task list; finish when no eligible tasks remain.
+- **Spawn task chips (explicit choice)**: preserve the existing behavior of spawning each
+  chip through `spawn_task` or an equivalent persistent task tool. If unavailable, report
+  self-contained chip candidates, as `after-merge` prescribes.
+
+Record the selected mode on the board and preserve it through close-out and recovery. This
+choice changes follow-up handling only; regular wave selection and execution stay as before.
+For the default mode, read [Post-wave coordination](references/post-wave.md) at close-out.
+
 **One coordinator per fleet, not per box** (ludics-lite#4, since 2026-09-02). The coordinator
 owns scoping, the decision gate, placement, the integration loop, stop-the-world, and close-out
 for every machine, and launches workers onto whichever box the plan places them on - the same
@@ -142,7 +156,8 @@ promise that, since two coordinators starting on an idle fleet would both see it
 lease is per coordinator SESSION (the session identity inherited from the harness), so a
 restarted coordinator adopts with `--take` rather than inheriting silently, and `unstick` is
 fenced by it too - only the holder intervenes in a wave's workers. Native and app dispatch
-prove the lease through `fleet-worker.sh gate` (Launch: *Base gate*). `release` at close-out.
+prove the lease through `fleet-worker.sh gate` (Launch: *Base gate*). `release` at final
+close-out, after any post-wave coordination loop finishes.
 
 ## Scope and sequencing
 
@@ -444,7 +459,8 @@ requirements for every transport with transport-specific setup and identity, and
   it lands*, because `gh issue close --comment` on an issue a PR body's `Closes #N` already
   closed posts nothing at all - then the after-merge brainstorm ship-pr ends with, in
   **hand-back mode**: propose issues and chip candidates in the close-out report, file and
-  spawn nothing - the coordinator combines across workers and does the filing. Worktree removal
+  spawn nothing - the coordinator combines across workers, does the filing, and routes chips
+  through the selected mode. Workers do not start their own post-waves. Worktree removal
   is NOT the worker's: the brainstorm's diff and tracker reads run in that worktree, the
   worker's shell sits inside it (removing your own cwd is the "Unable to read current working
   directory" failure ship-pr warns about), and the coordinator may still resume the session
@@ -728,9 +744,8 @@ controlled through the tools in your coordinator's file, never through those com
 
 When the last gate clears: every worker on the board has finished its work and its hand-back
 (verified through its transport's tools, the PRs and git; the CLI-side condition is in
-[cli-claude.md](references/cli-claude.md#close-out)), and the lease is released last
-(`fleet-worker.sh release`), after the report below is written; then a final board (issue ->
-box -> PR -> merge state), residuals and follow-up issues, and any gates left for the next
+[cli-claude.md](references/cli-claude.md#close-out)), write the completed wave's board (issue or
+task -> box -> PR -> merge state), residuals and follow-up issues, and any gates left for the next
 invocation. Workers ran `after-merge` in hand-back mode, so each close-out - collected through
 the transport's channel: the coordinator file's messages and waits for a native worker,
 `read_thread` for an app worker, `fleet-worker.sh log <box> <name>` for a CLI worker; the
@@ -738,15 +753,24 @@ thread or CLI stream is the full record - arrives carrying proposed issues, chip
 and reasoned drops; the coordinator's role here is editorial, not generative. Combine
 overlapping proposals across workers into single issues - cross-worker recurrence is the
 strongest priority signal a wave produces - revise drafts against the tracker's style, then do
-the filing, evidence comments, and chip-spawning yourself. Do not re-brainstorm a worker's
-merge from the supervision view (its transcript grounds it better); run `after-merge` directly
-only for work the coordinator itself shepherded. Worktree removal comes last and is
+the filing and evidence comments yourself. Route the remaining chips through the selected mode:
+spawn task chips only in the explicit spawn mode; in the default mode, collect the
+non-discarded tasks without their own issue for [Post-wave coordination](references/post-wave.md).
+Do not re-brainstorm a worker's merge from the supervision view (its transcript grounds it
+better); run `after-merge` directly only for work the coordinator itself shepherded, collecting
+its proposals for this same editorial pass and chip mode. Worktree removal comes last and is
 transport-specific: native in [native-workers.md](references/native-workers.md#close-out-and-bounded-smoke),
 app in [separate-codex.md](references/separate-codex.md#close-out), CLI in
 [cli-claude.md](references/cli-claude.md#close-out); no checkout is removed while an
 outstanding reservation refers to it. Notify any sessions the user asked to be told. If the
 wave surfaced a new coordination trap, add it to the project's agent-notes or this skill -
 whichever the trap belongs to.
+
+In the default mode, complete this wave's close-out before starting its post-wave, retain the
+same coordinator lease across the loop, and repeat close-out after each post-wave. Release the
+lease last (`fleet-worker.sh release`), after the final report and transport cleanup, when the
+loop has no eligible work left (or has stopped with explicit residuals). In spawn mode, release
+after this wave's report and cleanup as before.
 
 ## Execution ownership
 
