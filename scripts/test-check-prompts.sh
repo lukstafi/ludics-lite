@@ -500,6 +500,7 @@ copy_prompts() {
 LINK_TARGETS="issue-wave/references/cli-claude.md issue-wave/references/executions.md
   issue-wave/references/native-claude.md issue-wave/references/native-codex.md
   issue-wave/references/native-workers.md issue-wave/references/separate-codex.md
+  issue-wave/references/post-wave.md
   issue-wave/references/linux-boxes.md issue-wave/references/wsl-boxes.md
   ship-pr/SKILL.md ship-pr/hooks/README.md scripts/install-linux.md"
 # The default as the checker reads it, and a number that is not it: the probes state no literal
