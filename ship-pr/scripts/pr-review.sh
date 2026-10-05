@@ -703,7 +703,7 @@ gh_retry() {
   GH_ERR=""
   while :; do
     # The polling budget's hold (see "the polling budget"): no call while one stands.
-    if ! budget_gate "$mode"; then
+    if budget_scope "$@" && ! budget_gate "$mode"; then
       [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
       return 3
     fi
@@ -729,7 +729,7 @@ gh_retry() {
     # that hold out at the top of this loop and repeats; a read the probe found no hold for gets
     # one more try, and a write is never repeated.
     if quota_failure "${GH_ERR%%$'\n'*}"; then
-      budget_quota_hit "$@"
+      ! budget_scope "$@" || budget_quota_hit "$@"
       if [ "$mode" = read ] && [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$(budget_now)" -lt "$BUDGET_WAIT_UNTIL" ]; then
         if hold_read; then
           continue
@@ -795,7 +795,8 @@ gh_err_line() {
 #     the incident. A response with neither header holds for a minute, doubling on each repeat,
 #     and so does a probe that answers: it is a GET or GraphQL's viewer query, and a secondary
 #     limit on the refused operation itself need not show on it. A standing hold is only ever
-#     extended, never shortened, by a later refusal. Once the hold has ended, ONE process probes
+#     extended, never shortened, by a later refusal (each refusal adds its own entry; see
+#     hold_read). Once the hold has ended, ONE process probes
 #     the same endpoint again, and the hold lifts only when that endpoint answers. A quota answer
 #     sets the next hold from its own headers. An observer (a command with a wait ceiling) waits a
 #     hold out within its ceiling, then repeats the READ the quota stopped. A write never waits,
@@ -811,13 +812,18 @@ gh_err_line() {
 # BOUNDARY. The quota reader is a fail-closed ALLOWLIST over the FIRST line of gh's stderr, with
 # these shapes: `API rate limit exceeded` or `API rate limit already exceeded` (the primary
 # limit, in its REST and GraphQL spellings), `secondary rate limit`, and `(HTTP 429)`. A 403 with
-# any other message is still the API's answer. Headers are read only from the probe's output, up
-# to its first blank line. A probe addresses the call's own endpoint: the one positional of
+# any other message is still the API's answer. The probe reads its own answer: the headers up to
+# the first blank line, and the body after it in quota_failure's words (GraphQL answers an
+# exhausted quota with a 200). A probe addresses the call's own endpoint: the one positional of
 # `api`, `repos/<repo>/actions/runs/<id>` for `run view`, and `graphql` for every other gh
-# command, since gh's pr and issue commands ride GraphQL, which has its own quota. The hold is per
-# state directory, not per account: another host learns of the quota from its own first refusal.
+# command, since gh's pr and issue commands ride GraphQL, which has its own quota. The budget
+# covers github.com only: a call naming another `--hostname` is neither held nor probed. The hold
+# is per state directory, not per account: another host learns of the quota from its own first
+# refusal. Every gh call passes the hold's gate: gh_retry's, and repo_from_cwd's `gh repo view`.
 # An observer counts as live while `kill -0` reaches its pid, so a pid the OS has reused reads as
-# live until that process ends. The refusal names the pid.
+# live until that process ends. The refusal names the pid. Two processes replacing one dead lock
+# at the same moment are kept apart by lock_reap; a third arriving in that same window can still
+# make two observers, which costs duplicate reads and never a verdict.
 REVIEW_POLL_CAP="${SHIP_PR_REVIEW_POLL_CAP:-300}"
 BUILD_POLL_CAP="${SHIP_PR_BUILD_POLL_CAP:-600}"
 for budget_knob in "SHIP_PR_REVIEW_POLL_CAP=$REVIEW_POLL_CAP" "SHIP_PR_BUILD_POLL_CAP=$BUILD_POLL_CAP"; do
@@ -836,8 +842,9 @@ else
   BUDGET_DIR="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/ship-pr"
 fi
 # The epoch up to which this command may wait a hold out. Empty means it must answer now. The
-# observers set it to their own ceiling.
+# observers set it to their own ceiling, which runs from BUDGET_WAIT_FROM, the command's start.
 BUDGET_WAIT_UNTIL=""
+BUDGET_WAIT_FROM=""
 # The observer lock this process holds, released by pr_review_cleanup.
 BUDGET_OBSERVER=""
 
@@ -910,20 +917,44 @@ budget_endpoint() {
   return 0
 }
 
+# budget_scope <gh args...>: status 0 when the call is github.com's, the one host the budget
+# covers. A call naming another `--hostname` (an Enterprise server) has a quota of its own, which
+# this file neither holds nor probes.
+budget_scope() {
+  local a next=""
+  for a in "$@"; do
+    if [ -n "$next" ]; then
+      [ "$a" = github.com ] || return 1
+      next=""
+      continue
+    fi
+    case "$a" in
+    --hostname) next=1 ;;
+    --hostname=*) [ "${a#--hostname=}" = github.com ] || return 1 ;;
+    esac
+  done
+  return 0
+}
+
 # budget_probe <endpoint>: one request to the endpoint with its headers (`gh api -i`), not through
 # gh_retry: a probe is not retried, since its answer is the reading. Prints one of
-#   ok             the endpoint answered: a 2xx, or another 4xx whose headers show quota left
+#   ok             the endpoint answered, and nothing in the answer says its quota is out
 #   quota <epoch>  a quota answer, held until the epoch its own headers name (0: they name none)
 #   down           no status line, a 5xx, or a 4xx that shows no quota either way
+# A quota answer is a 429; or a 403 carrying Retry-After or X-RateLimit-Remaining: 0; or, on any
+# status (GraphQL answers an exhausted quota with a 200), those headers, or a body that says it in
+# the words quota_failure reads.
 budget_probe() {
-  local out status="" remaining="" reset="" after="" line name value now
+  local out head body status="" remaining="" reset="" after="" line name value now quota=""
   if [ "$1" = graphql ]; then
     out=$(gh api -i graphql -f query='query{viewer{login}}' 2>/dev/null)
   else
     out=$(gh api -i "$1" 2>/dev/null)
   fi
-  # The header block alone, lowercased once: header names are case-insensitive.
-  out=$(printf '%s\n' "$out" | tr -d '\r' | sed '/^$/q' | tr '[:upper:]' '[:lower:]')
+  out=$(printf '%s\n' "$out" | tr -d '\r')
+  # The header block alone, lowercased once (header names are case-insensitive); the body after it.
+  head=$(printf '%s\n' "$out" | sed '/^$/q' | tr '[:upper:]' '[:lower:]')
+  body=$(printf '%s\n' "$out" | sed '1,/^$/d')
   while IFS= read -r line; do
     [ -n "$line" ] || break
     if [ -z "$status" ]; then
@@ -941,64 +972,78 @@ budget_probe() {
     x-ratelimit-reset) reset="$value" ;;
     retry-after) after="$value" ;;
     esac
-  done <<<"$out"
+  done <<<"$head"
   now=$(budget_now)
   case "$status" in
-  2??)
-    echo ok
+  429) quota=1 ;;
+  [2-4]??)
+    if [ -n "$after" ] || [ "$remaining" = 0 ] || quota_failure "$body"; then quota=1; fi
+    ;;
+  *)
+    echo down
     return 0
     ;;
-  429 | 403)
+  esac
+  if [ -n "$quota" ]; then
     if [ -n "$after" ]; then
       echo "quota $((now + after))"
     elif [ "$remaining" = 0 ] && [ -n "$reset" ]; then
       echo "quota $reset"
-    elif [ "$status" = 429 ]; then
-      echo "quota 0"
-    elif [ -n "$remaining" ]; then
-      echo ok
     else
-      echo down
+      echo "quota 0"
     fi
     return 0
-    ;;
-  4??)
-    if [ -n "$remaining" ] && [ "$remaining" != 0 ]; then echo ok; else echo down; fi
-    return 0
-    ;;
+  fi
+  case "$status" in
+  2??) echo ok ;;
+  *) if [ -n "$remaining" ]; then echo ok; else echo down; fi ;;
   esac
-  echo down
 }
 
-# hold_read: the standing hold into HOLD_UNTIL, HOLD_EP, HOLD_LEN and HOLD_SRC, or status 1 when
-# there is none. A line this did not write is no hold.
+# The hold is a directory of ENTRIES, never one file rewritten: every refusal adds its own, named
+# <until>.<pid>.<n> and holding "<endpoint> TAB <length> TAB <why>", and the hold that stands is
+# the entry with the latest end. Requests in flight when the quota ran out each come back refused
+# at once; with entries none of them can overwrite another, so a short reset can never cut a long
+# one short, whatever order the writers finish in. A lift removes only the entries that had ended
+# when its probe STARTED, so a refusal landing during the probe (whose entry ends later) still
+# stands after it.
+#
+# hold_read: the standing hold (its latest-ending entry) into HOLD_UNTIL, HOLD_EP, HOLD_LEN and
+# HOLD_SRC, or status 1 when there is none. A name or a line this did not write is no entry.
 hold_read() {
-  local line
+  local f u best="" best_until=0
   HOLD_UNTIL="" HOLD_EP="" HOLD_LEN="" HOLD_SRC=""
-  [ -n "$BUDGET_DIR" ] && [ -f "$BUDGET_DIR/quota-hold" ] || return 1
-  IFS= read -r line <"$BUDGET_DIR/quota-hold" 2>/dev/null || return 1
-  IFS=$'\t' read -r HOLD_UNTIL HOLD_EP HOLD_LEN HOLD_SRC <<<"$line"
-  case "$HOLD_UNTIL$HOLD_LEN" in '' | *[!0-9]*) return 1 ;; esac
-  [ -n "$HOLD_EP" ] && [ -n "$HOLD_SRC" ]
+  [ -n "$BUDGET_DIR" ] && [ -d "$BUDGET_DIR/quota-holds" ] || return 1
+  for f in "$BUDGET_DIR/quota-holds"/[0-9]*; do
+    [ -f "$f" ] || continue
+    u="${f##*/}"
+    u="${u%%.*}"
+    case "$u" in '' | *[!0-9]*) continue ;; esac
+    [ "$u" -gt "$best_until" ] || continue
+    best="$f"
+    best_until="$u"
+  done
+  [ -n "$best" ] || return 1
+  IFS=$'\t' read -r HOLD_EP HOLD_LEN HOLD_SRC <"$best" 2>/dev/null || return 1
+  case "$HOLD_LEN" in '' | *[!0-9]*) return 1 ;; esac
+  [ -n "$HOLD_EP" ] && [ -n "$HOLD_SRC" ] || return 1
+  HOLD_UNTIL="$best_until"
 }
 
-# hold_set <endpoint> <probe verdict>: writes the hold a quota (or an unreadable probe) calls
-# for, replacing the file whole so no reader sees half a line. A standing hold is only ever
-# extended, never shortened: requests in flight when the quota ran out each come back here, and
-# the last of them must not cut short an earlier, longer reset (another bucket's, say). With no
-# reset in the headers the hold backs off: a minute, doubling from the last hold's length while
-# the quota keeps refusing, up to an hour. The last hold is remembered in quota-last once lifted,
-# for exactly that doubling.
+# hold_set <endpoint> <probe verdict>: adds the entry a quota (or an unreadable probe) calls for.
+# With no reset in the headers it backs off: a minute, doubling from the last hold's length while
+# the quota keeps refusing, up to an hour. The last lifted hold is kept in quota-last for exactly
+# that doubling.
 hold_set() {
-  local ep="$1" verdict="$2" now until len src prev=0 last_until last_len
+  local ep="$1" verdict="$2" now until len src prev=0 last_len last_at tmp
   now=$(budget_now)
   if hold_read; then
     prev="$HOLD_LEN"
   elif [ -f "$BUDGET_DIR/quota-last" ]; then
-    IFS=$'\t' read -r last_until _ last_len _ <"$BUDGET_DIR/quota-last" 2>/dev/null
-    case "$last_until$last_len" in
+    IFS=$'\t' read -r last_at last_len <"$BUDGET_DIR/quota-last" 2>/dev/null
+    case "$last_at$last_len" in
     '' | *[!0-9]*) ;;
-    *) [ $((now - last_until)) -gt 3600 ] || prev="$last_len" ;;
+    *) [ $((now - last_at)) -gt 3600 ] || prev="$last_len" ;;
     esac
   fi
   case "$verdict" in
@@ -1021,19 +1066,36 @@ hold_set() {
     *) src="the probe got no reading; backing off" ;;
     esac
   fi
-  if [ -n "$HOLD_UNTIL" ] && [ "$HOLD_UNTIL" -gt "$now" ] && [ "$HOLD_UNTIL" -ge "$until" ]; then
-    return 0
-  fi
-  mkdir -p "$BUDGET_DIR" 2>/dev/null || return 1
-  printf '%s\t%s\t%s\t%s\n' "$until" "$ep" "$len" "$src" >"$BUDGET_DIR/quota-hold.$$" &&
-    mv -f "$BUDGET_DIR/quota-hold.$$" "$BUDGET_DIR/quota-hold"
+  mkdir -p "$BUDGET_DIR/quota-holds" 2>/dev/null || return 1
+  # Written aside and renamed in, so no reader sees half a line; mktemp's name is the entry's
+  # unique part, since subshells share $$.
+  tmp=$(mktemp "$BUDGET_DIR/quota-holds/.new.XXXXXX" 2>/dev/null) || return 1
+  printf '%s\t%s\t%s\n' "$ep" "$len" "$src" >"$tmp" &&
+    mv -f "$tmp" "$BUDGET_DIR/quota-holds/$until.${tmp##*/.new.}"
+}
+
+# hold_lift <probe start>: the probed endpoint answered. Removes every entry that had ended when
+# the probe started, and remembers the longest of them in quota-last.
+hold_lift() {
+  local f u l longest=0
+  for f in "$BUDGET_DIR/quota-holds"/[0-9]*; do
+    [ -f "$f" ] || continue
+    u="${f##*/}"
+    u="${u%%.*}"
+    case "$u" in '' | *[!0-9]*) continue ;; esac
+    [ "$u" -le "$1" ] || continue
+    IFS=$'\t' read -r _ l _ <"$f" 2>/dev/null
+    case "$l" in '' | *[!0-9]*) ;; *) [ "$l" -le "$longest" ] || longest="$l" ;; esac
+    rm -f "$f"
+  done
+  [ "$longest" -eq 0 ] || printf '%s\t%s\n' "$(budget_now)" "$longest" >"$BUDGET_DIR/quota-last"
 }
 
 # lock_take <dir>: status 0 once this process holds the lock <dir> (or already did), 1 while a live
 # process holds it, naming it in LOCK_HOLDER and LOCK_SINCE. A lock is a directory holding `owner`
 # (a pid, then the epoch it was taken). A holder that no longer runs is replaced, and so is a
-# directory still ownerless a second after it was first seen: its claimant died between the
-# mkdir and the write, and it would otherwise lock everyone out for good.
+# directory still ownerless a second after it was first seen: its claimant died between the mkdir
+# and the write, and it would otherwise lock everyone out for good.
 lock_take() {
   local dir="$1" holder seen=""
   LOCK_HOLDER="" LOCK_SINCE=""
@@ -1051,9 +1113,28 @@ lock_take() {
       continue
     fi
     seen=""
-    rm -rf "$dir"
+    lock_reap "$dir" "$holder"
   done
   printf '%s\n%s\n' "$$" "$(budget_now)" >"$dir/owner"
+}
+
+# lock_reap <dir> <the owner it was judged by>: removes a stale lock, but only the one that was
+# judged. Two processes can judge the same dead lock at once, and the first to replace it would
+# otherwise have its NEW lock deleted by the second. So the lock is first renamed aside (atomic),
+# and the renamed directory's owner is compared with the one judged; a lock that turns out to be
+# someone else's is put back, unless a third process has taken the name meanwhile.
+lock_reap() {
+  local dir="$1" judged="$2" aside now_owner
+  aside=$(mktemp -u "$dir.reap.XXXXXX" 2>/dev/null) || return 0
+  mv "$dir" "$aside" 2>/dev/null || return 0
+  now_owner=$(sed -n 1p "$aside/owner" 2>/dev/null)
+  if [ "$now_owner" = "$judged" ]; then
+    rm -rf "$aside"
+  elif [ ! -e "$dir" ]; then
+    mv "$aside" "$dir" 2>/dev/null || rm -rf "$aside"
+  else
+    rm -rf "$aside"
+  fi
 }
 
 budget_at() { date -u -r "$1" '+%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%H:%M:%SZ' 2>/dev/null || printf 'epoch %s' "$1"; }
@@ -1065,7 +1146,7 @@ budget_at() { date -u -r "$1" '+%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%H:
 # minutes or hours later would act on reads the hold has made stale (a merge on its gate, a
 # review request over an approval that landed meanwhile).
 budget_gate() {
-  local mode="${1:-read}" now nap verdict noted=""
+  local mode="${1:-read}" now nap verdict noted="" probe_start
   [ -n "$BUDGET_DIR" ] || return 0
   while hold_read; do
     now=$(budget_now)
@@ -1087,10 +1168,11 @@ budget_gate() {
     fi
     # The hold has ended. One process probes its endpoint; the rest wait for that probe's answer.
     if lock_take "$BUDGET_DIR/quota-probe"; then
+      probe_start=$(budget_now)
       verdict=$(budget_probe "$HOLD_EP")
       case "$verdict" in
       ok)
-        mv -f "$BUDGET_DIR/quota-hold" "$BUDGET_DIR/quota-last" 2>/dev/null
+        hold_lift "$probe_start"
         warn "quota hold lifted: $HOLD_EP answered again"
         ;;
       *) hold_set "$HOLD_EP" "$verdict" ;;
@@ -1126,7 +1208,8 @@ budget_quota_hit() {
 observer_claim() {
   local kind="$1" dir key
   [ -n "$BUDGET_DIR" ] || return 0
-  key=$(printf '%s#%s.%s' "$REPO" "$PR_NUM" "$kind" | tr '/' '~')
+  # GitHub's names are case-insensitive, so the key is too: Owner/Repo and owner/repo are one PR.
+  key=$(printf '%s#%s.%s' "$REPO" "$PR_NUM" "$kind" | tr '/' '~' | tr '[:upper:]' '[:lower:]')
   dir="$BUDGET_DIR/observers/$key"
   [ "$BUDGET_OBSERVER" != "$dir" ] || return 0
   mkdir -p "$BUDGET_DIR/observers" 2>/dev/null || die "cannot create $BUDGET_DIR/observers for the observer lock"
@@ -1144,7 +1227,8 @@ budget_observe() {
   case "$2" in '' | *[!0-9]*) return 0 ;; esac
   [ "$2" -gt 0 ] || return 0
   observer_claim "$1"
-  BUDGET_WAIT_UNTIL=$(($(budget_now) + $2))
+  [ -n "$BUDGET_WAIT_FROM" ] || BUDGET_WAIT_FROM=$(budget_now)
+  BUDGET_WAIT_UNTIL=$((BUDGET_WAIT_FROM + $2))
 }
 
 observer_release() {
@@ -1186,11 +1270,12 @@ observer_release() {
 repo_from_cwd() {
   local url
   # `gh repo view` first: it honours remote.origin.gh-resolved, so a fork checkout keeps naming
-  # whichever repo gh already decided the PRs live in. Not while a quota hold is on file, though:
-  # this call is not gh_retry's, so the hold's gate never sees it (see "the polling budget").
-  if ! hold_read; then
-    gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null | grep . && return 0
-  fi
+  # whichever repo gh already decided the PRs live in. It is not gh_retry's call, so it passes the
+  # quota hold's gate itself (see "the polling budget"). A hold is never a reason to fall back to
+  # the remote below, which in a fork names the fork and not the repository gh resolved.
+  budget_gate read || fail 3 "could not resolve the repository from the checkout: $(gh_err_line)." \
+    "Pass it as owner/name, or wait for the hold."
+  gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null | grep . && return 0
   # ... but it rides GraphQL, so fall back to the origin remote, which answers the same question
   # locally and stays up when GraphQL does not.
   url=$(git remote get-url origin 2>/dev/null) || return 1
@@ -5431,14 +5516,16 @@ gate_checks() {
   local run_why="" run_info note pr_at="" base_sha="" head_ref="" current_sha waived_runs rname rid
   local last_sig="" sig last_pause=""
   # A `--wait` is the PR's build observer (see "the polling budget"): one at a time, and it may
-  # wait a quota hold out within its ceiling, the same ceiling as its own: both run from this
-  # timestamp, taken before the first read. A single read is neither.
+  # wait a quota hold out within its ceiling, the same ceiling as its own: both run from the
+  # command's start (BUDGET_WAIT_FROM, which `checks` and `merge` take before their own first
+  # read), so neither a hold nor a preflight read extends the advertised wait. A single read is
+  # neither.
   started=$(date +%s)
-  deadline=$((started + wait_for))
   if [ "$wait_for" -gt 0 ]; then
-    observer_claim build
-    BUDGET_WAIT_UNTIL="$deadline"
+    budget_observe build "$wait_for"
+    started="$BUDGET_WAIT_FROM"
   fi
+  deadline=$((started + wait_for))
   GATE_BASE=""
   WAIVED=$'\n'
   RUN_WAIVED=0
@@ -8251,7 +8338,11 @@ cmd_base() {
       "reach it. Size it from the two knobs instead:" \
       "--wait=$((ABSENT_GRACE + CHECKS_INTERVAL)) or more (ludics-lite#175)."
   fi
-  [ -n "$REPO" ] || REPO=$(repo_from_cwd) || true
+  if [ -z "$REPO" ]; then
+    # 3 is a quota hold standing (repo_from_cwd said so); anything else falls to the refusal below.
+    REPO=$(repo_from_cwd)
+    [ $? -ne 3 ] || exit 3
+  fi
   [ -n "$REPO" ] || die "base: name the repo — \`base owner/name [branch]\`, --repo, or REPO=." \
     "cwd inference only works from a checkout, and not from a background shell."
   if [ -z "$branch" ]; then

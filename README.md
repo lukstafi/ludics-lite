@@ -860,7 +860,10 @@ that endpoint answers; a probe that still finds the quota out sets the next hold
 headers, and a probe that answers still sets the backoff hold (a secondary limit on the refused
 operation need not show on the probe's GET), doubling from the last one. A later refusal never
 shortens a standing hold, a write never waits one out, a hold at the start of a `--wait` counts
-toward its ceiling, and `base`'s `gh repo view` is skipped while one is on file. A second build
+toward its ceiling even when a preflight read met it, a standing hold makes `base`'s repository
+resolution exit 3 rather than guess from the remote, a refusal landing during a probe survives the
+lift, a lock reaped by two processes at once keeps the one retaken meanwhile, another
+`--hostname` is outside the budget, and a GraphQL 200 carrying exhausted-quota headers is quota. A second build
 observer of a PR is refused naming the first's pid before any read (the advisory list and the
 merge body included), a dead holder is replaced, while one process probes an ended hold the
 others send nothing, and a probe lock left without an owner is replaced after a second. A still queue backs

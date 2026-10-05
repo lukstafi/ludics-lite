@@ -47,6 +47,9 @@ QUOTA_RESETS=()      # per probe, in order, when a case wants the reset to move
 FAIL_502=""          # an endpoint glob that answers 502 (transport)
 PROBE_ANSWERS=""     # nonempty: a probe answers even during the quota (a secondary limit on the
                      # refused operation, which the probe's cheaper request does not meet)
+PROBE_HOOK=""        # run as a probe answers: what lands meanwhile, e.g. another refusal's hold
+GRAPHQL_PROBE=""     # how GraphQL's probe answers: "" (200, quota left), exhausted (a 200 with
+                     # Remaining 0), secondary (a 200 whose body says so, no header)
 
 stub warn_multi_close warn_series_close merge_threads_gate warn_base_drift
 warn_multi_close() { :; }
@@ -149,7 +152,16 @@ gh() {
   fi
   if [ -n "$include" ]; then
     printf 'probe %s ok\n' "$FIXTURE_ENDPOINT" >>"$CALL_LOG"
-    printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 4999\r\n\r\n{}\n'
+    [ -z "$PROBE_HOOK" ] || eval "$PROBE_HOOK"
+    case "$FIXTURE_ENDPOINT $GRAPHQL_PROBE" in
+    "graphql exhausted")
+      printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: %s\r\n\r\n{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded for user ID 1."}]}\n' "$((T0 + 2400))"
+      ;;
+    "graphql secondary")
+      printf 'HTTP/2.0 200 OK\r\n\r\n{"errors":[{"message":"You have exceeded a secondary rate limit."}]}\n'
+      ;;
+    *) printf 'HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 4999\r\n\r\n{}\n' ;;
+    esac
     return 0
   fi
   printf 'read %s\n' "$FIXTURE_ENDPOINT" >>"$CALL_LOG"
@@ -167,6 +179,10 @@ gh() {
   "repos/$REPO/actions/runs?head_sha=$HEAD_SHA&per_page=100")
     body=$(workflow_runs "$(cat "$TEST_ROOT/state")")
     ;;
+  "repos/$REPO/contents/.github/ship-pr-advisory-checks")
+    body='^claude$'
+    ;;
+  "repos/ghe/repo") body='{}' ;;
   "repos/$REPO/actions/runs/101/jobs?per_page=100")
     body='{"jobs":[{"name":"build","status":"in_progress","conclusion":null,"created_at":"2026-10-04T00:00:00Z","completed_at":null}]}'
     ;;
@@ -196,6 +212,9 @@ reset_fixture() {
   QUOTA_RESETS=()
   FAIL_502=""
   PROBE_ANSWERS=""
+  PROBE_HOOK=""
+  GRAPHQL_PROBE=""
+  retune ADVISORY_FROM_ENV=1
 }
 
 # run <var-prefix> <command...>: runs it in a subshell (the commands exit), keeping stdout, stderr
@@ -213,6 +232,13 @@ out() { cat "$TEST_ROOT/$1.out"; }
 err() { cat "$TEST_ROOT/$1.err"; }
 rc() { cat "$TEST_ROOT/$1.rc"; }
 requests() { cat "$CALL_LOG"; }
+# plant_hold <until> <endpoint> <length>: one hold entry, as a refusal leaves it.
+plant_hold() {
+  mkdir -p "$STATE_DIR/quota-holds"
+  printf '%s\t%s\t%s\n' "$2" "$3" "its headers" >"$STATE_DIR/quota-holds/$1.planted.$RANDOM"
+}
+# The hold that stands, as every reader sees it: "<until> TAB <endpoint> TAB <length>", or nothing.
+standing() { (hold_read && printf '%s\t%s\t%s' "$HOLD_UNTIL" "$HOLD_EP" "$HOLD_LEN") 2>/dev/null || :; }
 
 # --- fixture 1: a quota or transport failure stays unknown and never permits a merge ------------
 
@@ -226,7 +252,7 @@ test_a_quota_refusal_is_unknown_and_holds_every_caller() {
   assert_contains "$(requests)" "probe repos/$REPO/pulls/7" \
     "the quota's end is read from the failing endpoint itself"
   assert_not_contains "$(requests)" "rate_limit" "and never from /rate_limit"
-  assert_eq "$(cut -f1-2 "$STATE_DIR/quota-hold" 2>/dev/null)" "$((T0 + 1800))	repos/$REPO/pulls/7" \
+  assert_eq "$(standing | cut -f1-2)" "$((T0 + 1800))	repos/$REPO/pulls/7" \
     "the hold ends where that endpoint's X-RateLimit-Reset says, and names the endpoint"
 
   # Every later caller on the host, while the hold stands: no call at all, still UNKNOWN.
@@ -243,7 +269,7 @@ test_a_quota_refusal_is_unknown_and_holds_every_caller() {
   assert_eq "$(requests)" "" "and makes no request either"
 
   # The await of one run: a quota answer about the run is not "no such run" (exit 2) either.
-  rm -f "$STATE_DIR/quota-hold"
+  rm -rf "$STATE_DIR/quota-holds"
   : >"$CALL_LOG"
   printf '%s' "$T0" >"$CLOCK"
   BUDGET_DIR=""
@@ -258,7 +284,7 @@ test_a_transport_failure_is_unknown_and_never_merges() {
   run merge cmd_merge "$REPO#7"
   assert_eq "$(rc merge)" 3 "a gate read that never answered is UNKNOWN ($(err merge))"
   assert_eq "$(cat "$MERGE_LOG")" "" "and it never calls the merge"
-  assert_eq "$(cat "$STATE_DIR/quota-hold" 2>/dev/null)" "" "transport sets no quota hold"
+  assert_eq "$(standing)" "" "transport sets no quota hold"
 }
 
 # --- fixture 2: observers resume from verified endpoint recovery, without duplicates -----------
@@ -286,7 +312,7 @@ probe repos/$REPO/pulls/7 ok" \
     "it sleeps to each reset its headers named, and calls nothing in between"
   assert_eq "$(err wait | grep -c 'quota hold:')" 2 "one line per hold"
   assert_eq "$(err wait | grep -c 'quota hold lifted')" 1 "and one when the endpoint answers again"
-  assert_eq "$(cat "$STATE_DIR/quota-hold" 2>/dev/null)" "" "the hold is gone once it answered"
+  assert_eq "$(standing)" "" "the hold is gone once it answered"
 }
 
 test_a_second_observer_of_the_pr_is_refused() {
@@ -320,7 +346,7 @@ test_a_second_observer_of_the_pr_is_refused() {
 test_one_process_probes_an_ended_hold() {
   local holder
   reset_fixture
-  printf '%s\t%s\t%s\t%s\n' "$((T0 - 1))" "repos/$REPO/pulls/7" 600 "its headers" >"$STATE_DIR/quota-hold"
+  plant_hold "$((T0 - 1))" "repos/$REPO/pulls/7" 600
   command sleep 300 &
   holder=$!
   mkdir -p "$STATE_DIR/quota-probe"
@@ -344,7 +370,7 @@ test_a_probe_that_answers_still_holds_the_refused_operation() {
   PROBE_ANSWERS=1
   run first cmd_checks "$REPO#7"
   assert_eq "$(rc first)" 3 "the refused read is UNKNOWN ($(err first))"
-  assert_eq "$(cut -f1,3 "$STATE_DIR/quota-hold" 2>/dev/null)" "$((T0 + 60))	60" \
+  assert_eq "$(standing | cut -f1,3)" "$((T0 + 60))	60" \
     "a minute's hold although the probe answered"
   printf '%s' "$((T0 + 60))" >"$CLOCK"
   : >"$CALL_LOG"
@@ -352,19 +378,19 @@ test_a_probe_that_answers_still_holds_the_refused_operation() {
   assert_eq "$(rc second)" 3 "refused again after the lift ($(err second))"
   assert_eq "$(requests | sed -n 1,2p)" "probe repos/$REPO/pulls/7 ok
 read repos/$REPO/pulls/7 quota" "the ended hold is probed, lifted, and the read refused again"
-  assert_eq "$(cut -f3 "$STATE_DIR/quota-hold" 2>/dev/null)" 120 "so the next hold doubles"
+  assert_eq "$(standing | cut -f3)" 120 "so the next hold doubles"
 }
 
 # Requests in flight when the quota ran out each come back refused, and the last must not cut
 # short a longer hold another one set: the hold is only ever extended while it stands.
 test_a_later_refusal_never_shortens_the_hold() {
   reset_fixture
-  printf '%s\t%s\t%s\t%s\n' "$((T0 + 3600))" graphql 3600 "its headers" >"$STATE_DIR/quota-hold"
+  plant_hold "$((T0 + 3600))" graphql 3600
   hold_set "repos/$REPO/pulls/7" "quota $((T0 + 60))"
-  assert_eq "$(cut -f1-2 "$STATE_DIR/quota-hold")" "$((T0 + 3600))	graphql" \
+  assert_eq "$(standing | cut -f1-2)" "$((T0 + 3600))	graphql" \
     "an earlier reset leaves the standing hold as it was"
   hold_set "repos/$REPO/pulls/7" "quota $((T0 + 5400))"
-  assert_eq "$(cut -f1-2 "$STATE_DIR/quota-hold")" "$((T0 + 5400))	repos/$REPO/pulls/7" \
+  assert_eq "$(standing | cut -f1-2)" "$((T0 + 5400))	repos/$REPO/pulls/7" \
     "a later one extends it"
 }
 
@@ -373,7 +399,7 @@ test_a_later_refusal_never_shortens_the_hold() {
 # observer does wait.
 test_a_write_never_waits_a_hold() {
   reset_fixture
-  printf '%s\t%s\t%s\t%s\n' "$((T0 + 600))" "repos/$REPO/pulls/7" 600 "its headers" >"$STATE_DIR/quota-hold"
+  plant_hold "$((T0 + 600))" "repos/$REPO/pulls/7" 600
   run write eval 'BUDGET_WAIT_UNTIL=$((T0 + 7200)); gh_retry write api -X POST "repos/$REPO/issues/7/comments" -f body=x'
   assert_eq "$(rc write)" 3 "a write during a hold is not sent ($(err write))"
   assert_eq "$(requests)" "" "no request at all"
@@ -387,7 +413,7 @@ test_a_write_never_waits_a_hold() {
 # given a second (a claimant mid-write), then replaced, rather than locking every caller out.
 test_an_ownerless_probe_lock_is_recovered() {
   reset_fixture
-  printf '%s\t%s\t%s\t%s\n' "$((T0 - 1))" "repos/$REPO/pulls/7" 600 "its headers" >"$STATE_DIR/quota-hold"
+  plant_hold "$((T0 - 1))" "repos/$REPO/pulls/7" 600
   mkdir -p "$STATE_DIR/quota-probe"
   run single cmd_checks "$REPO#7"
   assert_eq "$(rc single)" 0 "the ownerless lock is replaced and the hold probed ($(err single))"
@@ -404,19 +430,93 @@ test_a_hold_at_the_start_counts_toward_the_ceiling() {
   run wait cmd_checks "$REPO#7" --wait=600
   assert_eq "$(rc wait)" 4 "a queue still running at the ceiling is no verdict ($(err wait))"
   assert_eq "$(now)" "$((T0 + 600))" "and the ceiling is 600 s from the start, the hold included"
+  # ... and from the command's start, not the gate's: a hold met by the preflight read of the
+  # repository's advisory list uses the wait up too.
+  reset_fixture
+  retune ADVISORY_FROM_ENV=
+  CHECKS_SEQ=(pending)
+  QUOTA_UNTIL=$((T0 + 300))
+  run wait cmd_checks "$REPO#7" --wait=600
+  assert_eq "$(rc wait)" 4 "the same with the advisory list read first ($(err wait))"
+  assert_contains "$(requests | sed -n 1p)" "contents/.github/ship-pr-advisory-checks" "which met the hold"
+  assert_eq "$(now)" "$((T0 + 600))" "and the ceiling still runs from the command's start"
 }
 
-# `base` resolves a repository from the checkout with `gh repo view`, a call gh_retry never sees.
-# While a hold is on file it asks the origin remote instead.
-test_resolving_the_repo_sends_nothing_during_a_hold() {
+# `base` resolves a repository from the checkout with `gh repo view`, a call gh_retry never sees,
+# so it passes the hold's gate itself. A standing hold is exit 3, never a fall back to the origin
+# remote (in a fork that names the fork, not the repository gh resolved); an ended one is probed
+# and lifted first, as for any read.
+test_resolving_the_repo_passes_the_hold() {
   reset_fixture
   run control repo_from_cwd
-  assert_contains "$(requests)" "repo view" "with no hold, gh is asked"
+  assert_eq "$(requests)" "repo view" "with no hold, gh is asked"
   : >"$CALL_LOG"
-  printf '%s\t%s\t%s\t%s\n' "$((T0 + 600))" graphql 600 "its headers" >"$STATE_DIR/quota-hold"
+  plant_hold "$((T0 + 600))" graphql 600
   run held repo_from_cwd
-  assert_eq "$(rc held)" 0 "the origin remote still answers ($(err held))"
+  assert_eq "$(rc held)" 3 "a standing hold is exit 3 ($(err held))"
+  assert_eq "$(out held)" "" "with no repository guessed from the remote"
   assert_eq "$(requests)" "" "and gh is not asked"
+  printf '%s' "$((T0 + 600))" >"$CLOCK"
+  run ended repo_from_cwd
+  assert_eq "$(rc ended) $(out ended)" "0 $REPO" "an ended hold is probed and lifted ($(err ended))"
+  assert_eq "$(requests | tr '\n' '|')" "probe graphql ok|repo view|" "the probe first, then gh"
+}
+
+# A refusal can land while an ended hold is being probed (a request already in flight). The lift
+# removes only the entries that had ended when the probe started, so the new hold still stands.
+test_a_refusal_during_the_probe_survives_the_lift() {
+  reset_fixture
+  plant_hold "$((T0 - 1))" "repos/$REPO/pulls/7" 600
+  PROBE_HOOK='plant_hold "$((T0 + 900))" graphql 900'
+  run single cmd_checks "$REPO#7"
+  assert_eq "$(rc single)" 3 "the new hold stands after the lift ($(err single))"
+  assert_eq "$(requests)" "probe repos/$REPO/pulls/7 ok" "and the read is not sent"
+  assert_eq "$(standing | cut -f1-2)" "$((T0 + 900))	graphql" "the new hold is the one standing"
+}
+
+# Two processes can judge the same dead lock at once. The reap renames the lock aside and deletes
+# it only if its owner is still the one judged, so the lock the first one took meanwhile survives.
+test_a_reap_keeps_a_lock_retaken_meanwhile() {
+  local live
+  reset_fixture
+  command sleep 300 &
+  live=$!
+  mkdir -p "$STATE_DIR/lock"
+  printf '%s\n%s\n' "$live" "$T0" >"$STATE_DIR/lock/owner"
+  lock_reap "$STATE_DIR/lock" 999999
+  assert_eq "$(sed -n 1p "$STATE_DIR/lock/owner" 2>/dev/null)" "$live" "a lock judged by another owner is put back"
+  lock_reap "$STATE_DIR/lock" "$live"
+  kill "$live" 2>/dev/null || :
+  wait "$live" 2>/dev/null || :
+  assert_eq "$(ls -A "$STATE_DIR" | grep -c lock || true)" 0 "the judged one is removed, nothing left aside"
+}
+
+# A call to another host (`--hostname`, an Enterprise server) is outside the budget: its quota is
+# its own, so it sets no github.com hold, and a github.com hold does not stop it.
+test_another_host_is_outside_the_budget() {
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 600))
+  run ghe gh_retry read api --hostname ghe.example.com repos/ghe/repo
+  assert_eq "$(rc ghe)" 3 "its quota refusal is still UNKNOWN ($(err ghe))"
+  assert_eq "$(standing)" "" "but sets no hold"
+  assert_not_contains "$(requests)" "probe" "and probes nothing"
+  QUOTA_UNTIL=0
+  : >"$CALL_LOG"
+  plant_hold "$((T0 + 600))" graphql 600
+  run ghe2 gh_retry read api --hostname ghe.example.com repos/ghe/repo
+  assert_eq "$(rc ghe2)" 0 "a github.com hold does not stop it ($(err ghe2))"
+}
+
+# GraphQL answers an exhausted quota with a 200 (GitHub's GraphQL rate-limit documentation), so the
+# probe reads the quota headers, and the body's words, on every status.
+test_a_graphql_200_can_still_be_quota() {
+  reset_fixture
+  GRAPHQL_PROBE=exhausted
+  assert_eq "$(budget_probe graphql)" "quota $((T0 + 2400))" "Remaining 0 on a 200 is quota until its reset"
+  GRAPHQL_PROBE=secondary
+  assert_eq "$(budget_probe graphql)" "quota 0" "a 200 whose body names a secondary limit is quota"
+  GRAPHQL_PROBE=""
+  assert_eq "$(budget_probe graphql)" ok "a 200 with quota left is the answer"
 }
 
 # --- fixture 3: a meaningful failure notifies; an unchanged queued poll does not ---------------
@@ -461,7 +561,11 @@ run_tests \
   test_a_write_never_waits_a_hold \
   test_an_ownerless_probe_lock_is_recovered \
   test_a_hold_at_the_start_counts_toward_the_ceiling \
-  test_resolving_the_repo_sends_nothing_during_a_hold \
+  test_resolving_the_repo_passes_the_hold \
+  test_a_refusal_during_the_probe_survives_the_lift \
+  test_a_reap_keeps_a_lock_retaken_meanwhile \
+  test_another_host_is_outside_the_budget \
+  test_a_graphql_200_can_still_be_quota \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
