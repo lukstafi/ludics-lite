@@ -478,9 +478,11 @@ class Watch:
             return None
         return self.clock.now() + self.cfg.grace - state.age
 
-    def post_request(self) -> bool:
+    def post_request(self) -> tuple[bool, str]:
         """The watch's one write, ATTEMPTED ONCE: a gateway refusal that did land would otherwise
-        be a second review run nobody asked for (review of #465, round 4)."""
+        be a second review run nobody asked for (review of #465, round 4). Returns whether it
+        posted, and its error line: the shell made this call outside a command substitution, so
+        its error was still what gh_err_line quoted after the drift read's own calls succeeded."""
         session = self.ctx.session
         saved = session.config
         session.config = replace(saved, api_attempts=1)
@@ -494,7 +496,7 @@ class Watch:
             )
         finally:
             session.config = saved
-        return isinstance(result, GhOk)
+        return isinstance(result, GhOk), session.err_line()
 
     # --- the loop ------------------------------------------------------------------------------------
 
@@ -572,7 +574,8 @@ class Watch:
                     fsha = _upto(detail, "|")
                     fkind = _upto(_after(detail, "|"), "|")
                     if fkind == "run" and rerequested != fsha:
-                        if self.post_request():
+                        posted, post_err = self.post_request()
+                        if posted:
                             rerequested = fsha
                             rerequest_end = self.clock.now() + cfg.grace
                             candidate_end = rerequest_end
@@ -586,7 +589,7 @@ class Watch:
                             self.drift_note()
                             _say(
                                 f"the '@codex review' re-request for the failed run on head {fsha}"
-                                f" did not go through ({ctx.session.err_line()}) — read the PR's"
+                                f" did not go through ({post_err}) — read the PR's"
                                 " comments before posting it by hand, since a request that failed"
                                 " ambiguously may have landed"
                             )
