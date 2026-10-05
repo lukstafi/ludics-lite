@@ -98,22 +98,27 @@ def die_of_sigpipe() -> int:
     return 128 + 13
 
 
-# scripts/py's note of the caller's PYTHONPATH: ``=<value>`` when it was set, empty when not.
+# scripts/py's notes of the caller's PYTHONPATH and PYTHONCOERCECLOCALE: ``=<value>`` when it was
+# set, empty when not.
 CALLER_PYTHONPATH = "LUDICS_CALLER_PYTHONPATH"
+CALLER_NOTES = {CALLER_PYTHONPATH: "PYTHONPATH", "LUDICS_CALLER_PYTHONCOERCECLOCALE": "PYTHONCOERCECLOCALE"}
 
 
 def restore_caller_environment(env: MutableMapping[str, str]) -> None:
-    """Put back the PYTHONPATH scripts/py replaced with the checkout's lib/, so every program an
-    entry point runs -- a batch under ``fleet-worker.sh execution slot``, git's hooks, a fixture's
-    gh -- sees the caller's environment, not the ``ludics`` package. This process's own path was
-    fixed at startup. A run not through scripts/py has no note, and keeps what it has."""
-    saved = env.pop(CALLER_PYTHONPATH, None)
-    if saved is None:
-        return
-    if saved.startswith("="):
-        env["PYTHONPATH"] = saved[1:]
-    else:
-        env.pop("PYTHONPATH", None)
+    """Put back what scripts/py replaced: the PYTHONPATH it set to the checkout's lib/, and the
+    PYTHONCOERCECLOCALE=0 it set for this interpreter's startup, so every program an entry point
+    runs -- a batch under ``fleet-worker.sh execution slot``, a local far side, git's hooks, a
+    fixture's gh -- sees the caller's environment, not the ``ludics`` package. This process's own
+    path and locale were fixed at startup. A run not through scripts/py has no notes, and keeps
+    what it has."""
+    for note, name in CALLER_NOTES.items():
+        saved = env.pop(note, None)
+        if saved is None:
+            continue
+        if saved.startswith("="):
+            env[name] = saved[1:]
+        else:
+            env.pop(name, None)
 
 
 def main(prog: str, run: Callable[[list[str]], int]) -> int:

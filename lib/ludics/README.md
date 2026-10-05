@@ -26,10 +26,12 @@ porters: where code goes, how a subcommand is forwarded, and how to check it.
 
 ```
 scripts/py                       the interpreter wrapper: the first Python >= 3.12, run as
-                                 `-X utf8 -P` with PYTHONPATH=lib, the caller's own PYTHONPATH
-                                 noted in LUDICS_CALLER_PYTHONPATH (scripts/test-py.sh)
+                                 `-X utf8 -P` with PYTHONPATH=lib and PYTHONCOERCECLOCALE=0,
+                                 the caller's own values noted in LUDICS_CALLER_PYTHONPATH and
+                                 LUDICS_CALLER_PYTHONCOERCECLOCALE (scripts/test-py.sh)
 lib/ludics/cli.py                shared by every entry point: Exit, main (the caller's
-                                 PYTHONPATH back, then main_guard), main_guard (an Exit's message
+                                 PYTHONPATH and PYTHONCOERCECLOCALE back, then main_guard),
+                                 main_guard (an Exit's message
                                  and status; a closed stdout ends the command by SIGPIPE, 141, as
                                  it ended the shell's printf), say/emit/note
 lib/ludics/proc.py               run_tool and the shell bridge
