@@ -14,10 +14,11 @@ shell's awk programs on 6,000 generated workflow texts, each read four ways: ide
 """
 
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ludics.prreview.core import GhOk, GhSession
+from ludics.prreview.workflow_yaml import paths_ignore_covers, workflow_filter, workflow_keys
 from ludics.prreview.shtext import (
     after_line,
     count_nonempty,
@@ -33,262 +34,10 @@ IGNORE_MAX_COMMITS_DEFAULT = 20
 # SHARED-CANDIDATE: HEAD_INERT_EVENTS
 HEAD_INERT_EVENTS = ("workflow_call", "merge_group")
 
-_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
-_IDENT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*[ ]*:")
-_ON_KEY = re.compile(r'(on|"on")[ ]*:')
-
-
 @dataclass(frozen=True)
 class RecognitionLimits:
     contents_dir_cap: int = CONTENTS_DIR_CAP_DEFAULT
     ignore_max_commits: int = IGNORE_MAX_COMMITS_DEFAULT
-
-
-# --- the YAML readers ---------------------------------------------------------------------------
-
-
-def _ind_of(s: str) -> int:
-    m = re.search(r"[^ ]", s)
-    return m.start() if m else -1
-
-
-def _unquote(s: str) -> str:
-    s = s.strip(" ")
-    c = s[:1]
-    if c in ("'", '"') and len(s) >= 2 and s[-1] == c:
-        s = s[1:-1]
-    return s
-
-
-@dataclass
-class _Line:
-    ind: int
-    key: str
-    rest: str
-
-
-class _Bad(Exception):
-    pass
-
-
-def _yaml_lines(text: str) -> Iterator[_Line]:
-    """The records both readers walk, one at a time: a TAB ends the read as unparsed AT THE LINE
-    that carries it (the readers' first rule, so a tab below where a reader stops is never seen),
-    and blank lines and comment lines are dropped as both of them drop them."""
-    for record in text.split("\n"):
-        if "\t" in record:
-            raise _Bad
-        line = re.sub(r"[ \r]+$", "", record)
-        if line == "":
-            continue
-        ind = _ind_of(line)
-        key = line[ind:]
-        if key.startswith("#"):
-            continue
-        rest = re.sub(r"^[^:]*:", "", key, count=1)
-        rest = re.sub(r"^[ ]+", "", rest, count=1)
-        rest = re.sub(r"[ ]+#.*$", "", rest, count=1)
-        yield _Line(ind, key, rest)
-
-
-# SHARED-CANDIDATE: WORKFLOW_YAML_FILTER
-def yaml_seq(text: str, want: str, seq: str) -> list[str] | None:
-    """``WORKFLOW_YAML_FILTER``: the items of ``on: <want>: <seq>`` in a workflow file, or None when
-    they cannot be established (the file does not parse, or the key is not there)."""
-    lines = _yaml_lines(text)
-    pats: list[str] = []
-    state = 0
-    ok = False
-    on_ind = push_ind = seq_ind = 0
-    want_re = re.compile(re.escape(want) + "[ ]*:")
-    seq_re = re.compile(re.escape(seq) + "[ ]*:")
-
-    def emit(s: str) -> None:
-        s = _unquote(s)
-        if s == "":
-            raise _Bad
-        pats.append(s)
-
-    try:
-        for ln in lines:
-            if state == 0:
-                if ln.ind == 0 and _ON_KEY.match(ln.key):
-                    if ln.rest != "" and not ln.rest.startswith("#"):
-                        raise _Bad
-                    state = 1
-                    on_ind = ln.ind
-                continue
-            if state == 1:
-                if ln.ind <= on_ind:
-                    raise _Bad
-                if want_re.match(ln.key):
-                    if ln.rest != "" and not ln.rest.startswith("#"):
-                        raise _Bad
-                    state = 2
-                    push_ind = ln.ind
-                continue
-            if state == 2:
-                if ln.ind <= push_ind:
-                    raise _Bad
-                if seq_re.match(ln.key):
-                    if ln.rest == "":
-                        state = 3
-                        seq_ind = ln.ind
-                        continue
-                    if re.fullmatch(r"\[.*\]", ln.rest):
-                        inner = ln.rest[1:-1]
-                        for part in inner.split(",") if inner != "" else []:
-                            emit(part)
-                        ok = True
-                        break
-                    raise _Bad
-                continue
-            # state 3: the block sequence's items
-            if ln.key == "-" or ln.key.startswith("- "):
-                emit(ln.key[1:])
-                continue
-            if ln.ind <= seq_ind:
-                ok = True
-                break
-            raise _Bad
-    except _Bad:
-        return None
-    if state == 3:
-        ok = True
-    if not ok or not pats:
-        return None
-    return pats
-
-
-# SHARED-CANDIDATE: WORKFLOW_KEYS
-def yaml_keys(text: str, want: str) -> list[str] | None:
-    """``WORKFLOW_KEYS``: the trigger events a workflow file declares (``want`` empty), or the keys
-    under one named event; None when they cannot be established."""
-    lines = _yaml_lines(text)
-    keys: list[str] = []
-    state = 0
-    ok = False
-    on_ind = want_ind = 0
-    ev_ind = -1
-    kw_ind = -1
-
-    def emit(s: str) -> None:
-        s = _unquote(s)
-        if not _IDENT.fullmatch(s):
-            raise _Bad
-        keys.append(s)
-
-    def key_name(key: str) -> str:
-        return re.sub(r"[ ]*:.*$", "", key, count=1)
-
-    try:
-        for ln in lines:
-            if state == 0:
-                if ln.ind == 0 and _ON_KEY.match(ln.key):
-                    on_ind = ln.ind
-                    if ln.rest == "":
-                        state = 1
-                        continue
-                    if re.fullmatch(r"\[.*\]", ln.rest):
-                        if want == "":
-                            inner = ln.rest[1:-1]
-                            for part in inner.split(",") if inner != "" else []:
-                                emit(part)
-                        ok = True
-                        break
-                    if want == "":
-                        emit(ln.rest)
-                    ok = True
-                    break
-                continue
-            if state == 1:
-                if ln.ind <= on_ind:
-                    ok = True
-                    break
-                if ev_ind < 0:
-                    ev_ind = ln.ind
-                if ln.ind < ev_ind:
-                    raise _Bad
-                if ln.ind > ev_ind:
-                    continue
-                if not _IDENT_KEY.match(ln.key):
-                    raise _Bad
-                k = key_name(ln.key)
-                if want == "":
-                    emit(k)
-                    continue
-                if k == want:
-                    state = 2
-                    want_ind = ln.ind
-                continue
-            # state 2: the keys under the named event
-            if ln.ind <= want_ind:
-                ok = True
-                break
-            if kw_ind < 0:
-                kw_ind = ln.ind
-            if ln.ind < kw_ind:
-                raise _Bad
-            if ln.ind > kw_ind:
-                continue
-            if not _IDENT_KEY.match(ln.key):
-                raise _Bad
-            emit(key_name(ln.key))
-    except _Bad:
-        return None
-    if state in (1, 2):
-        ok = True
-    if not ok:
-        return None
-    if want != "" and state == 1:
-        return None
-    if want == "" and not keys:
-        return None
-    return keys
-
-
-# --- the glob translation -----------------------------------------------------------------------
-
-
-# SHARED-CANDIDATE: glob_ere
-def glob_ere(pattern: str) -> str | None:
-    """``glob_ere``: one GitHub path filter as a regex anchored at both ends, or None for a pattern
-    this translation does not carry (anything but ``*``, ``**`` and plain path characters)."""
-    if pattern == "" or re.search(r"[^A-Za-z0-9._/*-]", pattern):
-        return None
-    out: list[str] = []
-    i = 0
-    while i < len(pattern):
-        c = pattern[i]
-        if c == "*":
-            if pattern[i : i + 2] == "**":
-                out.append(".*")
-                i += 2
-                continue
-            out.append("[^/]*")
-        elif c == ".":
-            out.append("\\.")
-        else:
-            out.append(c)
-        i += 1
-    return "^" + "".join(out) + "$"
-
-
-# SHARED-CANDIDATE: paths_ignore_covers
-def paths_ignore_covers(patterns: list[str], files: list[str]) -> bool:
-    """``paths_ignore_covers``: every changed path matches some pattern; EVERY pattern translated
-    before anything is matched, so one the translation refuses fails the whole question."""
-    pats = [p for p in patterns if p]
-    paths = [f for f in files if f]
-    if not pats or not paths:
-        return False
-    eres: list[re.Pattern[str]] = []
-    for p in pats:
-        ere = glob_ere(p)
-        if ere is None:
-            return False
-        eres.append(re.compile(ere))
-    return all(any(e.search(f) for e in eres) for f in paths)
 
 
 # --- the reads ----------------------------------------------------------------------------------
@@ -536,12 +285,12 @@ def head_within_paths_ignore(reads: Reads, pr: str, head: str, base: str, ref: s
             return None
         if body != bbody:
             return None
-        evs = yaml_keys(body, "")
+        evs = workflow_keys(body, "")
         if not evs:
             return None
         for ev in evs:
             if ev == "pull_request":
-                pats = yaml_seq(body, "pull_request", "paths-ignore")
+                pats = workflow_filter(body, "pull_request", "paths-ignore")
                 if not pats:
                     return None
                 if not paths_ignore_covers(pats, rfiles):

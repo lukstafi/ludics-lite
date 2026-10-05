@@ -20,7 +20,7 @@ from contextlib import redirect_stderr, redirect_stdout
 
 from ludics import cli, proc
 from ludics.prreview import base
-from ludics.prreview.base_yaml import glob_ere, paths_ignore_covers, workflow_filter, workflow_keys
+from ludics.prreview.workflow_yaml import glob_ere, paths_ignore_covers, workflow_filter, workflow_keys
 from ludics.prreview.checkruns import newest_first
 from ludics.prreview.shtext import encode_ref
 from ludics.prreview.clock import FuncClock

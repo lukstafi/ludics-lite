@@ -40,7 +40,7 @@ from ludics.prreview.core import (
     warn,
 )
 from ludics.prreview.clock import Clock, clock_from_env, fmt_age
-from ludics.prreview.watch_drift import warn_base_drift
+from ludics.prreview.drift import warn_base_drift
 from ludics.prreview.watch_feeds import Ctx, pr_head_read
 from ludics.prreview.watch_poll import poll
 from ludics.prreview.watch_state import (
@@ -230,7 +230,7 @@ class Watch:
         return status_line(state, self.repo, self.pr)
 
     def drift_note(self) -> None:
-        warn_base_drift(self.ctx, self.pr, self.cfg.stale_base, _err, _err)
+        warn_base_drift(self.ctx.session, self.repo, self.pr, self.cfg.stale_base, say=_err, err=_err)
 
     def round(self) -> None:
         """``watch_round``: one poll, the head read after it, and the split of its items."""

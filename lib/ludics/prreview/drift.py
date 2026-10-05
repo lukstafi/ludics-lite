@@ -7,17 +7,18 @@ compares are anchored on that one tip; an overlapping path is split by whether t
 meet, and a patch that cannot be read hunk by hunk is UNREAD, never disjoint. A read that could not
 be completed prints UNKNOWN and is never "not behind" or "none".
 
-``watch`` reads the same thing at the end of a round (``watch_drift_note``); this module is the
-port of the function both call (SHARED-CANDIDATE).
+``watch`` reads the same thing at the end of a round (``watch_drift_note``), all of it on stderr
+there; this module is the one port of the function both call.
 """
 
 import json
 import re
-import sys
+from collections.abc import Callable
 from typing import cast
 
 from ludics import cli
-from ludics.prreview.core import PROG, GhOk, GhSession, Json, warn
+from ludics.prreview.core import PROG, GhOk, GhSession, Json
+from ludics.prreview.core import warn as core_warn
 from ludics.prreview.shtext import JqError, encode_ref, is_number, jq_compact, jq_get, tab_fields
 
 _HUNK = re.compile(r"^@@ -(?P<s>[0-9]+)(,(?P<n>[0-9]+))? \+[0-9]+(,(?P<m>[0-9]+))? @@")
@@ -66,7 +67,6 @@ def _ranges(entry: Json) -> Ranges | None:
     return None
 
 
-# SHARED-CANDIDATE: compare_hunks
 def compare_hunks(doc: Json) -> dict[str, Ranges | None] | None:
     """``compare_hunks``: each file's ranges by path (None for a file whose hunks are unread); None
     when the response has no file list to read."""
@@ -82,7 +82,6 @@ def compare_hunks(doc: Json) -> dict[str, Ranges | None] | None:
     return out
 
 
-# SHARED-CANDIDATE: compare_file_set
 def compare_file_set(doc: Json) -> tuple[int, list[str]] | None:
     """``compare_file_set``: the file count and every path (old names of renames included), or
     None for a missing or malformed file list."""
@@ -131,11 +130,29 @@ def _meets(a: Ranges, b: Ranges) -> bool:
     return any(lo <= xhi + 1 and xlo <= hi + 1 for (xlo, xhi) in a for (lo, hi) in b)
 
 
-# SHARED-CANDIDATE: warn_base_drift
-def warn_base_drift(session: GhSession, repo: str, pr: str, stale_base: int | None) -> int:
+def warn_base_drift(
+    session: GhSession,
+    repo: str,
+    pr: str,
+    stale_base: int | None,
+    *,
+    say: Callable[[str], None] = cli.say,
+    err: Callable[[str], None] | None = None,
+) -> int:
     """``warn_base_drift``: the count and the overlap, said on stdout (and loudly on stderr where it
     is to be acted on). 0 nothing to act on; 1 a warning (stale, conflicted, or an overlap whose
-    hunks meet or are unread); 3 the count or the overlap is UNKNOWN. Never a gate."""
+    hunks meet or are unread); 3 the count or the overlap is UNKNOWN. Never a gate.
+
+    ``say`` takes what the shell printed on stdout and ``err`` (``warn`` by default) its stderr
+    lines, ``pr-review.sh: `` included: a ``watch`` round passes one stderr writer for both, so
+    the round's stdout stays poll's."""
+
+    def warn(*parts: str) -> None:
+        if err is None:
+            core_warn(*parts)
+        else:
+            err(f"{PROG}: {' '.join(parts)}")
+
     fields = session.retry(
         "read",
         [
@@ -152,7 +169,7 @@ def warn_base_drift(session: GhSession, repo: str, pr: str, stale_base: int | No
             f"({session.err_line()}). This is not 'not behind': check it by hand before merging",
             "and do not assume the base-drift file overlap is empty.",
         )
-        cli.say(f"base-drift file overlap {repo}#{pr}: UNKNOWN — the PR snapshot could not be read")
+        say(f"base-drift file overlap {repo}#{pr}: UNKNOWN — the PR snapshot could not be read")
         return 3
     tip = session.retry("read", ["api", f"repos/{repo}/commits/{encode_ref(base)}", "--jq", ".sha"])
     if not isinstance(tip, GhOk) or not tip.stdout:
@@ -161,15 +178,15 @@ def warn_base_drift(session: GhSession, repo: str, pr: str, stale_base: int | No
             f"({session.err_line()}). This is not 'not behind': check it by hand before merging",
             "and do not assume the base-drift file overlap is empty.",
         )
-        cli.say(f"base-drift file overlap {repo}#{pr}: UNKNOWN — the tip of {base} could not be read")
+        say(f"base-drift file overlap {repo}#{pr}: UNKNOWN — the tip of {base} could not be read")
         return 3
     base_sha = tip.stdout
     dirty_warn = mstate == "dirty"
     if dirty_warn:
-        cli.say(f"!!! {repo}#{pr} CONFLICTS with {base} (mergeable_state=dirty): GitHub cannot build head")
-        cli.say(f"!!! {head_sha[:7]} merged with the current {base}, so no pull_request run tests that merge")
-        cli.say(f"!!! and the merge will be refused. Merge {base} in, resolve, push, and let the checks run")
-        cli.say("!!! on the resolution.")
+        say(f"!!! {repo}#{pr} CONFLICTS with {base} (mergeable_state=dirty): GitHub cannot build head")
+        say(f"!!! {head_sha[:7]} merged with the current {base}, so no pull_request run tests that merge")
+        say(f"!!! and the merge will be refused. Merge {base} in, resolve, push, and let the checks run")
+        say("!!! on the resolution.")
     forward_r = session.retry("read", ["api", f"repos/{repo}/compare/{base_sha}...{head_sha}?per_page=1"])
     if not isinstance(forward_r, GhOk):
         warn(
@@ -177,7 +194,7 @@ def warn_base_drift(session: GhSession, repo: str, pr: str, stale_base: int | No
             f"({session.err_line()}). The base-drift file overlap is UNKNOWN too, not none; retry before",
             "merging.",
         )
-        cli.say(f"base-drift file overlap {repo}#{pr}: UNKNOWN — the forward compare call did not answer")
+        say(f"base-drift file overlap {repo}#{pr}: UNKNOWN — the forward compare call did not answer")
         return 3
     forward = _parse(forward_r.stdout)
     count_unknown = False
@@ -245,50 +262,48 @@ def warn_base_drift(session: GhSession, repo: str, pr: str, stale_base: int | No
     elif stale_base is None:
         pass
     elif behind is not None and behind < stale_base:
-        cli.say(f"base freshness {repo}#{pr}: {behind} commit(s) behind {base}, {ahead} ahead (warns at {stale_base})")
+        say(f"base freshness {repo}#{pr}: {behind} commit(s) behind {base}, {ahead} ahead (warns at {stale_base})")
     else:
         count_warn = True
-        cli.say(f"!!! {repo}#{pr} is {behind} COMMITS BEHIND its base ({base}).")
-        cli.say("!!! The review that approved this branch, and the checks that went green on it, both judged")
-        cli.say(f"!!! it against a base that has since moved {behind} commits. Under the roll-forward policy")
-        cli.say("!!! (ahrefs/ocannl#861) this does NOT block a clean merge — the post-merge integration loop")
-        cli.say("!!! re-runs the full suites on merged master — but a clean 'mergeable' says only that the")
-        cli.say("!!! two texts do not collide. Read the base-drift file intersection printed below.")
+        say(f"!!! {repo}#{pr} is {behind} COMMITS BEHIND its base ({base}).")
+        say("!!! The review that approved this branch, and the checks that went green on it, both judged")
+        say(f"!!! it against a base that has since moved {behind} commits. Under the roll-forward policy")
+        say("!!! (ahrefs/ocannl#861) this does NOT block a clean merge — the post-merge integration loop")
+        say("!!! re-runs the full suites on merged master — but a clean 'mergeable' says only that the")
+        say("!!! two texts do not collide. Read the base-drift file intersection printed below.")
     if overlap_unknown:
         reason = overlap_reason or "a compare response was incomplete or invalid"
-        cli.say(f"base-drift file overlap {repo}#{pr}: UNKNOWN — {reason}")
+        say(f"base-drift file overlap {repo}#{pr}: UNKNOWN — {reason}")
         warn(f"BASE-DRIFT FILE OVERLAP UNKNOWN for {repo}#{pr} — this is not 'none'; retry the merge", "read.")
     elif not overlap:
-        cli.say(f"base-drift file overlap {repo}#{pr}: none")
+        say(f"base-drift file overlap {repo}#{pr}: none")
     elif not meeting:
-        cli.say(
+        say(
             f"base-drift file overlap {repo}#{pr}: {len(overlap)} path(s) changed on both sides, all in"
             " DISJOINT hunks (the base's lines and this PR's do not meet, which git merges by"
             f" construction): {_json_list(disjoint)}"
         )
     else:
-        cli.say(
+        say(
             "!!! BASE-DRIFT FILE OVERLAP: the base's advance touched the SAME REGIONS of"
             f" {len(meeting)} path(s) changed by"
         )
-        cli.say(f"!!! {repo}#{pr}: {_json_list(meeting)}")
+        say(f"!!! {repo}#{pr}: {_json_list(meeting)}")
         if unread:
-            cli.say(
+            say(
                 f"!!! (hunks unread for {len(unread)} of them — patch missing or unreadable in the compare response,"
                 f" so counted as meeting: {_json_list(unread)})"
             )
         if disjoint:
-            cli.say(f"!!! and {len(disjoint)} more path(s) in disjoint hunks only: {_json_list(disjoint)}")
-        cli.say("!!! Merging under the roll-forward policy (ahrefs/ocannl#861): a clean merge proceeds on")
-        cli.say(f"!!! the run that went green, and the post-merge integration loop verifies merged {base}.")
-        cli.say("!!! Read those files for semantic drift. The overlap is not a reason to rebase: rebase")
-        cli.say(f"!!! (or merge {base} in) only to resolve a conflict.")
-        sys.stdout.flush()
-        sys.stderr.write(
-            f"{PROG}: BASE-DRIFT FILE OVERLAP for {repo}#{pr} in the same regions: {_json_list(meeting)} — noted"
-            " even below SHIP_PR_STALE_BASE; it does not block the merge under the roll-forward policy.\n"
+            say(f"!!! and {len(disjoint)} more path(s) in disjoint hunks only: {_json_list(disjoint)}")
+        say("!!! Merging under the roll-forward policy (ahrefs/ocannl#861): a clean merge proceeds on")
+        say(f"!!! the run that went green, and the post-merge integration loop verifies merged {base}.")
+        say("!!! Read those files for semantic drift. The overlap is not a reason to rebase: rebase")
+        say(f"!!! (or merge {base} in) only to resolve a conflict.")
+        warn(
+            f"BASE-DRIFT FILE OVERLAP for {repo}#{pr} in the same regions: {_json_list(meeting)} — noted"
+            " even below SHIP_PR_STALE_BASE; it does not block the merge under the roll-forward policy."
         )
-        sys.stderr.flush()
     if count_warn:
         warn(
             f"MERGING A STALE BRANCH: {repo}#{pr} is {behind} commits behind {base} (warns at {stale_base},",

@@ -17,7 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from ludics import proc
-from ludics.prreview import clock, closekw, shtext, workflows
+from ludics.prreview import clock, closekw, shtext, workflow_yaml
 from ludics.prreview.core import Config, GhSession, Json
 from ludics.prreview.drift import compare_file_set, compare_hunks
 from ludics.prreview.checkruns import conclusion_class, newest_first_lines
@@ -133,41 +133,41 @@ class WorkflowYaml(unittest.TestCase):
         # An item's trailing comment is NOT stripped (the awk read the item off the key, not the
         # comment-stripped rest), so it is not unquoted either -- and the glob then refuses it.
         self.assertEqual(
-            workflows.yaml_seq(DOCS, "pull_request", "paths-ignore"), ["docs/**", "'**.md'   # a comment"]
+            workflow_yaml.workflow_filter(DOCS, "pull_request", "paths-ignore"), ["docs/**", "'**.md'   # a comment"]
         )
-        self.assertIsNone(workflows.glob_ere("'**.md'   # a comment"))
+        self.assertIsNone(workflow_yaml.glob_ere("'**.md'   # a comment"))
 
     def test_a_tab_before_the_answer_refuses(self) -> None:
         text = "on:\n\tpull_request:\n"
-        self.assertIsNone(workflows.yaml_seq(text, "pull_request", "paths-ignore"))
-        self.assertIsNone(workflows.yaml_keys(text, ""))
+        self.assertIsNone(workflow_yaml.workflow_filter(text, "pull_request", "paths-ignore"))
+        self.assertIsNone(workflow_yaml.workflow_keys(text, ""))
 
     def test_the_flow_form_and_its_refusals(self) -> None:
         flow = 'on:\n  pull_request:\n    paths-ignore: ["docs/**", "**.md"]\n'
-        self.assertEqual(workflows.yaml_seq(flow, "pull_request", "paths-ignore"), ["docs/**", "**.md"])
-        self.assertIsNone(workflows.yaml_seq('on:\n  pull_request:\n    paths-ignore: []\n', "pull_request", "paths-ignore"))
-        self.assertIsNone(workflows.yaml_seq("on:\n  pull_request:\n    paths-ignore: *docs\n", "pull_request", "paths-ignore"))
-        self.assertIsNone(workflows.yaml_seq("on:\n  pull_request:\n    paths: [a]\n", "pull_request", "paths-ignore"))
+        self.assertEqual(workflow_yaml.workflow_filter(flow, "pull_request", "paths-ignore"), ["docs/**", "**.md"])
+        self.assertIsNone(workflow_yaml.workflow_filter('on:\n  pull_request:\n    paths-ignore: []\n', "pull_request", "paths-ignore"))
+        self.assertIsNone(workflow_yaml.workflow_filter("on:\n  pull_request:\n    paths-ignore: *docs\n", "pull_request", "paths-ignore"))
+        self.assertIsNone(workflow_yaml.workflow_filter("on:\n  pull_request:\n    paths: [a]\n", "pull_request", "paths-ignore"))
 
     def test_the_events_in_every_form(self) -> None:
-        self.assertEqual(workflows.yaml_keys(DOCS, ""), ["pull_request"])
-        self.assertEqual(workflows.yaml_keys("on: push\n", ""), ["push"])
-        self.assertEqual(workflows.yaml_keys("on: [push, pull_request]\n", ""), ["push", "pull_request"])
-        self.assertEqual(workflows.yaml_keys(DOCS, "pull_request"), ["paths-ignore"])
-        self.assertEqual(workflows.yaml_keys("on: push\n", "push"), [], "declared with no keys is an answer")
-        self.assertIsNone(workflows.yaml_keys(DOCS, "push"), "a mapping that never reached the event")
-        self.assertIsNone(workflows.yaml_keys("name: x\n", ""), "no trigger at all is a misread file")
+        self.assertEqual(workflow_yaml.workflow_keys(DOCS, ""), ["pull_request"])
+        self.assertEqual(workflow_yaml.workflow_keys("on: push\n", ""), ["push"])
+        self.assertEqual(workflow_yaml.workflow_keys("on: [push, pull_request]\n", ""), ["push", "pull_request"])
+        self.assertEqual(workflow_yaml.workflow_keys(DOCS, "pull_request"), ["paths-ignore"])
+        self.assertEqual(workflow_yaml.workflow_keys("on: push\n", "push"), [], "declared with no keys is an answer")
+        self.assertIsNone(workflow_yaml.workflow_keys(DOCS, "push"), "a mapping that never reached the event")
+        self.assertIsNone(workflow_yaml.workflow_keys("name: x\n", ""), "no trigger at all is a misread file")
 
     def test_the_glob(self) -> None:
-        self.assertEqual(workflows.glob_ere("docs/**"), "^docs/.*$")
-        self.assertEqual(workflows.glob_ere("*.md"), "^[^/]*\\.md$")
-        self.assertIsNone(workflows.glob_ere("!docs/**"))
-        self.assertIsNone(workflows.glob_ere("docs/?.md"))
-        self.assertTrue(workflows.paths_ignore_covers(["docs/**", "**.md"], ["docs/a.txt", "x/README.md"]))
-        self.assertFalse(workflows.paths_ignore_covers(["docs/**"], ["docs/a.txt", "src/a.ml"]))
-        self.assertFalse(workflows.paths_ignore_covers(["docs/**", "[ab]"], ["docs/a.txt"]),
+        self.assertEqual(workflow_yaml.glob_ere("docs/**"), "^docs/.*$")
+        self.assertEqual(workflow_yaml.glob_ere("*.md"), "^[^/]*\\.md$")
+        self.assertIsNone(workflow_yaml.glob_ere("!docs/**"))
+        self.assertIsNone(workflow_yaml.glob_ere("docs/?.md"))
+        self.assertTrue(workflow_yaml.paths_ignore_covers(["docs/**", "**.md"], ["docs/a.txt", "x/README.md"]))
+        self.assertFalse(workflow_yaml.paths_ignore_covers(["docs/**"], ["docs/a.txt", "src/a.ml"]))
+        self.assertFalse(workflow_yaml.paths_ignore_covers(["docs/**", "[ab]"], ["docs/a.txt"]),
                          "one untranslatable pattern fails the whole filter")
-        self.assertFalse(workflows.paths_ignore_covers(["*.md"], ["docs/a.md"]), "* stays in one segment")
+        self.assertFalse(workflow_yaml.paths_ignore_covers(["*.md"], ["docs/a.md"]), "* stays in one segment")
 
 
 class Drift(unittest.TestCase):

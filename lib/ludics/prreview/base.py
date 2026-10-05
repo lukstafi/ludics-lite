@@ -52,7 +52,7 @@ from ludics.prreview import knobs
 from ludics.prreview.checkruns import conclusion_class, newest_first
 from ludics.prreview.clock import FuncClock, age_of
 from ludics.prreview.shtext import encode_ref
-from ludics.prreview.base_yaml import paths_ignore_covers, workflow_filter, workflow_keys
+from ludics.prreview.workflow_yaml import paths_ignore_covers, workflow_filter, workflow_keys
 from ludics.prreview.core import (
     GhFailed,
     GhOk,

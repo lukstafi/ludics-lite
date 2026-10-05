@@ -1,4 +1,5 @@
-"""The workflow-file readers `base` settles a tip's absence with, ported from pr-review.sh.
+"""The workflow-file readers, ported once from pr-review.sh: `base` settles a tip's absence with
+them, and the paths-ignore recognition (``checks``/``merge``, workflows.py) reads files with them.
 
 Two narrow state machines over a workflow file's text, and the path-filter translation:
 
@@ -12,8 +13,7 @@ comments give at length: a refusal costs the absence grace, a guess settles for 
 over an unbuilt tip. The shell ran the two readers as awk programs; these are line-for-line ports
 of those programs, including where awk's semantics are unusual (``split`` of an empty string
 yields nothing; ``exit`` inside a rule still runs the END block). ``head_within_paths_ignore``
-(``checks``/``merge``, ludics-lite#176) reads files with the same two programs, so all four are
-shared candidates.
+(``checks``/``merge``, ludics-lite#176) reads files with the same two programs.
 """
 
 import re
@@ -82,7 +82,6 @@ def _no_value(rest: str) -> bool:
     return rest == "" or rest.startswith("#")
 
 
-# SHARED-CANDIDATE: WORKFLOW_YAML_FILTER
 def workflow_filter(text: str, want: str, seq: str) -> list[str] | None:
     """The items of ``on: <want>: <seq>`` in a workflow file, or None when they cannot be
     established (the file does not parse this narrowly, or the key is not there). ``want`` and
@@ -161,7 +160,6 @@ def workflow_filter(text: str, want: str, seq: str) -> list[str] | None:
     return pats
 
 
-# SHARED-CANDIDATE: WORKFLOW_KEYS
 def workflow_keys(text: str, want: str = "") -> list[str] | None:
     """The keys a workflow file declares at one level of its ``on:`` block: the trigger events
     (``want`` empty), or the keys under the event ``want``. None when they cannot be established.
@@ -268,7 +266,6 @@ def workflow_keys(text: str, want: str = "") -> list[str] | None:
 _GLOB_CHARS = re.compile(r"[A-Za-z0-9._/*-]+")
 
 
-# SHARED-CANDIDATE: glob_ere
 def glob_ere(pattern: str) -> str | None:
     """One GitHub path filter as a regular expression anchored at both ends, or None for a
     pattern this translation does not carry: ``**`` is any run of characters, ``*`` any run within
@@ -294,7 +291,6 @@ def glob_ere(pattern: str) -> str | None:
     return "^" + "".join(out) + "$"
 
 
-# SHARED-CANDIDATE: paths_ignore_covers
 def paths_ignore_covers(patterns: list[str], files: list[str]) -> bool:
     """Every changed path matches some pattern. EVERY pattern is translated before anything is
     matched, so one that does not translate fails the whole question rather than just itself."""
