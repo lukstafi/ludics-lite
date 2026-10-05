@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ludics import cli
+from ludics.proc import decode, substitution
 
 PROG = "post-merge-cleanup.sh"
 
@@ -38,10 +39,6 @@ class Done:
 
     rc: int
     out: str
-
-
-def decode(data: bytes) -> str:
-    return data.decode("utf-8", "surrogateescape")
 
 
 def encode(text: str) -> bytes:
@@ -99,11 +96,6 @@ def git(
         return Done(126, "")
     captured = decode(proc.stdout) if out == "capture" else ""
     return Done(status_of(proc.returncode), captured)
-
-
-def substitution(text: str) -> str:
-    """What the shell's ``$(...)`` keeps of a command's output: every trailing newline dropped."""
-    return text.rstrip("\n")
 
 
 def nul_records(text: str) -> list[str]:
