@@ -1182,8 +1182,8 @@ cleanup removes it rather than refusing over it:
   --base main --regenerable _build
 ```
 
-Which directories those are is the project's to say, in its AGENTS.md (OCANNL's names `_build`);
-`_opam` and `node_modules` are the same shape. The
+Which directories `--regenerable` names is the project's to say, in its AGENTS.md (OCANNL's
+names `_build`); `_opam` and `node_modules` are the same shape. The
 flag is repeatable and has no default, and the helper learns no build system from it — it names a
 class of paths, not a command to run inside a checkout it is about to judge. Each value must be
 ONE top-level directory of the SESSION worktree: a value carrying a separator — `/`, and `\` too,
