@@ -15,7 +15,7 @@ import sys
 from ludics import cli
 from ludics.prreview.core import PROG, GhSession, die, load_config
 
-PORTED = ("body",)
+PORTED = ("body", "watch", "run-watch")
 
 
 def dispatch(argv: list[str]) -> int:
@@ -37,6 +37,16 @@ def dispatch(argv: list[str]) -> int:
             from ludics.prreview import body
 
             return body.run(session, rest)
+        case "watch":
+            from ludics.prreview import watch
+
+            return watch.run(session, rest, env)
+        case "run-watch":
+            # `retry run watch`'s await: the shell's cmd_retry hands it here. Not a subcommand of
+            # pr-review.sh's own command line, so it is not in the shell's PY_PORTED.
+            from ludics.prreview import run_watch
+
+            return run_watch.run(session, rest, env)
         case _:
             die(
                 f"'{sub}' is not a subcommand ported to Python (ported: {' '.join(PORTED)});",

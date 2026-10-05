@@ -1,0 +1,699 @@
+"""``pr-review.sh watch <pr> [watermark]``: wait for the reviewer's next round, and say what it was.
+
+Ported from ``cmd_watch``, ``watch_loop`` and their helpers (``watch_round``, ``watch_note_past``,
+``watch_quiet_line``, ``watch_act``, ``watch_round_counts``/``_trailer``/``_note``,
+``watch_settle``, ``watch_preserve_unarmed_nudge``, ``watch_end``, ``watch_grace_deadline``,
+``watch_post_request``, ``item_about_head``, ``tmp_sweep_stale``). The shell's comments above each
+of them carry the incidents behind every rule kept here; read them there before changing one:
+
+- the wait ends only on reviewer activity ABOUT the head being watched (ludics-lite#72); items
+  about another commit are printed for the record on stderr and the watermark moves past them;
+- every verdict that says "nothing is coming" polls once more first, re-reads the state, and is
+  withheld (exit 3) when either did not answer -- a nudge over a round that just landed clears
+  the 👍 it was about to get;
+- "keep waiting" is said only while something runs: a live round or a fresh nudge extends the
+  window ONCE, to a frozen deadline (handed off once from a nudge's pickup to its review);
+- a `failed` run is re-requested by the watch itself, once per head per process, on a state read
+  fresh after the round, and the request is sent ONCE whatever its error (it may have landed).
+
+Exit: 0 something to act on (a round, an approval, a verdict); 1 a quiet window; 3 the window, its
+tail or the verdict's re-reads were not observed. The last stdout line is always the watermark.
+"""
+
+import glob
+import os
+import re
+import shutil
+import sys
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from typing import assert_never
+
+from ludics.prreview.core import (
+    GhOk,
+    GhSession,
+    die,
+    mark_of,
+    pr_arg,
+    warn,
+)
+from ludics.prreview.watch_clock import Clock, clock_from_env, fmt_age
+from ludics.prreview.watch_drift import warn_base_drift
+from ludics.prreview.watch_feeds import Ctx, pr_head_read
+from ludics.prreview.watch_poll import poll
+from ludics.prreview.watch_state import (
+    Rounds,
+    State,
+    approval_gate,
+    gated_state,
+    review_rounds,
+    status_line,
+    status_state,
+)
+
+_NUMBER = re.compile(r"[0-9]+")
+_WATERMARK = re.compile(r"[0-9].*,[0-9].*,[0-9].*", re.DOTALL)
+_REQUEST_BODY = "@codex review\n\n_\U0001f916 Addressed by an automated coding agent_"
+
+
+@dataclass(frozen=True)
+class WatchConfig:
+    """The watch's source-time constants (validated, as the shell validated them, before anything
+    is read) and its two environment knobs (read when the watch starts)."""
+
+    grace: int
+    stall: int
+    stale_base: int | None
+    interval: int = 90
+    timeout: int = 900
+
+
+def _number(env: Mapping[str, str], name: str, default: str, what: str) -> int:
+    text = env.get(name, "") or default
+    if not _NUMBER.fullmatch(text):
+        die(f"{name} must be {what}, got '{text}'")
+    return int(text)
+
+
+# SHARED-CANDIDATE: (pr-review.sh's source-time GRACE, STALL, STALE_BASE)
+def load_watch_config(env: Mapping[str, str]) -> WatchConfig:
+    grace = _number(env, "SHIP_PR_REVIEW_GRACE", "1200", "a number of seconds")
+    stall = _number(env, "SHIP_PR_REVIEW_STALL", str(grace * 2), "a number of seconds")
+    stale_text = env.get("SHIP_PR_STALE_BASE", "") or "20"
+    if stale_text == "off":
+        stale_base: int | None = None
+    elif _NUMBER.fullmatch(stale_text):
+        stale_base = int(stale_text)
+    else:
+        die(f"SHIP_PR_STALE_BASE must be a number of commits or 'off', got '{stale_text}'")
+    return WatchConfig(grace, stall, stale_base)
+
+
+def with_window(cfg: WatchConfig, env: Mapping[str, str]) -> WatchConfig:
+    """``${WATCH_INTERVAL:-90}`` and ``${WATCH_TIMEOUT:-900}``. The shell fed them to its
+    arithmetic unchecked; a value that is not whole seconds is a usage error here."""
+    return replace(
+        cfg,
+        interval=_number(env, "WATCH_INTERVAL", "90", "whole seconds"),
+        timeout=_number(env, "WATCH_TIMEOUT", "900", "whole seconds"),
+    )
+
+
+def _err(text: str) -> None:
+    """``echo ... >&2``: a line on stderr, after whatever stdout already holds."""
+    sys.stdout.flush()
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+def _say(text: str) -> None:
+    sys.stdout.write(text + "\n")
+
+
+def _strip(text: str) -> str:
+    """What ``$(...)`` keeps of a command's output: trailing newlines dropped."""
+    return text.rstrip("\n")
+
+
+def _drop_last_line(text: str) -> str:
+    """``$(sed '$d' <<<"$text")``."""
+    return _strip("\n".join(text.split("\n")[:-1]))
+
+
+def _last_line(text: str) -> str:
+    """``$(tail -n 1 <<<"$text")``."""
+    return text.split("\n")[-1]
+
+
+def _upto(text: str, sep: str) -> str:
+    """``${text%%<sep>*}``."""
+    return text.split(sep, 1)[0]
+
+
+def _after(text: str, sep: str) -> str:
+    """``${text#*<sep>}``: everything after the first separator, or all of it when there is none."""
+    return text.split(sep, 1)[1] if sep in text else text
+
+
+def _cut_f12(text: str) -> str:
+    """``cut -d'|' -f1-2``: a line without the delimiter prints whole."""
+    parts = text.split("|")
+    return text if len(parts) == 1 else "|".join(parts[:2])
+
+
+def item_about_head(stamp: str, head: str) -> bool:
+    """Is a rendered item about the head being watched? A prefix test, either way round; YES for
+    an item with no stamp and for any item when the head could not be read."""
+    if stamp in ("", "-") or not head:
+        return True
+    return head.startswith(stamp) or stamp.startswith(head)
+
+
+# SHARED-CANDIDATE: tmp_sweep_stale
+def tmp_sweep_stale(env: Mapping[str, str]) -> None:
+    """Remove what a SIGKILLed run left in TMPDIR: every family keyed by an owning pid that is no
+    longer alive, this user's only. A name with no pid in it names no owner and is left alone."""
+    root = env.get("TMPDIR", "") or "/tmp"
+    if root.endswith("/"):
+        root = root[:-1]
+    if not root or not os.path.isdir(root):
+        return
+    uid = os.geteuid()
+    for family in ("snap", "err", "gh", "probe", "test"):
+        prefix = f"pr-review-{family}."
+        for path in sorted(glob.glob(os.path.join(glob.escape(root), prefix + "*"))):
+            try:
+                if not os.path.exists(path) or os.stat(path).st_uid != uid:
+                    continue
+            except OSError:
+                continue
+            pid_text = os.path.basename(path)[len(prefix):].split(".", 1)[0]
+            if not (pid_text.isdigit() and pid_text.isascii()):
+                continue
+            try:
+                os.kill(int(pid_text), 0)
+                continue
+            except (OSError, OverflowError, ValueError):
+                pass
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+@dataclass
+class Polled:
+    """``watch_round``'s POLLED_* globals."""
+
+    rc: int = 0
+    out: str = ""
+    mark: str = ""
+    head: str = ""
+    on: str = ""
+    on_n: int = 0
+    past: str = ""
+    past_n: int = 0
+
+
+class Watch:
+    def __init__(
+        self, ctx: Ctx, pr: str, mark: str, cfg: WatchConfig, round_gap: int, threshold: str
+    ) -> None:
+        self.ctx = ctx
+        self.pr = pr
+        self.mark = mark
+        self.watch_from = mark
+        self.cfg = cfg
+        self.round_gap = round_gap
+        self.threshold = threshold
+        self.clock: Clock = ctx.clock
+        self.polled = Polled()
+        self.saw = 0
+        self.blind = 0
+        self.past_seen = 0
+        self.past_last = ""
+        self.last_healthy_mark = mark
+        self.state: State = State("unknown", None, "-", "")
+        self.rounds_now = Rounds(None, "")
+        self.rounds_before = Rounds(None, "")
+
+    # --- the pieces of a round -------------------------------------------------------------------
+
+    @property
+    def repo(self) -> str:
+        return self.ctx.repo
+
+    def line(self, state: State) -> str:
+        return status_line(state, self.repo, self.pr)
+
+    def drift_note(self) -> None:
+        warn_base_drift(self.ctx, self.pr, self.cfg.stale_base, _err, _err)
+
+    def round(self) -> None:
+        """``watch_round``: one poll, the head read after it, and the split of its items."""
+        snap = self.ctx.snap
+        snap.arm()
+        result = poll(self.ctx, self.pr, self.mark)
+        p = Polled(rc=result.rc, out=_strip(result.text), mark=self.mark)
+        self.polled = p
+        if p.rc != 0:
+            snap.drop()
+            return
+        if _WATERMARK.fullmatch(result.watermark):
+            p.mark = result.watermark
+        head = pr_head_read(self.ctx, self.pr)
+        snap.put_head(self.pr, head)
+        p.head = head.sha
+        for entry in result.items.split():
+            kind = _upto(entry, ":")
+            rest = _after(entry, ":")
+            ident = _upto(rest, ":")
+            rest = _after(rest, ":")
+            commit = _upto(rest, ":")
+            rest = _after(rest, ":")
+            login = _upto(rest, ":")
+            state = _after(rest, ":")
+            desc = f"{kind} id={ident}"
+            if state != "-":
+                desc += f" state={state}"
+            desc += f" commit={commit} by {login}"
+            if item_about_head(commit, p.head):
+                p.on_n += 1
+                p.on = p.on or desc
+            else:
+                p.past_n += 1
+                p.past = p.past or desc
+
+    def note_past(self) -> None:
+        p = self.polled
+        if p.past_n <= 0:
+            return
+        self.past_seen += p.past_n
+        self.past_last = p.past
+        warn(
+            f"PR {self.repo}#{self.pr}: {p.past_n} item(s) NOT about head {p.head[:7]} (first:"
+            f" {p.past}) — printed below for the record; the watermark advances past them and the"
+            " wait continues, but a thread among them left unresolved still holds an approval back"
+            " from `merge`"
+        )
+        kept = [
+            ln for ln in p.out.split("\n")
+            if not ln.startswith("watermark: ") and not ln.startswith("items: ")
+        ]
+        sys.stdout.flush()
+        sys.stderr.write("".join(f"{ln}\n" for ln in kept))
+        sys.stderr.flush()
+
+    def quiet_line(self, window: str) -> str:
+        p = self.polled
+        about = f"head {p.head[:7] or 'UNREAD'}"
+        if p.rc != 0:
+            about = "the head (the last poll did not answer)"
+        out = f"no reviewer activity about {about}"
+        if window != "-":
+            out += f" in {window}s"
+        if self.past_seen:
+            out += (
+                f"; {self.past_seen} item(s) about another commit scrolled past (last:"
+                f" {self.past_last})"
+            )
+        return out
+
+    def round_counts(self) -> None:
+        self.rounds_now = review_rounds(self.ctx, self.pr, self.round_gap)
+        self.rounds_before = review_rounds(
+            self.ctx, self.pr, self.round_gap, mark_of(self.watch_from, 2), mark_of(self.watch_from, 3)
+        )
+
+    def rounds_trailer(self) -> str:
+        return (
+            f"watch-rounds: from={self.rounds_before.token()} to={self.rounds_now.token()}"
+            f" threshold={self.threshold}"
+        )
+
+    def round_note(self) -> str:
+        now, before = self.rounds_now, self.rounds_before
+        if now.count is None or before.count is None:
+            detail = before.detail if now.count is not None else now.detail
+            return f" — round UNKNOWN ({detail}); read `rounds` before citing a round number"
+        n, b = now.count, before.count
+        past = ""
+        if not _NUMBER.fullmatch(self.threshold):
+            of = " (no threshold set)"
+        else:
+            t = int(self.threshold)
+            of = f" of {t}"
+            if n > t:
+                if n > b + 1 and b + 1 <= t:
+                    past = (
+                        f"; from round {t + 1} on PAST the threshold: blocking-only there,"
+                        f" rounds {b + 1}–{t} in full"
+                    )
+                else:
+                    past = ", PAST the threshold: blocking-only from here"
+        if n <= b:
+            return f" — this window opened no round; rounds with findings: {n}{of}{past}"
+        if n == b + 1:
+            return f" — this window opened round {n}{of}{past}"
+        return f" — this window opened rounds {b + 1}–{n}{of}{past}"
+
+    def preserve_unarmed_nudge(self, pre_mark: str, previous: State | None, new: State) -> None:
+        old_issue = mark_of(pre_mark, 2)
+        next_issue = mark_of(self.mark, 2)
+        if next_issue <= old_issue:
+            return
+        match new.tok:
+            case "nudged":
+                if previous is not None and previous.tok == "nudged" and previous.detail == new.detail:
+                    return
+            case "unknown":
+                pass
+            case _:
+                return
+        self.mark = f"{mark_of(self.mark, 1)},{old_issue},{mark_of(self.mark, 3)}"
+        warn(
+            "keeping the final poll's issue comments pending for the next watch; a new nudge may"
+            " still need its grace"
+        )
+
+    def act(self, state: State) -> None:
+        """``watch_act``: what the wait ended on, by name, and the round itself on stdout."""
+        p = self.polled
+        extra = ""
+        original_mark = self.mark
+        if p.on_n > 1:
+            extra = f" (+{p.on_n - 1} more about this head)"
+        if p.past_n != 0:
+            extra += f" (+{p.past_n} about another commit, below)"
+        if not p.head:
+            extra += " (the head did not read this round, so nothing was held back for being old)"
+        if state.tok == "nudged":
+            pending = _upto(state.detail, "|")
+            if _NUMBER.fullmatch(pending):
+                pid = int(pending)
+                if pid > 0 and mark_of(self.mark, 2) >= pid:
+                    self.mark = f"{mark_of(self.mark, 1)},{pid - 1},{mark_of(self.mark, 3)}"
+                    warn(
+                        f"nudge {pending} remains pending; keep an observer after handling these"
+                        " review items"
+                    )
+        elif state.tok == "unknown":
+            self.preserve_unarmed_nudge(self.last_healthy_mark, None, state)
+        if self.mark != original_mark:
+            p.out = _drop_last_line(p.out) + f"\nwatermark: {self.mark}"
+        _err(f"status: {self.line(state)}")
+        self.drift_note()
+        self.round_counts()
+        warn(
+            f"PR {self.repo}#{self.pr}: ending the wait on {p.on or 'reviewer activity'}{extra}"
+            f"{self.round_note()}"
+        )
+        last = _last_line(p.out)
+        if last.startswith("watermark: "):
+            p.out = f"{_drop_last_line(p.out)}\n{self.rounds_trailer()}\n{last}"
+        else:
+            p.out = f"{p.out}\n{self.rounds_trailer()}"
+        _say(p.out)
+
+    def settle(self) -> int:
+        """``watch_settle``: 0 nothing new; 1 a round about the head arrived; 3 no answer."""
+        self.round()
+        self.mark = self.polled.mark
+        if self.polled.rc == 0:
+            self.saw = 1
+            self.blind = 0
+        else:
+            self.blind += 1
+            return 3
+        if self.polled.on_n != 0:
+            return 1
+        self.note_past()
+        return 0
+
+    def end(self, verdict: str, message: str) -> int:
+        """``watch_end``: the final poll and state re-read before a nothing-is-coming verdict."""
+        before_settle = self.mark
+        before_state = self.state
+        rc = self.settle()
+        where = f"PR {self.repo}#{self.pr}"
+        if rc == 1:
+            self.act(gated_state(self.ctx, self.pr))
+            return 0
+        if rc == 3:
+            _say(
+                f"the final poll before the '{verdict}' verdict on {where} did not answer"
+                f" ({self.ctx.session.err_line()}), so nothing rules out a round that landed while"
+                " the state was being read — the verdict is WITHHELD, and this window says nothing"
+                " about the reviewer; re-arm"
+            )
+            _say(f"watermark: {self.mark}")
+            return 3
+        state = status_state(self.ctx, self.pr)
+        self.preserve_unarmed_nudge(before_settle, before_state, state)
+        state = approval_gate(self.ctx, self.pr, state)
+        self.state = state
+        tok = state.tok
+        if tok == "unknown":
+            _say(
+                f"the state could not be re-read after the final poll on {where}, so the"
+                f" '{verdict}' verdict is WITHHELD — {state.detail}; this is NOT 'the reviewer"
+                " stayed quiet', re-arm"
+            )
+            _say(f"watermark: {self.mark}")
+            return 3
+        if tok in ("approved", "unresolved") and verdict != "approved":
+            _say(
+                f"the '{verdict}' verdict on {where} was dropped: the 👍 landed while it was being"
+                f" read — {self.line(state)}"
+            )
+            _say(f"watermark: {self.mark}")
+            return 0
+        if tok == "nudged" and before_state.tok == "nudged" and before_state.detail != state.detail:
+            _say(
+                f"the '{verdict}' verdict on {where} was dropped: a newer nudge still needs its"
+                " grace; re-arm"
+            )
+            _say(f"watermark: {self.mark}")
+            return 1
+        if tok != verdict:
+            _say(
+                f"the '{verdict}' verdict on {where} was dropped: the state moved to '{tok}' while"
+                f" it was being read — {self.line(state)}; nothing here says the reviewer is done,"
+                " re-arm"
+            )
+            _say(f"watermark: {self.mark}")
+            return 1
+        self.drift_note()
+        if message:
+            _say(message)
+        _say(f"{self.quiet_line('-')}; status: {self.line(state)}")
+        _say(f"watermark: {self.mark}")
+        return 0
+
+    def grace_deadline(self, state: State) -> int | None:
+        if state.tok not in ("reviewing", "nudged") or state.age is None:
+            return None
+        return self.clock.now() + self.cfg.grace - state.age
+
+    def post_request(self) -> bool:
+        """The watch's one write, ATTEMPTED ONCE: a gateway refusal that did land would otherwise
+        be a second review run nobody asked for (review of #465, round 4)."""
+        session = self.ctx.session
+        saved = session.config
+        session.config = replace(saved, api_attempts=1)
+        try:
+            result = session.retry(
+                "write",
+                [
+                    "api", "-X", "POST", f"repos/{self.repo}/issues/{self.pr}/comments", "-f",
+                    f"body={_REQUEST_BODY}", "--jq", ".html_url",
+                ],
+            )
+        finally:
+            session.config = saved
+        return isinstance(result, GhOk)
+
+    # --- the loop ------------------------------------------------------------------------------------
+
+    def run(self) -> int:
+        ctx = self.ctx
+        cfg = self.cfg
+        pr = self.pr
+        where = f"PR {self.repo}#{pr}"
+        interval, timeout = cfg.interval, cfg.timeout
+        start = self.clock.now()
+        quiet = 0
+        extension_end: int | None = None
+        extension_kind = ""
+        extension_mark = ""
+        rerequested = ""
+        rerequest_end: int | None = None
+        ctx.nudge_after = mark_of(self.mark, 2)
+
+        self.state = status_state(ctx, pr)
+        was = self.state.tok
+        candidate_end = self.grace_deadline(self.state)
+        candidate_kind: str = was
+        _err(
+            f"watching {where}, every {interval}s for up to {timeout}s; from:"
+            f" {self.line(self.state)}"
+        )
+
+        while True:
+            self.round()
+            self.mark = self.polled.mark
+            if self.polled.rc == 0:
+                self.saw = 1
+                self.blind = 0
+            else:
+                self.blind += 1
+
+            state = gated_state(ctx, pr)
+            tok = state.tok
+            if tok == "failed":
+                fkind = _cut_f12(state.detail)
+                if _after(fkind, "|") == "run" and rerequested != _upto(fkind, "|"):
+                    ctx.snap.drop()
+                    state = gated_state(ctx, pr)
+                    tok = state.tok
+                    if _cut_f12(state.detail) != fkind:
+                        warn(
+                            f"{where}: not re-requesting the failed run on {_upto(fkind, '|')} — a"
+                            f" fresh read says: {self.line(state)}"
+                        )
+            self.state = state
+            age = state.age
+            if tok != "unknown":
+                if not (was == "reviewing" and tok != "reviewing" and tok != "nudged" and quiet == 0):
+                    candidate_end = self.grace_deadline(state)
+                    candidate_kind = tok
+                self.last_healthy_mark = self.mark
+
+            if self.polled.on_n > 0:
+                self.act(state)
+                return 0
+            self.note_past()
+            warn(f"{where}: {self.line(state)}")
+
+            match tok:
+                case "unknown":
+                    warn(f"state unreadable this round on {where}; holding '{was}'")
+                case "approved" | "unresolved":
+                    _say(self.line(state))
+                    _say(f"watermark: {self.mark}")
+                    return 0
+                case "stalled":
+                    return self.end(tok, "")
+                case "failed":
+                    detail = state.detail
+                    fsha = _upto(detail, "|")
+                    fkind = _upto(_after(detail, "|"), "|")
+                    if fkind == "run" and rerequested != fsha:
+                        if self.post_request():
+                            rerequested = fsha
+                            rerequest_end = self.clock.now() + cfg.grace
+                            candidate_end = rerequest_end
+                            candidate_kind = "nudged"
+                            warn(
+                                f"{where}: re-requested the review with '@codex review' — the run"
+                                f" on head {fsha} failed with no review and no 👍 to clear;"
+                                " watching for the new round"
+                            )
+                        else:
+                            self.drift_note()
+                            _say(
+                                f"the '@codex review' re-request for the failed run on head {fsha}"
+                                f" did not go through ({ctx.session.err_line()}) — read the PR's"
+                                " comments before posting it by hand, since a request that failed"
+                                " ambiguously may have landed"
+                            )
+                            _say(f"status: {self.line(state)}")
+                            _say(f"watermark: {self.mark}")
+                            return 0
+                        was = tok
+                        quiet = 0
+                    elif fkind == "run":
+                        candidate_end = rerequest_end
+                        candidate_kind = "nudged"
+                        was = tok
+                        quiet = 0
+                    else:
+                        return self.end(tok, "")
+                case "reviewing" | "expected" | "idle" | "nudged":
+                    if was == "reviewing" and tok != "reviewing" and tok != "nudged":
+                        quiet += 1
+                        if quiet >= 2:
+                            return self.end(
+                                tok,
+                                f"the 👀 round on {where} ended without a review of the head"
+                                " commit — consider nudging with a '@codex review' comment",
+                            )
+                    else:
+                        quiet = 0
+                        was = tok
+                    if tok in ("expected", "nudged") and not (was == "reviewing" and quiet == 1):
+                        if age is not None and age >= cfg.grace:
+                            return self.end(
+                                tok,
+                                f"no review materialized on {where} in the {fmt_age(age)} since"
+                                " it became due — consider nudging with a '@codex review' comment",
+                            )
+                case _:
+                    assert_never(tok)
+
+            pause = interval
+            now = self.clock.now()
+            if now - start + interval > timeout:
+                if candidate_end is None:
+                    break
+                if extension_end is None:
+                    remaining = candidate_end - now
+                    if remaining <= 0:
+                        break
+                    extension_end = candidate_end
+                    extension_kind = candidate_kind
+                    extension_mark = self.mark
+                    warn(
+                        "extending watch for the live review or fresh nudge, at most"
+                        f" {remaining}s beyond this poll"
+                    )
+                if extension_kind == "nudged" and candidate_kind == "reviewing":
+                    extension_end = candidate_end
+                    extension_kind = "reviewing"
+                    warn("review started after the nudge; handing off to its fixed live-review deadline")
+                remaining = extension_end - self.clock.now()
+                if remaining <= 0:
+                    break
+                if pause > remaining:
+                    pause = remaining
+            self.clock.sleep(pause)
+
+        if self.settle() == 1:
+            self.act(gated_state(ctx, pr))
+            return 0
+        if mark_of(self.mark, 2) > mark_of(self.last_healthy_mark, 2):
+            final_state = status_state(ctx, pr)
+            self.preserve_unarmed_nudge(self.last_healthy_mark, self.state, final_state)
+        if extension_mark and mark_of(self.mark, 2) > mark_of(extension_mark, 2):
+            self.mark = f"{mark_of(self.mark, 1)},{mark_of(extension_mark, 2)},{mark_of(self.mark, 3)}"
+            warn("comments after the fixed grace began remain pending; re-arm to observe any newer request")
+        if self.saw == 0:
+            _say(
+                f"could not read {where} for the whole {timeout}s window — NOT the same as quiet;"
+                " nothing was observed, so re-arm the watch rather than concluding the reviewer is"
+                " silent"
+            )
+            _say(f"watermark: {self.mark}")
+            return 3
+        if self.blind > 0:
+            _say(
+                f"the last {self.blind} poll(s) of the {timeout}s window on {where} did not answer,"
+                " so the tail of this window was NOT observed — nothing here says the reviewer"
+                " stayed quiet; re-arm"
+            )
+            _say(f"watermark: {self.mark}")
+            return 3
+        elapsed = timeout if extension_end is None else self.clock.now() - start
+        _say(f"{self.quiet_line(str(elapsed))}; status: {self.line(self.state)}")
+        _say(f"watermark: {self.mark}")
+        return 1
+
+
+def run(session: GhSession, args: list[str], env: Mapping[str, str] | None = None) -> int:
+    e = dict(os.environ) if env is None else env
+    cfg = load_watch_config(e)
+    tmp_sweep_stale(e)
+    if not args or not args[0]:
+        # The shell's `${1:?usage: ...}`: bash's own message, and its exit status 1.
+        sys.stdout.flush()
+        sys.stderr.write("pr-review.sh: 1: usage: watch <pr> [watermark]\n")
+        return 1
+    mark = args[1] if len(args) > 1 else ""
+    target = pr_arg(args[0], session.config.repo)
+    cfg = with_window(cfg, e)
+    threshold = "off" if session.config.round_threshold is None else str(session.config.round_threshold)
+    ctx = Ctx(session, target.repo, session.config.reviewer, clock_from_env(e), cfg.stall)
+    return Watch(ctx, target.num, mark, cfg, session.config.round_gap, threshold).run()
