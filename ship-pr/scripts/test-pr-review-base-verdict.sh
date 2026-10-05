@@ -307,6 +307,172 @@ test_overlapping_push_runs_are_read_by_creation_not_by_finish() {
     "with the tip's run named as going"
 }
 
+# --- lessons of the fix rounds, pinned before the port (ludics-lite#403) ------------------------
+# Each case below pins a rule a review round wrote into cmd_base that no case read until the v2
+# rewrite went looking: the rewrite must not quietly drop one.
+
+# base_call <args...>: `base` with exactly these arguments, no branch prepended (run_base names
+# BRANCH first), captured the way run_base captures it.
+base_call() {
+  set +e
+  BASE_OUTPUT=$(cmd_base "$@" 2>&1)
+  BASE_RC=$?
+  set -e
+}
+
+# A branch name carries slashes (`claude/topic`), and once the repository is named the first
+# slashed argument is the BRANCH, never a second repository (ludics-lite ffefd9a): read as the repo
+# it turned `base --repo owner/name claude/topic` into a 404 on repo "claude/topic".
+test_a_slashed_branch_is_the_branch_when_the_repo_is_named() {
+  local BRANCH=claude/topic
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{conclusion:"success", head_sha:$c, id:6101}]')")
+  run_base
+  assert_eq "$BASE_RC" 0 "the slashed branch is read as the branch ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "$REPO claude/topic: green (tip ${SHA_C:0:8})" \
+    "the verdict is about that branch of the named repository"
+  assert_contains "$(cat "$REQUEST_LOG")" "repos/$REPO/commits/claude/topic" \
+    "and the tip is read from the named repository, the slash kept literal"
+}
+
+# A branch name is data, not URL structure (f46932e): `#` would cut the request at a fragment and
+# `&` would split the query, so every byte outside the unreserved set is percent-encoded, a UTF-8
+# name byte by byte, while `/` stays literal. The fixture's endpoints carry the encoded form.
+test_a_branch_name_is_percent_encoded() {
+  local BRANCH='rel%231%26x%C3%A9'
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{conclusion:"success", head_sha:$c, id:6111}]')")
+  base_call 'rel#1&xé'
+  assert_eq "$BASE_RC" 0 "the encoded endpoints are the ones read ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "$REPO rel#1&xé: green (tip ${SHA_C:0:8})" \
+    "the report names the branch as given"
+  assert_contains "$(cat "$REQUEST_LOG")" "repos/$REPO/commits/rel%231%26x%C3%A9" \
+    "the tip read carries the encoded name"
+  assert_contains "$(cat "$REQUEST_LOG")" "runs?branch=rel%231%26x%C3%A9&event=push&per_page=10" \
+    "and so does the runs query, whose & would otherwise split it"
+}
+
+# No branch named: the repository's default branch is read, and a read that fails is UNKNOWN.
+test_the_default_branch_is_read_when_none_is_named() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{conclusion:"success", head_sha:$c, id:6121}]')")
+  base_call
+  assert_eq "$BASE_RC" 0 "the default branch is read and judged ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" "it is the default branch's verdict"
+  reset_fixture
+  retune API_ATTEMPTS=1
+  FAIL_ENDPOINT="repos/$REPO"
+  base_call
+  assert_eq "$BASE_RC" 3 "an unread default branch is unknown"
+  assert_contains "$BASE_OUTPUT" "could not read $REPO's default branch" "and says which read failed"
+  assert_contains "$BASE_OUTPUT" "UNKNOWN, which is not 'fine'" "and that unknown is not fine"
+}
+
+# A branch with no push run of any listed workflow has nothing to read: one empty line through
+# tab-IFS `read` once rendered as a phantom workflow and headlined green with exit 0 (ffefd9a).
+# A list of advisory workflows alone is the same nothing.
+test_a_branch_no_workflow_ran_on_is_not_green() {
+  reset_fixture
+  run_base
+  assert_eq "$BASE_RC" 4 "no run at all is no verdict ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: no build workflow has run on it (nothing to read, not a green light)" \
+    "and says there was nothing to read"
+  reset_fixture
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"claude"}]')
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{conclusion:"success", head_sha:$c, id:6131}]')")
+  run_base
+  assert_eq "$BASE_RC" 4 "an advisory workflow is not a build verdict ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "no build workflow has run on it" "so nothing was read"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "actions/workflows/1/runs" "and its runs are not even asked for"
+}
+
+# The workflow list is read again whenever the observed tip MOVES (7c9cf21): a sibling merge
+# landing mid-wait can add a workflow, and a stale list would never query it -- the old set going
+# covered would read green over the new workflow's red. Round one's coverage is not broken on (the
+# tip moved under it); round two reads the moved tip's list, and its new workflow's red at that tip
+# ends the wait. With the list kept, round two would break green on `ci` alone.
+test_a_workflow_the_moved_tip_added_is_read() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{conclusion:"success", head_sha:$c, id:6141}]')")
+  at_round 1 "$SHA_B"
+  WORKFLOWS_NEXT=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"lint"}]')
+  runs_from_round 2 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
+    '[{conclusion:"success", head_sha:$b, id:6142}, {conclusion:"success", head_sha:$c, id:6141}]')"
+  RUNS_2=$(runs_json 2 "$(jq -cn --arg b "$SHA_B" '[{conclusion:"failure", head_sha:$b, id:6143, name:"lint"}]')")
+  JOBS_6143=$(jobs_json '[{"name":"lint","conclusion":"failure"}]')
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 1 "the added workflow's red at the moved tip is the verdict ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "RED      lint — failure at ${SHA_B:0:8}" "the new workflow was read"
+  assert_eq "$(rounds_polled)" 2 "round two re-read the list for the tip that moved"
+}
+
+# Every read the verdict rests on is UNKNOWN when it fails, never a quieter answer: the workflow
+# list, a workflow's runs, and the deeper read behind a page of ten that judged nothing.
+test_an_unreadable_list_or_runs_read_is_unknown() {
+  reset_fixture
+  retune API_ATTEMPTS=1
+  FAIL_ENDPOINT="repos/$REPO/actions/workflows?per_page=100"
+  run_base
+  assert_eq "$BASE_RC" 3 "an unread workflow list is unknown ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "could not read $REPO's workflow list" "naming the read"
+  reset_fixture
+  retune API_ATTEMPTS=1
+  FAIL_ENDPOINT="repos/$REPO/actions/workflows/1/runs?*per_page=10"
+  run_base
+  assert_eq "$BASE_RC" 3 "an unread runs page is unknown ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "could not read $REPO's 'ci' runs on $BRANCH" "naming the workflow"
+  reset_fixture
+  retune API_ATTEMPTS=1
+  RUNS_1=$(runs_json 1 "$(jq -cn '[range(10) | {conclusion:"cancelled"}]')")
+  FAIL_ENDPOINT="repos/$REPO/actions/workflows/1/runs?*per_page=100"
+  run_base
+  assert_eq "$BASE_RC" 3 "an unread deeper page is unknown ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "past its newest ten, none of which judged it" "naming why it was asked"
+  assert_not_contains "$BASE_OUTPUT" "$REPO $BRANCH: green" "never green"
+}
+
+# The command line refuses what it cannot mean, exit 2, before any read.
+test_the_command_line_refuses_what_it_cannot_mean() {
+  reset_fixture
+  run_base --wait=soon
+  assert_eq "$BASE_RC" 2 "a --wait that is not seconds is refused ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "base: --wait takes seconds, got 'soon'" "saying what it got"
+  run_base --bogus
+  assert_eq "$BASE_RC" 2 "an unknown option is refused ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "base: unknown option '--bogus'" "naming it"
+  run_base --integration-records
+  assert_eq "$BASE_RC" 2 "--integration-records with no file is refused ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "base: --integration-records takes a file" "saying so"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d ' ')" 0 "and nothing was read"
+}
+
+# The poll interval is capped at what is left of the ceiling (0c4580d): a 60s interval under a 2s
+# --wait must not sleep a minute past the deadline before the clock is read again.
+test_the_sleep_is_capped_at_the_ceiling() {
+  local started elapsed
+  reset_fixture
+  retune ABSENT_GRACE=300 CHECKS_INTERVAL=60
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{status:"in_progress", conclusion:null, head_sha:$c, id:6151}]')")
+  started=$SECONDS
+  run_base --wait=2
+  elapsed=$((SECONDS - started))
+  assert_eq "$BASE_RC" 4 "the ceiling ends the wait without a verdict ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "--wait ceiling of 0 min reached" "at the ceiling"
+  [ "$elapsed" -lt 30 ] || bail "a 2s ceiling under a 60s interval took ${elapsed}s: the sleep was not capped"
+}
+
+# A long wait says it is still waiting, once per heartbeat, naming what it waits on.
+test_a_wait_heartbeats_what_it_waits_on() {
+  reset_fixture
+  retune CHECKS_HEARTBEAT=0
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{status:"in_progress", conclusion:null, head_sha:$c, id:6161}]')")
+  runs_from_round 2 1 "$(jq -cn --arg c "$SHA_C" '[{conclusion:"success", head_sha:$c, id:6161}]')"
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "the run finishing green ends the wait ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "still waiting on $REPO $BRANCH: 1 run(s) in flight, 1 workflow(s) not yet judged at the tip, after 0 min" \
+    "the heartbeat names the runs in flight and the workflows not yet judged"
+}
+
 tests=(
   test_a_red_at_the_tip_ends_the_wait_at_once
   test_the_red_break_reconfirms_the_tip
@@ -317,6 +483,15 @@ tests=(
   test_an_unreadable_tip_is_unknown_under_wait_and_decoration_without_it
   test_a_same_second_tie_goes_to_the_higher_run_id
   test_overlapping_push_runs_are_read_by_creation_not_by_finish
+  test_a_slashed_branch_is_the_branch_when_the_repo_is_named
+  test_a_branch_name_is_percent_encoded
+  test_the_default_branch_is_read_when_none_is_named
+  test_a_branch_no_workflow_ran_on_is_not_green
+  test_a_workflow_the_moved_tip_added_is_read
+  test_an_unreadable_list_or_runs_read_is_unknown
+  test_the_command_line_refuses_what_it_cannot_mean
+  test_the_sleep_is_capped_at_the_ceiling
+  test_a_wait_heartbeats_what_it_waits_on
 )
 
 run_tests "${tests[@]}" -- "$@"

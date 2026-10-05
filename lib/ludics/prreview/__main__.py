@@ -15,7 +15,7 @@ import sys
 from ludics import cli
 from ludics.prreview.core import PROG, GhSession, die, load_config
 
-PORTED = ("body", "reply", "resolve", "comment", "retry", "poll", "status", "rounds", "checks", "merge")
+PORTED = ("body", "reply", "resolve", "comment", "retry", "poll", "status", "rounds", "checks", "merge", "base")
 # Entry points for the suites, which pr-review.sh's command line does not route to (see status.py).
 INTERNAL = ("status-state", "status-line")
 
@@ -83,6 +83,10 @@ def dispatch(argv: list[str]) -> int:
             from ludics.prreview import merge
 
             return merge.run(session, rest)
+        case "base":
+            from ludics.prreview import base
+
+            return base.run(session, rest)
         case _:
             die(
                 f"'{sub}' is not a subcommand ported to Python (ported: {' '.join(PORTED)});",

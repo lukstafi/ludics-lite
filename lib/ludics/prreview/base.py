@@ -1,0 +1,1700 @@
+"""``pr-review.sh base [owner/name] [branch] [--wait[=s]] [--interim] [--integration-records f]``
+
+Is the base branch's CI green? Ported from the shell's ``cmd_base`` and the helpers only it uses
+(ludics-lite#403): ``base_red_detail``, ``base_page_judged``, ``base_push_trigger``, the
+paths-ignore settle (``range_files``, ``commit_files``, ``commits_ignored``,
+``tip_within_paths_ignore``), and the two named sources of a tip no push run judges
+(``tip_pr_head_verdict``, ``tip_named_source``). The shell's comments carry the incident history
+of every rule here; this file keeps the load-bearing ones, and the shell region they came from
+(``cmd_base`` and the helpers above it, in ship-pr/scripts/pr-review.sh at c856bb0, the v2 branch
+point) is where to read the rest. The helpers ``base`` shares with ``checks``/``merge``
+(``range_files``, ``commit_files``, the workflow-file readers) are still served by shell for
+those subcommands; their ports here are marked SHARED-CANDIDATE.
+
+WHY ``base`` EXISTS, and why ``--wait``. The other half of ahrefs/ocannl#694: the confusion lands
+on whoever branches off a broken master, so the base's own CI is read before work starts, not
+only before merging. ``--wait`` is for the other end of a branch's life, the roll-forward
+policy's complement: "after a merge, read the base's CI on what you just landed" -- and a plain
+``base`` seconds after a merge answers with the PREVIOUS tip's green, because the merge's own run
+is queued or not created yet. So ``--wait`` re-reads until nothing non-advisory is mid-flight and
+every non-advisory workflow's newest judged run is about the CURRENT tip -- or, with nothing in
+flight and NO run for the tip at all, until the workflow's own paths-ignore says none can be
+created for this tip (a docs-only push never gets one), or failing that until a grace expires
+(SHIP_PR_BASE_ABSENT_GRACE, all that separates "never coming" from "not yet"). Then it settles
+for the verdicts in hand, saying which commit each is about. Two absences it will not settle: a
+run that EXISTS for the tip and has not judged it (only that run can answer), and a run in flight
+anywhere on the branch (it judges a tree the tip contains). A red at the tip breaks the wait at
+once: it is a verdict.
+
+Stdout: the verdict line, then one line per workflow (and its notes). Exit: 0 green (an interim
+green under --interim included); 1 red; 2 usage or configuration; 3 UNKNOWN (a read the verdict
+rests on failed); 4 no verdict (nothing ran, nothing judged the tip, or --wait ran out).
+
+One dependency stays shell: the merged PR head's build signal (source (a)) is ``gate_checks``,
+the ``checks`` subcommand's gate, which this unit does not port. It is run in the shell that
+defines it (``_shell_gate_checks``), exactly as ``tip_pr_head_verdict`` ran it, in a subshell with
+its stderr dropped. When ``checks`` is served by Python this becomes a call.
+"""
+
+import math
+import os
+import re
+import sys
+import tempfile
+import time as _time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal, assert_never
+
+from ludics import cli, proc
+from ludics.prreview.base_yaml import paths_ignore_covers, workflow_filter, workflow_keys
+from ludics.prreview.core import (
+    GhFailed,
+    GhOk,
+    GhRefusedOwn,
+    GhResult,
+    GhSession,
+    GhUnanswered,
+    Json,
+    die,
+    fail,
+    json_stream,
+    repo_from_cwd,
+    shell_quote,
+    warn,
+)
+
+# --- configuration --------------------------------------------------------------------------------
+
+_DEFAULT_ADVISORY = "^(claude|Claude Code|github pages docs)$"
+# How many commits the paths-ignore recognition reads one by one before it lets the grace answer.
+IGNORE_MAX_COMMITS = 20
+# How many entries the Contents API serves for a directory before it truncates.
+CONTENTS_DIR_CAP = 1000
+_DIGITS = re.compile(r"[0-9]+")
+_HEX = re.compile(r"[0-9a-f]+")
+
+
+@dataclass(frozen=True)
+class Knobs:
+    """The source-time constants ``base`` reads beyond the core's: the absence grace and the
+    poll's interval, ceiling and heartbeat (whole seconds), and the advisory list as the shell
+    resolved it (``BUILD_ADVISORY``: ``base`` never reads a repository's advisory file)."""
+
+    absent_grace: int
+    checks_interval: int
+    checks_wait: int
+    checks_heartbeat: int
+    advisory: str
+
+
+def _env(env: Mapping[str, str], name: str, default: str) -> str:
+    value = env.get(name, "")
+    return value if value else default
+
+
+def load_knobs(env: Mapping[str, str]) -> Knobs:
+    """The shell's validation, in its order and its words (it ran at source time, so a forwarded
+    call has passed it already; a direct run gets it here)."""
+    grace = _env(env, "SHIP_PR_BASE_ABSENT_GRACE", "300")
+    if not _DIGITS.fullmatch(grace):
+        die(f"SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '{grace}'")
+    interval = _env(env, "SHIP_PR_CHECKS_INTERVAL", "60")
+    if not _DIGITS.fullmatch(interval):
+        die(f"SHIP_PR_CHECKS_INTERVAL must be whole seconds, got '{interval}'")
+    if int(interval) <= 0:
+        die(f"SHIP_PR_CHECKS_INTERVAL must be at least 1 second, got '{interval}'")
+    wait = _env(env, "SHIP_PR_CHECKS_WAIT", "7200")
+    if not _DIGITS.fullmatch(wait):
+        die(f"SHIP_PR_CHECKS_WAIT must be whole seconds, got '{wait}'")
+    beat = _env(env, "SHIP_PR_CHECKS_HEARTBEAT", "600")
+    if not _DIGITS.fullmatch(beat):
+        die(f"SHIP_PR_CHECKS_HEARTBEAT must be whole seconds, got '{beat}'")
+    # The forwarder hands over the shell's resolved list under a private name, because whether
+    # SHIP_PR_ADVISORY_CHECKS was SET is meaningful elsewhere; a direct run resolves it here.
+    if "LUDICS_BUILD_ADVISORY" in env:
+        advisory = env["LUDICS_BUILD_ADVISORY"]
+    else:
+        advisory = _env(env, "SHIP_PR_ADVISORY_CHECKS", _DEFAULT_ADVISORY)
+    return Knobs(int(grace), int(interval), int(wait), int(beat), advisory)
+
+
+# --- POSIX ERE, for the advisory list -------------------------------------------------------------
+
+_POSIX_CLASSES = {
+    "alpha": "A-Za-z",
+    "digit": "0-9",
+    "alnum": "A-Za-z0-9",
+    "upper": "A-Z",
+    "lower": "a-z",
+    "space": " \\t\\n\\r\\f\\v",
+    "blank": " \\t",
+    "punct": "!-/:-@\\[-`{-~",
+    "xdigit": "0-9A-Fa-f",
+    "cntrl": "\\x00-\\x1f\\x7f",
+    "print": " -~",
+    "graph": "!-~",
+}
+
+
+_WORD_ANCHORS = {"\\<": "\\b(?=\\w)", "\\>": "\\b(?<=\\w)"}
+
+
+def ere_to_python(ere: str) -> re.Pattern[str] | None:
+    """A POSIX extended regular expression as Python's ``re``, or None when it does not compile
+    (grep's exit 2, which matched nothing). Only bracket expressions differ in what this list
+    uses: POSIX classes, a literal backslash, and a leading ``]`` are rewritten there. Outside
+    them, grep's word anchors ``\\<`` and ``\\>`` (both BSD and GNU grep -E honour them) become
+    lookarounds; Python would read them as a literal ``<`` and ``>``."""
+    out: list[str] = []
+    i = 0
+    n = len(ere)
+    while i < n:
+        c = ere[i]
+        if c == "\\" and i + 1 < n:
+            pair = ere[i : i + 2]
+            out.append(_WORD_ANCHORS.get(pair, pair))
+            i += 2
+            continue
+        if c != "[":
+            out.append(c)
+            i += 1
+            continue
+        j = i + 1
+        body: list[str] = ["["]
+        if j < n and ere[j] == "^":
+            body.append("^")
+            j += 1
+        first = True
+        closed = False
+        while j < n:
+            d = ere[j]
+            if d == "]" and not first:
+                closed = True
+                j += 1
+                break
+            if d == "[" and ere[j : j + 2] == "[:":
+                end = ere.find(":]", j + 2)
+                if end < 0:
+                    return None
+                name = ere[j + 2 : end]
+                if name not in _POSIX_CLASSES:
+                    return None
+                body.append(_POSIX_CLASSES[name])
+                j = end + 2
+            elif d in "\\[]":
+                body.append("\\" + d)
+                j += 1
+            else:
+                body.append(d)
+                j += 1
+            first = False
+        if not closed:
+            return None
+        out.append("".join(body) + "]")
+        i = j
+    try:
+        return re.compile("".join(out))
+    except re.error:
+        return None
+
+
+class Advisory:
+    """``is_advisory``: a name the list says carries no build verdict."""
+
+    def __init__(self, ere: str) -> None:
+        self._pattern = ere_to_python(ere)
+
+    # SHARED-CANDIDATE: is_advisory
+    def __call__(self, name: str) -> bool:
+        return self._pattern is not None and self._pattern.search(name) is not None
+
+
+# --- jq's renderings, which the shell's projections fixed -------------------------------------------
+
+
+def jq_raw(value: Json) -> str:
+    """What ``jq -r`` prints for a scalar (and ``tostring`` returns): a string as itself, null as
+    ``null``, a boolean or number as its JSON text."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() and abs(value) < 1e17 else repr(value)
+    return _json_text(value)
+
+
+def _json_text(value: Json) -> str:
+    import json
+
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def tsv(value: Json) -> str:
+    """One ``@tsv`` field: null empty, a string with its tab, newline, CR and backslash escaped."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return (
+            value.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+        )
+    return jq_raw(value)
+
+
+def alt(value: Json, default: Json) -> Json:
+    """jq's ``value // default``: null and false take the default."""
+    return default if value is None or value is False else value
+
+
+def get(value: Json, *path: str | int) -> Json:
+    """``.a.b[0]`` over parsed JSON; anything missing on the way is null."""
+    for key in path:
+        if isinstance(key, int):
+            if not isinstance(value, list) or not -len(value) <= key < len(value):
+                return None
+            value = value[key]
+        else:
+            if not isinstance(value, dict):
+                return None
+            value = value.get(key)
+    return value
+
+
+def _items(value: Json) -> list[Json] | None:
+    return value if isinstance(value, list) else None
+
+
+# SHARED-CANDIDATE: conclusion_class
+def conclusion_class(concl: str) -> Literal["red", "green", "pending", "nogo"]:
+    """``conclusion_class``: a verdict, no verdict yet, or stopped without one."""
+    if concl in ("failure", "timed_out", "startup_failure"):
+        return "red"
+    if concl in ("success", "skipped", "neutral"):
+        return "green"
+    if concl in ("", "null", "pending"):
+        return "pending"
+    return "nogo"
+
+
+_JUDGED = frozenset(("failure", "timed_out", "startup_failure", "success", "skipped", "neutral"))
+
+
+def _sort_num(text: str) -> float:
+    """``sort -n``'s reading of a field: its leading number, 0 when there is none."""
+    m = re.match(r"\s*(-?[0-9]+(?:\.[0-9]*)?)", text)
+    return float(m.group(1)) if m else 0.0
+
+
+# SHARED-CANDIDATE: newest_first
+def newest_first[T](rows: Sequence[T], created: Callable[[T], str], rid: Callable[[T], str],
+                    line: Callable[[T], str]) -> list[T]:
+    """``newest_first``: ``LC_ALL=C sort -k<created>r -k<id>nr`` -- created_at descending as bytes,
+    then the id descending as a number, then sort's last resort, the whole line ascending."""
+    out = sorted(rows, key=lambda r: line(r).encode("utf-8", "surrogateescape"))
+    out.sort(key=lambda r: _sort_num(rid(r)), reverse=True)
+    out.sort(key=lambda r: created(r).encode("utf-8", "surrogateescape"), reverse=True)
+    return out
+
+
+def iso_seconds(text: str) -> float | None:
+    """jq's ``fromdateiso8601``: a UTC ``YYYY-MM-DDTHH:MM:SSZ`` as epoch seconds, else None (jq 1.8
+    refuses fractional seconds too)."""
+    m = re.fullmatch(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z", text)
+    if not m:
+        return None
+    try:
+        when = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)),
+                        int(m.group(5)), int(m.group(6)), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return when.timestamp()
+
+
+# SHARED-CANDIDATE: encode_ref
+def encode_ref(ref: str) -> str:
+    """``encode_ref``: a branch name for a REST path or query, every byte outside the unreserved
+    set percent-encoded and ``/`` kept literal (slashed branch names are the common case)."""
+    out: list[str] = []
+    for byte in ref.encode("utf-8", "surrogateescape"):
+        ch = chr(byte)
+        if byte < 128 and (ch.isascii() and (ch.isalnum() or ch in "._~/-")):
+            out.append(ch)
+        else:
+            out.append(f"%{byte:02X}")
+    return "".join(out)
+
+
+# --- the rows ---------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunRow:
+    """One push run as ``BASE_RUN_ROWS`` projected it: every field the text the TSV carried."""
+
+    wid: str
+    name: str
+    status: str
+    conclusion: str
+    head_sha: str
+    created_at: str
+    url: str
+    run_id: str
+
+    def line(self) -> str:
+        return "\t".join((self.wid, self.name, self.status, self.conclusion, self.head_sha,
+                          self.created_at, self.url, self.run_id))
+
+
+def _run_row(run: Json) -> RunRow:
+    return RunRow(
+        wid=jq_raw(get(run, "workflow_id")),
+        name=tsv(get(run, "name")),
+        status=tsv(get(run, "status")),
+        conclusion=tsv(alt(get(run, "conclusion"), "pending")),
+        head_sha=tsv(get(run, "head_sha")),
+        created_at=tsv(get(run, "created_at")),
+        url=tsv(alt(get(run, "html_url"), "-")),
+        run_id=jq_raw(get(run, "id")),
+    )
+
+
+def page_judged(rows: Sequence[RunRow]) -> bool:
+    """``base_page_judged``: a row that JUDGED the branch -- completed, red or green."""
+    return any(r.status == "completed" and r.conclusion in _JUDGED for r in rows)
+
+
+@dataclass(frozen=True)
+class Folded:
+    """One workflow of the fold: its newest run at all, newest COMPLETED run, and newest JUDGED
+    run ("-" or "pending" where it has none), keyed by the workflow id."""
+
+    name: str
+    status: str
+    sha: str
+    concl: str
+    csha: str
+    cwhen: str
+    curl: str
+    vconcl: str
+    vsha: str
+    vwhen: str
+    vurl: str
+    wfid: str
+
+
+def fold(rows: Sequence[RunRow]) -> list[Folded]:
+    """The awk fold over the assembled rows, grouped by workflow id in order of first sight."""
+    order: list[str] = []
+    first: dict[str, RunRow] = {}
+    done: dict[str, RunRow] = {}
+    judged: dict[str, RunRow] = {}
+    for r in rows:
+        if r.wid == "":
+            continue
+        if r.wid not in first:
+            first[r.wid] = r
+            order.append(r.wid)
+        if r.status == "completed" and r.wid not in done:
+            done[r.wid] = r
+        if r.status == "completed" and r.wid not in judged and r.conclusion in _JUDGED:
+            judged[r.wid] = r
+    out: list[Folded] = []
+    for k in order:
+        f, c, v = first[k], done.get(k), judged.get(k)
+        out.append(Folded(
+            name=f.name, status=f.status, sha=f.head_sha,
+            concl=c.conclusion if c else "pending", csha=c.head_sha if c else "-",
+            cwhen=c.created_at if c else "-", curl=c.url if c else "-",
+            vconcl=v.conclusion if v else "-", vsha=v.head_sha if v else "-",
+            vwhen=v.created_at if v else "-", vurl=v.url if v else "-", wfid=k,
+        ))
+    return out
+
+
+@dataclass(frozen=True)
+class Record:
+    """One integration record ``fleet-worker.sh gate`` handed in."""
+
+    sha: str
+    verdict: str
+    rid: str
+    when: str
+
+    def line(self) -> str:
+        return "\t".join((self.sha, self.verdict, self.rid, self.when))
+
+
+def ifs_tab_fields(line: str, count: int) -> list[str]:
+    """``IFS=$'\\t' read -r a b c d``: tabs are IFS whitespace, so leading and trailing runs are
+    dropped and a run between fields is one separator; the last field keeps the rest."""
+    rest = line.strip("\t")
+    fields: list[str] = []
+    while len(fields) < count - 1 and rest:
+        head, sep, tail = rest.partition("\t")
+        fields.append(head)
+        rest = tail.lstrip("\t") if sep else ""
+    fields.append(rest)
+    while len(fields) < count:
+        fields.append("")
+    return fields
+
+
+_RECORD_SHA = re.compile(r"[0-9a-f]{40}")
+_RECORD_RID = re.compile(r"[A-Za-z0-9._-]+")
+_RECORD_WHEN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+Z-]+")
+
+
+def load_records(path: str) -> list[Record]:
+    """The ``--integration-records`` file, every row validated before any is believed: a row this
+    cannot read is refused WHOLE (exit 2), never skipped -- a skipped red would leave an older
+    source to answer for the tip."""
+    if not (os.path.isfile(path) and os.access(path, os.R_OK)):
+        die(f"base: --integration-records: cannot read '{path}'")
+    try:
+        with open(path, "rb") as handle:
+            text = proc.decode(handle.read())
+    except OSError:
+        die(f"base: --integration-records: cannot read '{path}'")
+    lines = text.split("\n")
+    records: list[Record] = []
+    for index, line in enumerate(lines):
+        last = index == len(lines) - 1
+        sha, verdict, rid, when = ifs_tab_fields(line, 4)
+        # `read || [ -n "$rsha" ]`: an unterminated last line is a row when it has a first field.
+        if last and not sha:
+            continue
+        if not (sha + verdict + rid + when):
+            continue
+        if not (_RECORD_SHA.fullmatch(sha) and verdict in ("pass", "fail")
+                and _RECORD_RID.fullmatch(rid) and _RECORD_WHEN.fullmatch(when)):
+            die("base: --integration-records: a row is not <sha> <pass|fail> <request id> <concluded at>,"
+                f" tab-separated: {shell_quote(sha + chr(9) + verdict + chr(9) + rid + chr(9) + when)}")
+        records.append(Record(sha, verdict, rid, when))
+    return records
+
+
+# --- the named sources ------------------------------------------------------------------------------
+# A default branch without push CI (ludics-lite#401). A workflow that used to run on pushes to this
+# branch and whose file at the tip no longer declares `push` leaves its push runs standing
+# forever: `event=push` pages never age out, so the fold would keep presenting the last push run's
+# verdict -- days or months old -- as the base's. A stale green is worse than none. So such a
+# workflow's push rows are not read as a verdict at all, and the tip's verdict for it comes only
+# from a source this file can NAME, in this order:
+#
+#   (b) an INTEGRATION RECORD: a wave coordinator's own run concluded at exactly the tip, handed in
+#       by `fleet-worker.sh gate` as `--integration-records <file>`. About the tip's own tree, so
+#       it goes first, and a failed one is RED.
+#   (a) the MERGED PR'S HEAD RUN under the roll-forward rule: the tip is GitHub's own merge commit
+#       of one merged pull request into this branch, its second parent is that PR's head, and the
+#       head's build signal -- the one `merge` gated on -- is green (or red).
+#
+# Anything else is "no verdict", never an older green. Source (c), the latest daily sweep record
+# at or after the tip, has no machine-readable form on this side and is not read (#414).
+#
+# "Clean merge" is established from the commit, not assumed: exactly two parents, committed by
+# GitHub itself (`noreply@github.com`) with a signature GitHub verified. GitHub makes a merge
+# commit only for a PR it can merge without conflict, so its own merge carries nothing the head did
+# not; a merge made elsewhere can carry a resolution the head's run never saw, and a squash or a
+# rebase keeps no head in the history at all. The workflows the verdict is FOR must each have a run
+# of their own at the head that concluded `success` with a non-advisory job that succeeded: the
+# head's build signal is an aggregate, and on a docs-only PR the retired `ci` is filtered out by
+# its `pull_request` paths-ignore while another workflow passes (review rounds 1 and 2).
+
+type SourceVerdict = Literal["green", "red", "pending", "none"]
+
+
+@dataclass(frozen=True)
+class TipPr:
+    """``tip_pr_head_verdict``'s TIP_PR_*: the verdict, the sentence naming its source or why there
+    is none, and the PR and head when one was found."""
+
+    verdict: SourceVerdict
+    why: str
+    num: str = ""
+    head: str = ""
+
+
+@dataclass(frozen=True)
+class Source:
+    """``tip_named_source``'s SRC_*: the verdict, the sentence, the source in a few words."""
+
+    verdict: SourceVerdict
+    why: str
+    name: str
+
+
+@dataclass(frozen=True)
+class Trigger:
+    """``base_push_trigger``'s answer: whether the workflow's file AT THE TIP declares ``push``
+    (``pushless``: read, parsed, and names no push; ``unparsed``: read and refused by the narrow
+    reader; ``absent``: established not to be at the tip), and the file's text."""
+
+    kind: Literal["push", "pushless", "unparsed", "absent"]
+    body: str
+
+
+@dataclass(frozen=True)
+class GateSignal:
+    """What the shell's ``gate_checks`` left for ``tip_pr_head_verdict``: its VERDICT, its
+    ``build signal`` line, and the error line of its last failed read."""
+
+    verdict: str
+    line: str
+    err: str
+
+
+type ShellRunner = Callable[[str, Sequence[str]], proc.Completed]
+type Want = tuple[str, str]  # (workflow id, display name)
+
+
+# --- the clock --------------------------------------------------------------------------------------
+
+
+@dataclass
+class Clock:
+    """The wall clock the wait runs on: ``date +%s`` (whole seconds), jq's ``now`` (a float, for an
+    age) and ``sleep``. The suites run on real time (their delays are real sleeps in the fixture),
+    so production and the suites share this; the unit tests inject a fake."""
+
+    time: Callable[[], float] = _time.time
+    sleep: Callable[[float], None] = _time.sleep
+
+    def now(self) -> int:
+        return int(self.time())
+
+
+# --- one `base` invocation --------------------------------------------------------------------------
+
+
+def _checkout() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+@dataclass
+class _Round:
+    """What one round of the wait read and folded. The wait keeps only the previous round's tip;
+    ludics-lite#550 (a round whose runs page skips the tip's in-flight run settles on a
+    weeks-old verdict) is the place a consistency check against the PREVIOUS round would go: hold
+    the previous ``_Round`` and refuse to settle on a fold whose judged commit is older than one an
+    earlier round judged, or that lost a tip run an earlier round saw in flight."""
+
+    out: str = ""
+    red: int = 0
+    pend: int = 0
+    inflight: int = 0
+    uncovered: int = 0
+    red_at_tip: int = 0
+    nogo_at_tip: int = 0
+    norun: int = 0
+    tip_unjudged: int = 0
+    unrun: list[tuple[str, str, str]] = field(default_factory=lambda: [])
+    pushless: list[Want] = field(default_factory=lambda: [])
+    src_pending: bool = False
+    src_none: bool = False
+    tipfly: list[Want] = field(default_factory=lambda: [])
+    uncov_nofly: int = 0
+    pend_fly: int = 0
+    norun_ids: list[Want] = field(default_factory=lambda: [])
+    exhausted_wids: set[str] = field(default_factory=lambda: set())
+    exhausted: list[str] = field(default_factory=lambda: [])
+    folded: list[Folded] = field(default_factory=lambda: [])
+
+    @property
+    def pushless_names(self) -> str:
+        return ", ".join(name for _, name in self.pushless)
+
+    @property
+    def tipfly_names(self) -> str:
+        return ", ".join(name for _, name in self.tipfly)
+
+
+class Base:
+    """The reads ``base`` makes, and what it remembers across the rounds of one ``--wait``: the
+    red runs' job lines, the workflows' push triggers at a tip, and the paths-ignore answers."""
+
+    def __init__(
+        self,
+        session: GhSession,
+        knobs: Knobs,
+        repo: str,
+        *,
+        clock: Clock | None = None,
+        shell: ShellRunner | None = None,
+        records: Sequence[Record] = (),
+    ) -> None:
+        self.session = session
+        self.knobs = knobs
+        self.repo = repo
+        self.clock = clock if clock is not None else Clock()
+        self._shell: ShellRunner = shell if shell is not None else proc.run_tool
+        self.records = list(records)
+        self.is_advisory = Advisory(knobs.advisory)
+        self._err_override: str | None = None
+        self._jobs_cache: dict[str, str] = {}
+        self._trigger_cache: dict[str, Trigger] = {}
+        self._ignore_cache: dict[str, bool] = {}
+
+    # --- gh ---
+
+    def gh(self, args: Sequence[str]) -> GhResult:
+        """A READ through the session's retry policy."""
+        self._err_override = None
+        return self.session.retry("read", args)
+
+    def err_line(self) -> str:
+        """``gh_err_line``: the last failed read's first stderr line -- the shell gate's own, when
+        the last thing that read was the shell's ``gate_checks``."""
+        if self._err_override is not None:
+            return self._err_override
+        return self.session.err_line()
+
+    def gh_json(self, args: Sequence[str]) -> Json | GhFailed | GhUnanswered:
+        """A read answered with one JSON document. A body that does not parse is a failure
+        (``--jq`` erroring made gh fail in the shell)."""
+        result = self.gh(args)
+        match result:
+            case GhFailed() | GhUnanswered():
+                return result
+            case GhOk(stdout=out):
+                docs = json_stream(out)
+                if docs is None or len(docs) != 1:
+                    return GhFailed()
+                return docs[0]
+            case _:
+                assert_never(result)
+
+    def gh_pages(self, args: Sequence[str]) -> list[Json] | GhFailed | GhUnanswered:
+        """A ``--paginate`` read: one JSON document per page."""
+        result = self.gh(args)
+        match result:
+            case GhFailed() | GhUnanswered():
+                return result
+            case GhOk(stdout=out):
+                docs = json_stream(out)
+                return GhFailed() if docs is None else docs
+            case _:
+                assert_never(result)
+
+    def tip_sha(self, ebranch: str) -> str:
+        """The branch tip, or "" when it could not be read."""
+        doc = self.gh_json(["api", f"repos/{self.repo}/commits/{ebranch}"])
+        if isinstance(doc, (GhFailed, GhUnanswered)):
+            return ""
+        return jq_raw(get(doc, "sha")) if isinstance(doc, dict) else ""
+
+    def workflow_list(self) -> list[Want] | None:
+        doc = self.gh_json(["api", f"repos/{self.repo}/actions/workflows?per_page=100"])
+        if isinstance(doc, (GhFailed, GhUnanswered)):
+            return None
+        items = _items(get(doc, "workflows"))
+        if items is None:
+            return None
+        return [(jq_raw(get(w, "id")), tsv(get(w, "name"))) for w in items]
+
+    def runs_page(self, wid: str, ebranch: str, per_page: int) -> list[RunRow] | None:
+        doc = self.gh_json(["api", f"repos/{self.repo}/actions/workflows/{wid}/runs"
+                            f"?branch={ebranch}&event=push&per_page={per_page}"])
+        if isinstance(doc, (GhFailed, GhUnanswered)):
+            return None
+        runs = _items(get(doc, "workflow_runs"))
+        if runs is None:
+            return None
+        return [_run_row(r) for r in runs]
+
+    # --- the red report ---
+
+    def red_detail(self, wfid: str, rows: Sequence[RunRow]) -> str:
+        """``base_red_detail``: WHICH job failed and WHERE the red started, as indented notes for
+        the RED line (ludics-lite#73). Decoration on a verdict already reached: a failed jobs read
+        prints UNKNOWN and leaves the red standing, and is not remembered."""
+        indent = "           "
+        run_id = first_sha = first_when = ""
+        reds = 0
+        bounded = False
+        for r in rows:
+            if r.wid != wfid or r.status != "completed":
+                continue
+            klass = conclusion_class(r.conclusion)
+            if klass == "red":
+                reds += 1
+                run_id = run_id or r.run_id
+                first_sha, first_when = r.head_sha, r.created_at
+            elif klass == "green":
+                bounded = True
+                break
+        if reds == 0:
+            return ""
+        if bounded:
+            detail = (f"{indent}red since {first_sha[:8]} (run created {first_when}), {reds} run(s)"
+                      " back; the judged run before it was not red\n")
+        else:
+            detail = (f"{indent}red for all {reds} judged run(s) in the window, back to"
+                      f" {first_sha[:8]} (run created {first_when}) — the window holds no\n"
+                      f"{indent}green under it, so the red may start further back\n")
+        if not _DIGITS.fullmatch(run_id):
+            return detail
+        cached = self._jobs_cache.get(run_id)
+        if cached is not None:
+            return detail + cached + "\n"
+        pages = self.gh_pages(["api", "--paginate",
+                               f"repos/{self.repo}/actions/runs/{run_id}/jobs?per_page=100"])
+        if isinstance(pages, (GhFailed, GhUnanswered)):
+            return (detail + f"{indent}which job failed is UNKNOWN ({self.err_line()}) — the red above"
+                    " stands; open the run\n")
+        failed: list[str] = []
+        for page in pages:
+            for job in _items(get(page, "jobs")) or []:
+                name = tsv(get(job, "name"))
+                concl = tsv(alt(get(job, "conclusion"), "pending"))
+                if name and conclusion_class(concl) == "red":
+                    failed.append(f"{name} ({concl})")
+        if failed:
+            line = f"{indent}failed job(s): {', '.join(failed)}"
+        else:
+            line = f"{indent}no job in that run concluded red — a startup or workflow-level failure"
+        self._jobs_cache[run_id] = line
+        return detail + line + "\n"
+
+    # --- the workflow file ---
+
+    # SHARED-CANDIDATE: workflow_path
+    def workflow_path(self, wid: str) -> str | None:
+        """``workflow_path``: where that workflow's file lives -- one path, inside the repo."""
+        doc = self.gh_json(["api", f"repos/{self.repo}/actions/workflows/{wid}"])
+        if isinstance(doc, (GhFailed, GhUnanswered)):
+            return None
+        path = jq_raw(alt(get(doc, "path"), "")).rstrip("\n")
+        if not path or "\n" in path or "/../" in path or path.startswith("../") or path.startswith("/"):
+            return None
+        return path
+
+    # SHARED-CANDIDATE: workflow_body
+    def workflow_body(self, path: str, ref: str) -> str | None:
+        """``workflow_body``: the file's own text at that ref, under the raw media type."""
+        result = self.gh(["api", "-H", "Accept: application/vnd.github.raw",
+                          f"repos/{self.repo}/contents/{encode_ref(path)}?ref={ref}"])
+        match result:
+            case GhFailed() | GhUnanswered():
+                return None
+            case GhOk(stdout=body):
+                return body or None
+            case _:
+                assert_never(result)
+
+    # SHARED-CANDIDATE: workflow_files_at
+    def workflow_files_at(self, ref: str) -> list[str] | None:
+        """``workflow_files_at``: every YAML file directly under .github/workflows at that ref;
+        None when the listing is not whole (an error, nothing, or a directory at the cap)."""
+        doc = self.gh_json(["api", f"repos/{self.repo}/contents/.github/workflows?ref={ref}"])
+        if isinstance(doc, (GhFailed, GhUnanswered)) or not isinstance(doc, list):
+            return None
+        count = len(doc)
+        if count <= 0 or count >= CONTENTS_DIR_CAP:
+            return None
+        paths = [jq_raw(get(e, "path")) for e in doc if get(e, "type") == "file"]
+        yaml = [p for p in paths if re.search(r"\.ya?ml$", p)]
+        return yaml or None
+
+    def push_trigger(self, wid: str, tip: str) -> Trigger | None:
+        """``base_push_trigger``: does this workflow's file AT THE TIP declare ``push`` at all
+        (ludics-lite#401)? None is UNKNOWN (exit 3 at the caller), not remembered: a transport
+        failure, and any refusal of the API's (403, 401, or a 404 the directory listing does not
+        confirm), since a token that may read Actions but not the file would otherwise pass for a
+        file with no trigger to read.
+
+        BOUNDARY, as a fail-closed allowlist: ``pushless`` is claimed only for a file that was read
+        whole and whose ``on:`` block the narrow reader parsed and found without ``push`` in any of
+        its three forms (mapping, scalar, flow). ``unparsed`` and ``absent`` are read as a push
+        workflow, exactly as before #401, and so is a ``push`` whose ``branches:`` filter does not
+        reach this branch, which this does not evaluate (#176: what a push filter reaches is not
+        answerable from these feeds). An ABSENT file is claimed only when the directory at the tip
+        was read and does not hold it: a workflow the tip deleted (or a dynamic one, like Pages'
+        ``dynamic/pages/...``, which has no file) keeps the reading it had before #401."""
+        key = f"{wid}/{tip}"
+        hit = self._trigger_cache.get(key)
+        if hit is not None:
+            return hit
+        kind: Literal["push", "pushless", "unparsed", "absent"] = "unparsed"
+        path = self.workflow_path(wid)
+        if path is None:
+            return None
+        body = self.workflow_body(path, tip)
+        if body is None:
+            # The last read's own error: one that SUCCEEDED with an empty body cleared it.
+            if "HTTP 404" not in self.session.err_line():
+                return None
+            files = self.workflow_files_at(tip)
+            if files is None or path in files:
+                return None
+            kind, body = "absent", ""
+        else:
+            events = workflow_keys(body)
+            if events is not None:
+                kind = "push" if "push" in events else "pushless"
+        trigger = Trigger(kind, body)
+        self._trigger_cache[key] = trigger
+        return trigger
+
+    # --- the paths-ignore settle ---
+
+    # SHARED-CANDIDATE: commit_files
+    def commit_files(self, sha: str) -> list[str] | None:
+        """``commit_files``: the paths ONE commit changed (a rename's both names), paginated;
+        None when the answer is not evidence -- empty, or 300 files or more."""
+        pages = self.gh_pages(["api", "--paginate", f"repos/{self.repo}/commits/{sha}?per_page=100"])
+        if isinstance(pages, (GhFailed, GhUnanswered)):
+            return None
+        rows: list[tuple[str, str]] = []
+        for page in pages:
+            for f in _items(get(page, "files")) or []:
+                rows.append((tsv(get(f, "filename")), tsv(alt(get(f, "previous_filename"), ""))))
+        if not 0 < len(rows) < 300:
+            return None
+        return [name for row in rows for name in row if name]
+
+    # SHARED-CANDIDATE: range_files
+    def range_files(self, vsha: str, tip: str) -> list[str] | None:
+        """``range_files``: every path changed on the FIRST-PARENT path from the judged commit up
+        to the tip, or None when the range is not evidence: not an ancestor (a force-push), longer
+        than the cap, a list the total does not match, a step off the listed range, a workflow
+        file touched anywhere in it."""
+        doc = self.gh_json(["api", f"repos/{self.repo}/compare/{vsha}...{tip}"
+                            f"?per_page={IGNORE_MAX_COMMITS}"])
+        if isinstance(doc, (GhFailed, GhUnanswered)):
+            return None
+        count = jq_raw(alt(get(doc, "total_commits"), 0))
+        behind = jq_raw(alt(get(doc, "behind_by"), -1))
+        rows: list[tuple[str, str]] = []
+        for c in _items(alt(get(doc, "commits"), [])) or []:
+            rows.append((tsv(get(c, "sha")), tsv(alt(get(alt(get(c, "parents"), []), 0, "sha"), "-"))))
+        if not _DIGITS.fullmatch(count) or behind != "0":
+            return None
+        total = int(count)
+        if not 0 < total <= IGNORE_MAX_COMMITS:
+            return None
+        if sum(1 for s, _ in rows if re.match(r"[0-9a-f]{7,}$", s)) != total:
+            return None
+        out: list[str] = []
+        sha = tip
+        steps = 0
+        while sha != vsha:
+            steps += 1
+            if steps > total:
+                return None
+            parent = next((p for s, p in rows if s == sha), "")
+            if parent in ("", "-"):
+                return None
+            files = self.commit_files(sha)
+            if files is None or any(f.startswith(".github/workflows/") for f in files):
+                return None
+            out.extend(files)
+            sha = parent
+        if steps == 0 or not out:
+            return None
+        return out
+
+    def tip_within_paths_ignore(self, unrun: Sequence[tuple[str, str, str]], tip: str) -> str | None:
+        """``tip_within_paths_ignore``: every workflow trailing the tip with no run at it is
+        explained by its OWN push filter. The workflows' names joined (PATHS_IGNORE_WHY), or None."""
+        if not unrun:
+            return None
+        why: list[str] = []
+        for wfid, name, vsha in unrun:
+            if vsha in ("", "-"):
+                return None
+            key = f"{wfid}/{vsha}/{tip}"
+            hit = self._ignore_cache.get(key)
+            if hit is None:
+                hit = False
+                pats: list[str] = []
+                trigger = self.push_trigger(wfid, tip)
+                if trigger is not None and trigger.body:
+                    pats = workflow_filter(trigger.body, "push", "paths-ignore") or []
+                if pats:
+                    files = self.range_files(vsha, tip)
+                    hit = files is not None and paths_ignore_covers(pats, files)
+                self._ignore_cache[key] = hit
+            if not hit:
+                return None
+            why.append(name)
+        return ", ".join(why)
+
+    # --- the named sources ---
+
+    def _shell_gate_checks(self, num: str) -> GateSignal | None:
+        """``gate_checks <num> 0``, run in the shell that defines it: the bridge state when the
+        caller sourced pr-review.sh (its fixture ``gh`` and its constants ride along), else the
+        script itself sourced without main. None when it ended without its trailer (an exit)."""
+        state = os.environ.get(proc.BRIDGE_STATE, "")
+        shell = os.environ.get(proc.BRIDGE_SHELL, "") if state else ""
+        script = (
+            '__src=$1 __state=$2 __dir=$3; shift 3\n'
+            'if [ -n "$__state" ]; then . "$__state" 2>/dev/null\n'
+            'else SHIP_PR_TEST_SOURCE_ONLY=1; . "$__src" || exit 97; trap - EXIT; fi\n'
+            'GH_ERR_FILE=$__dir/err GH_REFUSED_FILE=$__dir/refused GH_REFUSAL_PID="" REPO=$1 BUILD_ADVISORY=$2\n'
+            'gate_checks "$3" 0 2>/dev/null\n'
+            'printf \'\\n%s\\t%s\\n\' "$?" "${VERDICT:-}"\n'
+        )
+        src = str(_checkout() / "ship-pr" / "scripts" / "pr-review.sh")
+        with tempfile.TemporaryDirectory(prefix=f"pr-review-gate.{os.getpid()}.") as scratch:
+            done = self._shell(shell or "bash", ["-c", script, "gate_checks", src, state, scratch,
+                                                 self.repo, self.knobs.advisory, num])
+            err = _read_first_line(os.path.join(scratch, "err"))
+            refused = _read_text(os.path.join(scratch, "refused"))
+        self._err_override = err
+        if refused.strip():
+            raise GhRefusedOwn(refused.rstrip("\n"))
+        res = proc.substitution(done.stdout)
+        last = res.rsplit("\n", 1)[-1]
+        verdict = last.split("\t", 1)[1] if "\t" in last else last
+        line = next((ln[len("build signal "):] for ln in res.split("\n")
+                     if ln.startswith("build signal ")), "")
+        return GateSignal(verdict, line, err)
+
+    def tip_pr_head_verdict(self, branch: str, sha: str, wants: Sequence[Want]) -> TipPr | None:
+        """``tip_pr_head_verdict``, source (a): the tip is GitHub's own clean merge of one merged
+        PR into this branch, and that PR head's build signal (and, for each workflow the verdict is
+        FOR, a successful run of it that built something) speaks for it. None is UNKNOWN."""
+        if not sha or not _HEX.fullmatch(sha):
+            return TipPr("none", "there is no tip SHA to judge")
+        doc = self.gh_json(["api", f"repos/{self.repo}/commits/{sha}"])
+        if isinstance(doc, (GhFailed, GhUnanswered)):
+            return None
+        parents = alt(get(doc, "parents"), [])
+        n = str(len(parents)) if isinstance(parents, (list, dict, str)) else "0"
+        p1 = _field(alt(get(doc, "parents", 1, "sha"), "-"))
+        email = _field(alt(get(doc, "commit", "committer", "email"), "-"))
+        verified = _field(jq_raw(alt(get(doc, "commit", "verification", "verified"), False)))
+        s8 = sha[:8]
+        if n != "2":
+            return TipPr("none", f"the tip {s8} is not a merge commit ({n} parent(s)), so no PR head's"
+                         " run speaks for it")
+        if email != "noreply@github.com" or verified != "true":
+            return TipPr("none", f"the tip {s8} is a merge commit GitHub did not make (committer {email},"
+                         f" verified {verified}), so it may carry a resolution no PR head's run saw")
+        pulls = self.gh_json(["api", f"repos/{self.repo}/commits/{sha}/pulls?per_page=100"])
+        if isinstance(pulls, (GhFailed, GhUnanswered)) or not isinstance(pulls, list):
+            return None
+        prs = [(_field(jq_raw(get(p, "number"))), _field(alt(get(p, "head", "sha"), "-")),
+                _field(alt(get(p, "base", "ref"), "-")))
+               for p in pulls
+               if get(p, "merged_at") is not None and get(p, "merge_commit_sha") == sha]
+        if len(prs) != 1:
+            return TipPr("none", f"no single merged pull request has the tip {s8} as its merge commit")
+        num, head, bref = prs[0]
+        if not _DIGITS.fullmatch(num):
+            return None
+        if head != p1 or bref != branch:
+            return TipPr("none", f"PR #{num} merged as the tip {s8}, but its head {head[:8]} is not the"
+                         f" merge's second parent or it was merged into '{bref}', not '{branch}'")
+        signal = self._shell_gate_checks(num)
+        if signal is None:
+            return None
+        verdict: SourceVerdict
+        match signal.verdict:
+            case "green":
+                verdict = "green"
+            case "red" | "runred":
+                verdict = "red"
+            case "pending" | "unjudged":
+                verdict = "pending"
+            case "mixed" | "absent":
+                verdict = "none"
+            case _:
+                return None
+        h8 = head[:8]
+        why = (f"PR #{num}'s head {h8}, which GitHub merged cleanly as the tip {s8} (roll-forward rule):"
+               f" {signal.line}")
+        if verdict != "green" or not wants:
+            return TipPr(verdict, why, num, head)
+        pages = self.gh_pages(["api", "--paginate",
+                               f"repos/{self.repo}/actions/runs?head_sha={head}&per_page=100"])
+        if isinstance(pages, (GhFailed, GhUnanswered)):
+            return None
+        runs = [
+            (tsv(alt(get(r, "created_at"), "-")), jq_raw(alt(get(r, "id"), 0)),
+             jq_raw(alt(get(r, "workflow_id"), 0)), tsv(alt(get(r, "status"), "-")),
+             tsv(alt(get(r, "conclusion"), "pending")))
+            for page in pages for r in _items(get(page, "workflow_runs")) or []
+        ]
+        runs = newest_first(runs, lambda r: r[0], lambda r: r[1], lambda r: "\t".join(r))
+        unbuilt: list[str] = []
+        rerun: list[str] = []
+        for wid, wname in wants:
+            row = next((r for r in runs if r[2] == wid), None)
+            if row is not None and row[3] != "completed":
+                rerun.append(wname)
+                continue
+            concl = row[4] if row is not None else ""
+            if concl != "success" or row is None:
+                unbuilt.append(f"{wname} ({concl or 'no run'})")
+                continue
+            jobs = self.gh_pages(["api", "--paginate",
+                                  f"repos/{self.repo}/actions/runs/{row[1]}/jobs?per_page=100"])
+            if isinstance(jobs, (GhFailed, GhUnanswered)):
+                return None
+            built = False
+            for page in jobs:
+                for job in _items(get(page, "jobs")) or []:
+                    jname = tsv(alt(get(job, "name"), "-"))
+                    jconcl = tsv(alt(get(job, "conclusion"), "pending"))
+                    if not jname or self.is_advisory(jname):
+                        continue
+                    if jconcl == "success":
+                        built = True
+            if not built:
+                unbuilt.append(f"{wname} (no job succeeded)")
+        if unbuilt:
+            return TipPr("none", f"PR #{num}'s head {h8}, which GitHub merged cleanly as the tip {s8},"
+                         f" has no successful run of {', '.join(unbuilt)}: its green is about other"
+                         " workflows", num, head)
+        if rerun:
+            return TipPr("pending", f"PR #{num}'s head {h8}, which GitHub merged cleanly as the tip {s8},"
+                         f" is being re-run by {', '.join(rerun)}", num, head)
+        return TipPr(verdict, why, num, head)
+
+    def named_source(self, branch: str, sha: str, wants: Sequence[Want]) -> Source | None:
+        """``tip_named_source``: (b) the newest integration record at the tip, by its conclusion
+        time, else (a). Nothing is remembered between rounds: a PR head's runs can be re-run."""
+        at_tip = [r for r in self.records if r.sha == sha]
+        if at_tip:
+            at_tip.sort(key=lambda r: r.line().encode("utf-8", "surrogateescape"))
+            at_tip.sort(key=lambda r: r.when.encode("utf-8", "surrogateescape"), reverse=True)
+            rec = at_tip[0]
+            return Source(
+                "green" if rec.verdict == "pass" else "red",
+                f"source (b): integration record {rec.rid} ran the tip {rec.sha[:8]} and concluded"
+                f" {rec.verdict} ({rec.when})",
+                f"integration record {rec.rid}",
+            )
+        tp = self.tip_pr_head_verdict(branch, sha, wants)
+        if tp is None:
+            return None
+        name = f"PR #{tp.num}'s head run (roll-forward rule)"
+        if tp.verdict == "none":
+            return Source(tp.verdict, f"no integration record ran the tip {sha[:8]}, and {tp.why}", name)
+        return Source(tp.verdict, f"source (a): {tp.why}", name)
+
+    # --- the interim's deeper read ---
+
+    def older_runs(self, wid: str, ebranch: str, tip: str) -> tuple[int, str] | None:
+        """The hundred-deep read before an interim (ludics-lite#533): how many runs at another
+        commit have not completed, and the newest JUDGED conclusion among them ("none")."""
+        doc = self.gh_json(["api", f"repos/{self.repo}/actions/workflows/{wid}/runs"
+                            f"?branch={ebranch}&event=push&per_page=100"])
+        if isinstance(doc, (GhFailed, GhUnanswered)):
+            return None
+        runs = _items(get(doc, "workflow_runs"))
+        if runs is None:
+            return None
+        others = [r for r in runs if get(r, "head_sha") != tip]
+        # `sort_by(.created_at, .id) | reverse`: a stable ascending sort, then the whole list
+        # reversed -- ties come out in the reverse of the feed's order, as jq's do.
+        others.sort(key=lambda r: (_jq_order(get(r, "created_at")), _jq_order(get(r, "id"))))
+        others.reverse()
+        unfinished = sum(1 for r in others if get(r, "status") != "completed")
+        newest = next((jq_raw(get(r, "conclusion")) for r in others
+                       if get(r, "status") == "completed" and get(r, "conclusion") in _JUDGED), "none")
+        return unfinished, newest
+
+
+def _field(value: Json) -> str:
+    """The shell's ``map(if type == "string" and length > 0 then . else "-" end) | @tsv``."""
+    return tsv(value) if isinstance(value, str) and value else "-"
+
+
+def _jq_order(value: Json) -> tuple[int, float | str]:
+    """jq's sort order: null < false < true < numbers < strings < arrays < objects."""
+    if value is None:
+        return (0, 0)
+    if isinstance(value, bool):
+        return (2 if value else 1, 0)
+    if isinstance(value, (int, float)):
+        return (3, float(value))
+    if isinstance(value, str):
+        return (4, value)
+    return (5 if isinstance(value, list) else 6, _json_text(value))
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "rb") as handle:
+            return proc.decode(handle.read())
+    except OSError:
+        return ""
+
+
+def _read_first_line(path: str) -> str:
+    return _read_text(path).split("\n", 1)[0]
+
+
+# --- the command ------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Args:
+    repo: str
+    branch: str
+    wait_for: int
+    interim: bool
+    records: str
+
+
+def parse_args(args: Sequence[str], repo: str, knobs: Knobs) -> Args:
+    """The shell's parse, in its case order: the first SLASHED argument is the repo unless one is
+    already named -- branches carry slashes too (``claude/...``)."""
+    interim = False
+    records = ""
+    branch = ""
+    wait_text = "0"
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--interim":
+            interim = True
+        elif arg == "--integration-records":
+            if i + 1 >= len(args):
+                die("base: --integration-records takes a file")
+            records = args[i + 1]
+            i += 1
+        elif arg.startswith("--integration-records="):
+            records = arg[len("--integration-records="):]
+        elif "/" in arg:
+            if not repo:
+                repo = arg
+            else:
+                branch = arg
+        elif arg == "--wait":
+            wait_text = str(knobs.checks_wait)
+        elif arg.startswith("--wait="):
+            wait_text = arg[len("--wait="):]
+        elif arg.startswith("-"):
+            die(f"base: unknown option '{arg}'")
+        else:
+            branch = arg
+        i += 1
+    if not _DIGITS.fullmatch(wait_text):
+        die(f"base: --wait takes seconds, got '{wait_text}'")
+    return Args(repo, branch, int(wait_text), interim, records)
+
+
+def run(session: GhSession, args: list[str], *, clock: Clock | None = None,
+        shell: ShellRunner | None = None, env: Mapping[str, str] | None = None) -> int:
+    knobs = load_knobs(os.environ if env is None else env)
+    parsed = parse_args(args, session.config.repo, knobs)
+    records = load_records(parsed.records) if parsed.records else []
+    grace, interval = knobs.absent_grace, knobs.checks_interval
+    wait_for = parsed.wait_for
+    # A --wait sized to outlive the grace but not by a whole round gets ONE chance at the settle,
+    # and a warning says so (ludics-lite#175). Not a refusal: the last round is scheduled at the
+    # ceiling and does reach the settle, when the tip has not moved.
+    if grace > 0 and grace < wait_for < grace + interval:
+        warn(f"base: --wait={wait_for} is inside the {grace}s absence grace's own round",
+             f"(SHIP_PR_BASE_ABSENT_GRACE={grace}, SHIP_PR_CHECKS_INTERVAL={interval}).",
+             "It reaches the settle only on the single round scheduled at the ceiling, and only if the",
+             "tip has not moved — a tip that moves restamps the grace and no ceiling this close can then",
+             "reach it. Size it from the two knobs instead:",
+             f"--wait={grace + interval} or more (ludics-lite#175).")
+    repo = parsed.repo or repo_from_cwd() or ""
+    if not repo:
+        die("base: name the repo — `base owner/name [branch]`, --repo, or REPO=.",
+            "cwd inference only works from a checkout, and not from a background shell.")
+    base = Base(session, knobs, repo, clock=clock, shell=shell, records=records)
+    return Wait(base, parsed, records).run()
+
+
+class Wait:
+    """``cmd_base``'s loop: one round per tip read, until a break or, without --wait, once."""
+
+    def __init__(self, base: Base, args: Args, records: Sequence[Record]) -> None:
+        self.b = base
+        self.args = args
+        self.records = list(records)
+        self.repo = base.repo
+        self.branch = args.branch
+        self.ebranch = ""
+        self.wf: list[Want] | None = None
+        self.last_tip = ""
+        self.allruns: list[RunRow] = []
+        self.rerounds = 0
+        self.interim_name = ""
+        self.interim_why = ""
+        self.pushless_name = ""
+
+    def tip_read(self) -> str:
+        return self.b.tip_sha(self.ebranch)
+
+    def run(self) -> int:
+        b, repo = self.b, self.repo
+        knobs = b.knobs
+        grace, wait_for = knobs.absent_grace, self.args.wait_for
+        if not self.branch:
+            doc = b.gh_json(["api", f"repos/{repo}"])
+            branch = "" if isinstance(doc, (GhFailed, GhUnanswered)) else jq_raw(get(doc, "default_branch"))
+            if not branch:
+                fail(3, f"could not read {repo}'s default branch", f"({b.err_line()}) — the base's health"
+                     " is UNKNOWN, which is not 'fine'.")
+            self.branch = branch
+        branch = self.branch
+        self.ebranch = encode_ref(branch)
+        started = b.clock.now()
+        beat = grace_from = started
+        waited_note = ""
+        no_tip_verdict = False
+        interim_green = False
+        rnd = _Round()
+        tip = ""
+        while True:
+            rnd = _Round()
+            # Re-read every round: a push during the wait moves the goal with it.
+            tip = self.tip_read()
+            if not tip and wait_for != 0:
+                fail(3, f"could not read {repo} {branch}'s tip ({b.err_line()}) — base --wait cannot know",
+                     "which commit needs the verdict. This is UNKNOWN, not green: retry.")
+            # The workflow list is re-read whenever the observed tip moves: a sibling merge can ADD
+            # a workflow, and a stale list would never query it.
+            if tip != self.last_tip or not self.wf:
+                self.wf = b.workflow_list()
+                if self.wf is None:
+                    fail(3, f"could not read {repo}'s workflow list ({b.err_line()});",
+                         "the base's health is UNKNOWN, which is NOT 'green'.")
+            # The clock the interim's newcomer hold ages the tip on: taken BEFORE the reads, so an
+            # age measured on it can only come out short, which holds longer, never less.
+            snap_at = b.clock.now()
+            raw = self.read_runs(rnd)
+            if not raw:
+                rnd.uncovered = 1
+            else:
+                self.allruns = raw
+                self.judge(rnd, tip, raw)
+            if self.args.interim:
+                outcome = self.interim(rnd, tip, snap_at)
+                if outcome == "green":
+                    interim_green = True
+                elif outcome == "reround":
+                    self.rerounds += 1
+                    if tip != self.last_tip:
+                        if self.last_tip:
+                            grace_from = b.clock.now()
+                        self.last_tip = tip
+                    continue
+            if interim_green:
+                break
+            if wait_for <= 0:
+                break
+            # Only a red AT THE TIP ends the wait early, and only once the tip is confirmed.
+            if rnd.red_at_tip > 0 and self.tip_read() == tip:
+                break
+            now = b.clock.now()
+            # The grace runs from the last time the tip MOVED; the first observation does not
+            # restamp it (ludics-lite#156).
+            if tip != self.last_tip:
+                if self.last_tip:
+                    grace_from = now
+                self.last_tip = tip
+            if rnd.inflight == 0 and rnd.uncovered == 0 and not rnd.src_pending:
+                # A listed workflow with no push run on the branch: dispatch-only, or one the tip
+                # just added -- held until the tip has had that newcomer's creation window.
+                hold = False
+                if rnd.norun > 0:
+                    seen = ""
+                    for f in rnd.folded:
+                        if f.csha == tip and f.cwhen > seen:
+                            seen = f.cwhen
+                    age = _age_of(seen, b.clock.time())
+                    if age is not None and age < grace:
+                        hold = True
+                if not hold and self.tip_read() == tip:
+                    break
+            elif (rnd.uncovered > 0 and rnd.tip_unjudged == 0 and rnd.inflight == 0
+                  and not rnd.src_pending):
+                settle_why = ""
+                why = b.tip_within_paths_ignore(rnd.unrun, tip) if rnd.norun == 0 else None
+                if why is not None:
+                    settle_why = (
+                        "(every commit on the first-parent path from the judged commit up to the tip"
+                        f" changes only paths within the paths-ignore of {why}, so no run for it is"
+                        " coming — the verdicts above are about the commit each line names)")
+                elif now - grace_from >= grace:
+                    settle_why = (f"(waited {(now - started) // 60} min: no run for the tip appeared and"
+                                  " none is in flight for it — the verdicts above may trail it)")
+                # The settle accepts verdicts about an OLDER commit: confirm the tip first.
+                if settle_why and self.tip_read() == tip:
+                    waited_note = settle_why
+                    break
+            elif rnd.inflight == 0 and rnd.nogo_at_tip > 0 and now - grace_from >= grace:
+                waited_note = ("(the tip's newest run completed stopped-not-judged and no replacement"
+                               " appeared within the grace — NOT absence and NOT a verdict: re-run the"
+                               " workflow)")
+                no_tip_verdict = True
+                break
+            if not now - started < wait_for:
+                waited_note = (f"(--wait ceiling of {wait_for // 60} min reached with a run still"
+                               " unfinished or the tip unjudged — NOT a verdict for the tip)")
+                no_tip_verdict = True
+                break
+            if now - beat >= knobs.checks_heartbeat:
+                warn(f"still waiting on {repo} {branch}: {rnd.inflight} run(s) in flight,"
+                     f" {rnd.uncovered} workflow(s)",
+                     f"not yet judged at the tip, after {(now - started) // 60} min")
+                beat = now
+            remaining = started + wait_for - now
+            b.clock.sleep(min(knobs.checks_interval, remaining))
+        return self.report(rnd, tip, waited_note, no_tip_verdict, interim_green)
+
+    def read_runs(self, rnd: _Round) -> list[RunRow]:
+        """Each listed non-advisory workflow's push runs on the branch, a page of ten (a hundred
+        behind a page of ten that judged nothing, ludics-lite#535), each ordered newest first."""
+        b, repo, branch = self.b, self.repo, self.branch
+        raw: list[RunRow] = []
+        for wid, wname in self.wf or []:
+            if not wid or b.is_advisory(wname):
+                continue
+            rows = b.runs_page(wid, self.ebranch, 10)
+            if rows is None:
+                fail(3, f"could not read {repo}'s '{wname}' runs on {branch}",
+                     f"({b.err_line()}); the base's health is UNKNOWN, which is NOT 'green'.")
+            if len(rows) >= 10 and not page_judged(rows):
+                rows = b.runs_page(wid, self.ebranch, 100)
+                if rows is None:
+                    fail(3, f"could not read {repo}'s '{wname}' runs on {branch} past its newest ten,",
+                         f"none of which judged it ({b.err_line()}); the base's health is UNKNOWN,"
+                         " which is NOT 'green'.")
+                if len(rows) >= 100 and not page_judged(rows):
+                    rnd.exhausted_wids.add(wid)
+            if rows:
+                raw.extend(newest_first(rows, lambda r: r.created_at, lambda r: r.run_id,
+                                        lambda r: r.line()))
+            else:
+                # Listed, with no push run here yet: still unjudged at the tip (the newcomer).
+                rnd.norun += 1
+                rnd.norun_ids.append((wid, wname))
+        return raw
+
+    def judge(self, rnd: _Round, tip: str, raw: list[RunRow]) -> None:
+        """The fold's verdict per workflow, the report's lines, and the round's counts."""
+        b, repo, branch = self.b, self.repo, self.branch
+        rnd.folded = fold(raw)
+        out: list[str] = []
+        for f in rnd.folded:
+            name, status, sha = f.name, f.status, f.sha
+            concl, csha, cwhen, curl = f.concl, f.csha, f.cwhen, f.curl
+            if not name or b.is_advisory(name):
+                continue
+            trig_note = ""
+            # A workflow whose newest judged run is not the tip's is asked whether its file at the
+            # tip still runs on push (ludics-lite#401); one that does not is set aside, and the
+            # tip's verdict for it comes from a named source below.
+            if not tip or f.vsha != tip:
+                trigger = b.push_trigger(f.wfid, tip or self.ebranch)
+                if trigger is None:
+                    fail(3, f"could not read {repo}'s '{name}' workflow file at the tip"
+                         f" {tip or 'of ' + branch}",
+                         f"({b.err_line()}): whether it still runs on push is UNKNOWN, which is NOT 'green'.")
+                if trigger.kind == "pushless" and not tip:
+                    fail(3, f"could not read {repo} {branch}'s tip, and '{name}' no longer runs on push:"
+                         " only a", "source about the tip can judge it, so the base's verdict is UNKNOWN,"
+                         " which is NOT 'green'.")
+                match trigger.kind:
+                    case "pushless":
+                        rnd.pushless.append((f.wfid, name))
+                        out.append(f"  retired  {name} — no push trigger at the tip, so its newest judged"
+                                   f" push run ({f.vconcl} at {f.vsha[:8]}) is history, not the tip's"
+                                   " verdict\n")
+                        continue
+                    case "unparsed":
+                        trig_note = (f"           ({name}'s file at the tip could not be parsed for its"
+                                     " triggers, so it is read as a push workflow)\n")
+                    case "absent":
+                        trig_note = (f"           ({name}'s file is not at the tip, so its standing"
+                                     " verdict is read as it was before ludics-lite#401)\n")
+                    case "push":
+                        pass
+                    case _:
+                        assert_never(trigger.kind)
+            if status != "completed":
+                rnd.inflight += 1
+            # The tip's OWN run in flight: what a merge burst leaves on every tip (#308).
+            fly = status != "completed" and bool(tip) and sha == tip
+            if fly:
+                rnd.tipfly.append((f.wfid, name))
+            if not (tip and f.vsha == tip):
+                rnd.uncovered += 1
+                if not fly:
+                    rnd.uncov_nofly += 1
+                # WHICH absence: a run for the tip EXISTS and has not judged it (only it can
+                # answer), or none exists (the not-created-yet window, or a filtered push).
+                if any(r.wid == f.wfid and r.head_sha == tip for r in self.allruns):
+                    rnd.tip_unjudged += 1
+                else:
+                    rnd.unrun.append((f.wfid, name, f.vsha))
+            if conclusion_class(concl) == "nogo" and tip and csha == tip:
+                rnd.nogo_at_tip += 1
+            # The newest JUDGED run carries the verdict; a stopped run over it is context.
+            stopped_note = ""
+            if conclusion_class(concl) == "nogo" and f.vsha != "-":
+                stopped_note = (f"           (newest completed run: {concl} at {csha[:8]}, stopped not"
+                                " judged — verdict above is the newest judged run)\n")
+                concl, csha, cwhen, curl = f.vconcl, f.vsha, f.vwhen, f.vurl
+            klass = conclusion_class(concl)
+            match klass:
+                case "red":
+                    rnd.red += 1
+                    if tip and csha == tip:
+                        rnd.red_at_tip += 1
+                    out.append(f"  RED      {name} — {concl} at {csha[:8]} ({cwhen})  {curl}\n")
+                    out.append(b.red_detail(f.wfid, self.allruns))
+                case "green":
+                    out.append(f"  green    {name} — {concl} at {csha[:8]}\n")
+                case "pending":
+                    rnd.pend += 1
+                    if status != "completed":
+                        rnd.pend_fly += 1
+                        out.append(f"  pending  {name} — no run of it has finished on {branch} yet, and"
+                                   " one is in flight\n")
+                    else:
+                        out.append(f"  no verdict  {name} — has never completed on {branch}\n")
+                case "nogo":
+                    rnd.pend += 1
+                    if status != "completed":
+                        rnd.pend_fly += 1
+                        out.append(f"  pending  {name} — {concl} at {csha[:8]} (stopped, not judged; no"
+                                   " earlier judged run in the window), and a later run is in flight"
+                                   f"  {curl}\n")
+                    else:
+                        out.append(f"  no verdict  {name} — {concl} at {csha[:8]} (stopped, not judged;"
+                                   f" no earlier judged run in the window)  {curl}\n")
+                case _:
+                    assert_never(klass)
+            out.append(stopped_note + trig_note)
+            if f.wfid in rnd.exhausted_wids:
+                rnd.exhausted.append(name)
+                out.append(f"           ({name}: none of its newest 100 push runs on {branch} judged it,"
+                           " and this read stops there — a judged run further back, a red included, is"
+                           " not seen: no verdict, never green)\n")
+            if csha == "-":
+                csha = ""
+            if status != "completed":
+                out.append(f"           ({name} is running now at {sha[:8]})\n")
+            elif tip and csha and csha != tip:
+                out.append(f"           (that verdict is about {csha[:8]}, not the tip {tip[:8]})\n")
+        # The retired workflows get the tip's verdict from a NAMED source, once for all of them.
+        if rnd.pushless:
+            names = rnd.pushless_names
+            src = b.named_source(branch, tip, rnd.pushless)
+            if src is None:
+                fail(3, f"could not read a verdict source for {repo} {branch}'s tip {tip[:8]}",
+                     f"({b.err_line()}): the tip's verdict is UNKNOWN, which is NOT 'green'.")
+            match src.verdict:
+                case "green":
+                    out.append(f"  green    {names} — {src.why}\n")
+                case "red":
+                    rnd.red += 1
+                    rnd.red_at_tip += 1
+                    out.append(f"  RED      {names} — {src.why}\n")
+                case "pending":
+                    rnd.pend += 1
+                    rnd.src_pending = True
+                    out.append(f"  no verdict  {names} — not yet: {src.why}\n")
+                case "none":
+                    rnd.pend += 1
+                    rnd.src_none = True
+                    out.append(f"  no verdict  {names} — no named source judges the tip: {src.why}\n")
+                case _:
+                    assert_never(src.verdict)
+            self.pushless_name = src.name
+        rnd.out += "".join(out)
+
+    def interim(self, rnd: _Round, tip: str, snap_at: int) -> Literal["green", "reround", "no"]:
+        """The INTERIM verdict (ludics-lite#308), under --interim only: nothing red, every workflow
+        still owed a verdict at the tip has the tip's own run in flight, and nothing else is in
+        flight on the branch -- then a named source's green for exactly those workflows is an
+        interim green. A failed integration record at the tip is the tip's red, read first."""
+        b, repo, branch = self.b, self.repo, self.branch
+        if not rnd.tipfly:
+            return "no"
+        names = rnd.tipfly_names
+        if any(r.sha == tip for r in self.records):
+            src = b.named_source(branch, tip, rnd.tipfly)
+            if src is not None and src.verdict == "red":
+                rnd.red += 1
+                rnd.red_at_tip += 1
+                rnd.out += f"  RED      {names} — its push run is still in flight, but {src.why}\n"
+        pushless_wids = {wid for wid, _ in rnd.pushless}
+        # EVERY row read, not the fold's newest per workflow: an older run beside the tip's.
+        older_fly = sum(1 for r in self.allruns if r.wid != "" and r.status != "completed"
+                        and r.head_sha != tip and r.wid not in pushless_wids)
+        if older_fly == 0 and rnd.exhausted:
+            older_fly = 1
+            rnd.out += (f"           (no interim verdict: none of the newest 100 push runs of"
+                        f" {', '.join(rnd.exhausted)} judged the branch, and nothing past them was read)\n")
+        if older_fly == 0:
+            # The burst a page of ten cannot hold (#533): each tip workflow read a hundred deep.
+            for wid, wname in rnd.tipfly:
+                older = b.older_runs(wid, self.ebranch, tip)
+                if older is None:
+                    older_fly = 1
+                    rnd.out += (f"           (no interim verdict for {wname}: its push runs could not be"
+                                f" read past the first page ({b.err_line()}))\n")
+                    break
+                n_open, newest = older
+                older_fly += n_open
+                if conclusion_class(newest) == "red":
+                    older_fly += 1
+                    rnd.out += (f"           (no interim verdict for {wname}: its newest judged push run"
+                                f" at an older commit is {newest} — the burst's verdict, not the PR"
+                                " head's)\n")
+        if not (rnd.red == 0 and not rnd.src_pending and not rnd.src_none
+                and rnd.inflight == len(rnd.tipfly) and rnd.uncov_nofly == 0 and older_fly == 0
+                and (self.args.wait_for > 0 or rnd.pend > 0)):
+            return "no"
+        src = b.named_source(branch, tip, rnd.tipfly)
+        if src is None:
+            rnd.out += (f"           (no interim verdict for {names}: a verdict source could not be read"
+                        f" ({b.err_line()}))\n")
+            return "no"
+        if src.verdict != "green":
+            rnd.out += f"           (no interim verdict for {names}: {src.why})\n"
+            return "no"
+        self.interim_name, self.interim_why = src.name, src.why
+        hold_why = ""
+        moved = False
+        grace = b.knobs.absent_grace
+        for wid, wname in rnd.norun_ids:
+            trigger = b.push_trigger(wid, tip)
+            if trigger is None:
+                hold_why = (f"whether {wname}, which has no push run on {branch}, runs on push could not"
+                            f" be read ({b.err_line()})")
+                break
+            if trigger.kind == "pushless":
+                continue
+            seen = ""
+            for r in self.allruns:
+                if r.head_sha == tip and r.created_at > seen:
+                    seen = r.created_at
+            at = iso_seconds(seen)
+            if at is None:
+                hold_why = (f"{wname} may run on push and has no run on {branch}, and the tip's age could"
+                            " not be read")
+                break
+            age = max(0, math.floor(snap_at - at))
+            if age < grace:
+                hold_why = (f"{wname} may run on push and has no run on {branch} yet, and the tip is"
+                            f" {age}s old, inside the {grace}s window its first run may still appear in")
+                break
+        if not hold_why:
+            # The tip's runs read again, by id: one that finished meanwhile is the tip's verdict.
+            for wid, wname in rnd.tipfly:
+                rid = next((r.run_id for r in self.allruns if r.wid == wid), "")
+                status = ""
+                if _DIGITS.fullmatch(rid):
+                    doc = b.gh_json(["api", f"repos/{repo}/actions/runs/{rid}"])
+                    if not isinstance(doc, (GhFailed, GhUnanswered)):
+                        status = tsv(alt(get(doc, "status"), "-"))
+                if not status:
+                    hold_why = (f"the tip's run of {wname} could not be read again after the source"
+                                f" ({b.err_line()})")
+                    break
+                if status == "completed":
+                    hold_why = (f"the tip's run of {wname} finished while the source was read, so it is"
+                                " the tip's verdict")
+                    moved = True
+                    break
+        if not hold_why and self.tip_read() != tip:
+            hold_why = "the tip moved while the source was read"
+            moved = True
+        if not hold_why:
+            return "green"
+        if moved and self.rerounds < 2:
+            return "reround"
+        rnd.out += f"           (no interim verdict for {names}: {hold_why})\n"
+        return "no"
+
+    def report(self, rnd: _Round, tip: str, waited_note: str, no_tip_verdict: bool,
+               interim_green: bool) -> int:
+        repo, branch, out = self.repo, self.branch, rnd.out
+        t8 = tip[:8]
+        at_tip = f" (tip {t8})" if tip else ""
+        if waited_note:
+            cli.say(waited_note)
+        # A wait that ended WITHOUT the tip's verdict says so before the red branch: an older
+        # tip's red is not the tip's.
+        if no_tip_verdict:
+            if rnd.tipfly:
+                cli.say(f"{repo} {branch}: NO VERDICT for the tip {t8} — pending: its own run of"
+                        f" {rnd.tipfly_names} is still in flight; not green, not red (see above)")
+            else:
+                cli.say(f"{repo} {branch}: NO VERDICT for the tip{' ' + t8 if tip else ''} — not green,"
+                        " not red (see above)")
+            sys.stdout.write(out)
+            return 4
+        if interim_green:
+            judged = f"; {rnd.pushless_names} judged by {self.pushless_name}" if rnd.pushless else ""
+            cli.say(f"{repo} {branch}: green, interim (tip {t8}; {rnd.tipfly_names} still running at"
+                    f" the tip, judged meanwhile by {self.interim_name}{judged})")
+            sys.stdout.write(out + f"  interim  {rnd.tipfly_names} — the tip's own run is in flight;"
+                             f" {self.interim_why}\n")
+            return 0
+        if rnd.red > 0:
+            cli.say(f"!!! {repo} {branch} is RED — {rnd.red} workflow(s) failed on the tip you are about"
+                    " to branch from")
+            sys.stdout.write(out)
+            cli.say("!!! Branching off a red base makes every later 'is this my change?' question"
+                    " expensive.")
+            cli.say("!!! Read the run above first: if it is already broken, say so before starting, and"
+                    " do not")
+            cli.say("!!! spend the session bisecting someone else's break.")
+            return 1
+        if not out:
+            cli.say(f"{repo} {branch}: no build workflow has run on it (nothing to read, not a green"
+                    " light)")
+            return 4
+        if rnd.exhausted:
+            cli.say(f"{repo} {branch}: NO VERDICT{at_tip} — none of the newest 100 push runs of"
+                    f" {', '.join(rnd.exhausted)} judged the branch, and the read stops there; a red"
+                    " further back is not seen; not green, not red")
+            sys.stdout.write(out)
+            return 4
+        if rnd.src_none or rnd.src_pending:
+            cli.say(f"{repo} {branch}: NO VERDICT (tip {t8}) — {rnd.pushless_names} no longer run(s) on"
+                    " push, and no named source has judged the tip; an older verdict is not the tip's"
+                    " (see below)")
+            sys.stdout.write(out)
+            return 4
+        if rnd.pend > 0 and rnd.pend_fly == rnd.pend:
+            cli.say(f"{repo} {branch}: NO VERDICT YET{at_tip} — pending: a run is in flight, and no"
+                    " finished run in the window judged the branch; not green, not red")
+            sys.stdout.write(out)
+            return 4
+        if rnd.pend > 0:
+            cli.say(f"{repo} {branch}: NO VERDICT{at_tip} — some workflow was never judged here; not"
+                    " green, not red")
+            sys.stdout.write(out)
+            return 4
+        if rnd.pushless:
+            cli.say(f"{repo} {branch}: green (tip {t8}; {rnd.pushless_names} judged by"
+                    f" {self.pushless_name})")
+        else:
+            cli.say(f"{repo} {branch}: green{at_tip}")
+        sys.stdout.write(out)
+        return 0
+
+
+# SHARED-CANDIDATE: age_of
+def _age_of(stamp: str, now: float) -> int | None:
+    """``age_of``: whole seconds since an ISO timestamp, or None (the shell's "-") when there is
+    nothing to measure from -- including a stamp in the future."""
+    if not stamp:
+        return None
+    at = iso_seconds(stamp)
+    if at is None:
+        return None
+    age = math.floor(now - at)
+    return age if age >= 0 else None
