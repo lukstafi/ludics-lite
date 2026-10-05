@@ -598,7 +598,9 @@ test_the_quiet_exit_names_the_head_and_what_scrolled_past() {
 
 # The polling budget (ludics-lite#543): a window whose state does not move backs off from the
 # interval toward the review cap, so a quiet 900s window at the 90s interval reads five times, not
-# eleven. The last pause that would run past the window is not taken.
+# eleven. The last pause that would run past the window is not taken. A subshell case, like the
+# others that redefine sleep, so it is listed after the cases that make the snapshot directory in
+# the suite's own shell (one made in a subshell outlives it).
 test_an_unmoving_window_backs_off_to_the_review_cap() (
   sleep() {
     printf '%s\n' "$1" >>"$TEST_ROOT/sleeps"
@@ -1778,7 +1780,6 @@ test_an_approval_beside_a_final_poll_round_is_checked_too() {
 
 tests=(
   test_the_about_codex_block_is_folded_to_one_line
-  test_an_unmoving_window_backs_off_to_the_review_cap
   test_what_is_not_the_about_codex_block_renders_as_is
   test_a_quoted_opener_above_the_block_keeps_the_findings
   test_a_broken_jq_program_fails_the_poll_round
@@ -1802,6 +1803,7 @@ tests=(
   test_the_ending_line_claims_only_the_rounds_the_window_opened
   test_the_round_label_costs_no_request
   test_the_round_span_is_the_whole_watch
+  test_an_unmoving_window_backs_off_to_the_review_cap
   test_the_missing_environment_ends_the_wait_with_the_nudge
   test_the_connector_thread_reply_opens_no_round
   test_an_extension_holds_through_unknown_status

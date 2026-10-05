@@ -815,9 +815,11 @@ gh_err_line() {
 # any other message is still the API's answer. The probe reads its own answer: the headers up to
 # the first blank line, and the body after it in quota_failure's words (GraphQL answers an
 # exhausted quota with a 200). A probe addresses the call's own endpoint: the one positional of
-# `api`, `repos/<repo>/actions/runs/<id>` for `run view`, and `graphql` for every other gh
-# command, since gh's pr and issue commands ride GraphQL, which has its own quota. The budget
-# covers github.com only: a call naming another `--hostname` is neither held nor probed. The hold
+# `api`, `repos/<repo>/actions/runs/<id>` (or `.../jobs/<id>` with `--job`) for `run view`, and
+# `graphql` for every other gh command, since gh's pr and issue commands ride GraphQL, which has
+# its own quota. A call whose endpoint cannot be told sets no hold. The budget covers github.com
+# only: a call to another host (`--hostname`, or GH_HOST with none named) is neither held nor
+# probed, and every probe names github.com. The hold
 # is per state directory, not per account: another host learns of the quota from its own first
 # refusal. Every gh call passes the hold's gate: gh_retry's, and repo_from_cwd's `gh repo view`.
 # An observer counts as live while `kill -0` reaches its pid, so a pid the OS has reused reads as
@@ -873,7 +875,7 @@ quota_failure() {
 
 # budget_endpoint <gh args...>: the endpoint a call addresses (see BOUNDARY).
 budget_endpoint() {
-  local a skip="" repo="" id=""
+  local a skip="" repo="" id="" job=""
   case "${1:-}" in
   api)
     shift
@@ -904,19 +906,28 @@ budget_endpoint() {
     for a in "$@"; do
       case "$skip" in
       repo) repo="$a" skip="" && continue ;;
+      job) job="$a" skip="" && continue ;;
       value) skip="" && continue ;;
       esac
       case "$a" in
       --repo | -R) skip=repo ;;
       --repo=*) repo="${a#--repo=}" ;;
-      --json | --jq | -q | --template | -t | --attempt | -a | --job | -j) skip=value ;;
+      --job | -j) skip=job ;;
+      --job=*) job="${a#--job=}" ;;
+      --json | --jq | -q | --template | -t | --attempt | -a) skip=value ;;
       -*) ;;
       *) [ -n "$id" ] || id="$a" ;;
       esac
     done
     # gh reads GH_REPO when no -R names one (`gh help environment`).
     [ -n "$repo" ] || repo="${GH_REPO:-}"
-    [ -n "$repo" ] && [ -n "$id" ] && printf 'repos/%s/actions/runs/%s' "$repo" "$id"
+    [ -n "$repo" ] || return 0
+    # `--job <id>` reads that job (the run id is optional then), so it is the endpoint.
+    if [ -n "$job" ]; then
+      printf 'repos/%s/actions/jobs/%s' "$repo" "$job"
+    elif [ -n "$id" ]; then
+      printf 'repos/%s/actions/runs/%s' "$repo" "$id"
+    fi
     ;;
   *) printf 'graphql' ;;
   esac
@@ -924,22 +935,24 @@ budget_endpoint() {
 }
 
 # budget_scope <gh args...>: status 0 when the call is github.com's, the one host the budget
-# covers. A call naming another `--hostname` (an Enterprise server) has a quota of its own, which
-# this file neither holds nor probes.
+# covers. A call to another host (an Enterprise server) has a quota of its own, which this file
+# neither holds nor probes: one naming another `--hostname`, or naming none while GH_HOST names
+# another (gh reads GH_HOST when a command names no host, `gh help environment`).
 budget_scope() {
-  local a next=""
+  local a next="" host=""
   for a in "$@"; do
     if [ -n "$next" ]; then
-      [ "$a" = github.com ] || return 1
+      host="$a"
       next=""
       continue
     fi
     case "$a" in
     --hostname) next=1 ;;
-    --hostname=*) [ "${a#--hostname=}" = github.com ] || return 1 ;;
+    --hostname=*) host="${a#--hostname=}" ;;
     esac
   done
-  return 0
+  [ -n "$host" ] || host="${GH_HOST:-github.com}"
+  [ "$host" = github.com ]
 }
 
 # budget_probe <endpoint>: one request to the endpoint with its headers (`gh api -i`), not through
@@ -1239,7 +1252,13 @@ budget_quota_hit() {
     hold_set "$ep" unprobed
     return 0
   fi
-  hold_set "$ep" "$(budget_probe "$ep")"
+  # Again under the lock: another refusal may have probed and set a hold between the check above
+  # and the lock.
+  if hold_read && [ "$HOLD_UNTIL" -gt "$(budget_now)" ]; then
+    hold_set "$ep" unprobed
+  else
+    hold_set "$ep" "$(budget_probe "$ep")"
+  fi
   rm -rf "$BUDGET_DIR/quota-probe"
 }
 

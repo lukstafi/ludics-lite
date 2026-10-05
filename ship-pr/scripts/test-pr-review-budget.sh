@@ -564,6 +564,36 @@ test_a_probe_follows_the_environment_gh_reads() {
   assert_not_contains "$(requests)" "probe to" "on github.com, named on the probe itself"
 }
 
+# The hold is checked again once the probe lock is held: another refusal can probe and set a hold
+# between the first check and the lock, and a second probe then would be the burst again.
+test_a_hold_set_before_the_lock_stops_the_probe() {
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 7200))
+  # The lock is taken by a stand-in that lets the other refusal win the race first. It is defined
+  # inside the subshell, at run time, so it replaces the library's for this one call only.
+  (
+    eval 'lock_take() {
+      plant_hold "$((T0 + 600))" graphql 600
+      mkdir "$1" && printf "%s\n%s\n" "$$" "$T0" >"$1/owner"
+    }'
+    budget_quota_hit api "repos/$REPO/pulls/7"
+  ) 2>/dev/null
+  assert_eq "$(requests)" "" "no probe once a hold stands under the lock"
+  assert_eq "$(cat "$STATE_DIR/quota-holds"/[0-9]* | cut -f1 | sort | tr '\n' ' ')" "graphql repos/$REPO/pulls/7 " \
+    "the refusal's entry is added unprobed"
+}
+
+# GH_HOST names the host of a call that names none, so an Enterprise GH_HOST puts it out of scope,
+# unless the call names github.com itself. A job-only run view reads the job.
+test_the_scope_and_the_job_read_what_gh_reads() {
+  local rc
+  rc=0; GH_HOST=ghe.example.com budget_scope api "repos/$REPO/pulls/7" || rc=$?
+  assert_eq "$rc" 1 "a GH_HOST naming another host puts a call out of scope"
+  rc=0; GH_HOST=ghe.example.com budget_scope api --hostname github.com "repos/$REPO/pulls/7" || rc=$?
+  assert_eq "$rc" 0 "unless the call names github.com"
+  assert_eq "$(budget_endpoint run view --job 456 --repo o/r)" "repos/o/r/actions/jobs/456" "--job reads the job"
+}
+
 test_a_lock_that_cannot_be_made_is_an_error() {
   local rc=0
   reset_fixture
@@ -683,6 +713,8 @@ run_tests \
   test_a_lock_that_cannot_be_made_is_an_error \
   test_refusals_behind_a_hold_or_a_probe_are_not_probed \
   test_a_probe_follows_the_environment_gh_reads \
+  test_a_hold_set_before_the_lock_stops_the_probe \
+  test_the_scope_and_the_job_read_what_gh_reads \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
