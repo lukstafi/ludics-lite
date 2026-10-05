@@ -29,6 +29,7 @@ function through the shell bridge (see ``ludics.proc``).
 """
 
 import json
+import os
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -246,12 +247,21 @@ _Q_SPECIAL = frozenset(" \t\n'\"\\|&;()<>!{}*[]?^$`,")
 
 
 def shell_quote(word: str) -> str:
-    """An approximation of bash's ``printf '%q'``, used only to print a refused call so it can be
-    found in the source: ``''`` for empty, ``$'...'`` when a control or non-ASCII character is in
-    it (bash 3.2's form; bash 5 leaves printable UTF-8 alone), otherwise backslashes before the
-    characters bash quotes. Not a contract: no caller parses it back."""
+    """bash's ``printf '%q'``, for a refused call's message and the paths of the open threads the
+    `unresolved` state names (which the shell's merge gate names with printf %q too). ASCII is
+    quoted here: ``''`` for empty, ``$'...'`` when a control character is in it, otherwise
+    backslashes before the characters bash quotes. A word with non-ASCII in it is quoted by bash
+    itself: what printf %q makes of it depends on the locale and the platform's C library (under
+    a UTF-8 locale on macOS ``naïve`` stays as is and ``€`` turns the word into ``$'...'``), which
+    no table here would track. The bash is the one the forwarding shell ran (the bridge's), else
+    the one on PATH, as pr-review.sh's ``#!/usr/bin/env bash`` finds it; without one, the C
+    locale's form below."""
     if word == "":
         return "''"
+    if any(ord(c) >= 128 for c in word):
+        quoted = _bash_printf_q(word)
+        if quoted is not None:
+            return quoted
     if any(ord(c) < 32 or ord(c) >= 127 for c in word):
         out: list[str] = []
         named = {"\n": "\\n", "\t": "\\t", "\r": "\\r", "\a": "\\a", "\b": "\\b", "\f": "\\f",
@@ -266,6 +276,15 @@ def shell_quote(word: str) -> str:
         return "$'" + "".join(out) + "'"
     quoted = "".join("\\" + c if c in _Q_SPECIAL else c for c in word)
     return "\\" + quoted if quoted.startswith("#") else quoted
+
+
+def _bash_printf_q(word: str) -> str | None:
+    bash = os.environ.get(proc.BRIDGE_SHELL, "") or "bash"
+    try:
+        done = proc.run_tool(bash, ["-c", 'printf %q "$1"', "bash", word])
+    except (OSError, ValueError):  # ValueError: a NUL, which no argv (and no bash word) holds
+        return None
+    return done.stdout if done.rc == 0 and done.stdout else None
 
 
 # --- the gh call ----------------------------------------------------------------------------------

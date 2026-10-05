@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import os
 import unittest
 from collections.abc import Sequence
 
@@ -250,10 +251,26 @@ class ShellQuote(unittest.TestCase):
             ("#c", "\\#c"),
             ("d#", "d#"),
             ("e\nf", "$'e\\nf'"),
-            ("é", "$'\\303\\251'"),
             ("$(x)'\"", "\\$\\(x\\)\\'\\\""),
         ):
             self.assertEqual(core.shell_quote(word), want, word)
+
+    def test_non_ascii_is_bash_s_own_under_every_locale(self) -> None:
+        # printf %q of non-ASCII depends on the locale and the C library: under a UTF-8 locale
+        # macOS's bash leaves "naïve" alone, which a fixed $'...' table quoted (#403 review).
+        words = ("docs/naïve.md", "a b/ï.md", "#ï", "x$y€", "tab\tï", "é'q", "é")
+        saved = os.environ.get("LC_ALL")
+        try:
+            for locale in ("C", "en_US.UTF-8", "C.UTF-8"):
+                os.environ["LC_ALL"] = locale
+                for word in words:
+                    want = proc.run_tool("bash", ["-c", 'printf %q "$1"', "bash", word]).stdout
+                    self.assertEqual(core.shell_quote(word), want, f"{locale}: {word}")
+        finally:
+            if saved is None:
+                os.environ.pop("LC_ALL", None)
+            else:
+                os.environ["LC_ALL"] = saved
 
 
 class Refs(unittest.TestCase):
