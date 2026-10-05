@@ -47,15 +47,18 @@ class Done:
         return self.rc == UNREACHABLE
 
 
+# SHARED-CANDIDATE: is_local
 def is_local(cfg: Config, box: str) -> bool:
     return box == "local" or (cfg.local_box != "" and box == cfg.local_box)
 
 
+# SHARED-CANDIDATE: fleet_name
 def fleet_name(cfg: Config, box: str) -> str:
     """A configured box as a fleet name: ``local`` is this box's own name, when it has one."""
     return cfg.local_box if box == "local" and cfg.local_box else box
 
 
+# SHARED-CANDIDATE: emit_var
 def emit_var(name: str, value: str) -> str:
     """A far-side assignment: a leading literal ``$HOME/`` stays expandable there, the rest quoted."""
     if value.startswith("$HOME/"):

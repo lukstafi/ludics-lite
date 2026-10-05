@@ -37,6 +37,7 @@ UNSET_FOR_CHECKER = (
 )
 
 
+# SHARED-CANDIDATE: base_checker
 def base_checker(cfg: Config, argv: list[str]) -> int:
     """Run the checker with the gate's own policy, its stdout on our stderr."""
     env = {k: v for k, v in cfg.env.items() if k not in UNSET_FOR_CHECKER}
@@ -84,6 +85,7 @@ def integration_rows(records: list[dict[str, Any]], repo: str) -> str:
     return "\n".join(rows)
 
 
+# SHARED-CANDIDATE: integration_records
 def integration_records(cfg: Config, repo: str) -> str | None:
     """The rows, or None when the registry could not be read (which refuses the gate: a failed
     record there would outrank a green PR head)."""
@@ -118,6 +120,7 @@ def _remove(path: str) -> None:
         pass
 
 
+# SHARED-CANDIDATE: base_gate
 def base_gate(cfg: Config, target: str, branch: str, force: bool, reason: str) -> int:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target):
         die("base gate: --target-repo <owner/repo> required")

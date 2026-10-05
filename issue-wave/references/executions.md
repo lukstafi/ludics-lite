@@ -3,9 +3,10 @@
 Use `fleet-worker.sh execution` for every worker correctness or measurement run on a fleet box
 and every coordinator integration run, with either provider and any transport: a CLI worker
 running tests on its own agent host exactly as much as a native worker driving that host over
-ssh. Agent residence never grants execution ownership. Python 3 is required on the anchor, and
-on every box that runs batches (`execution slot`'s lock is a python3 flock); the per-box
-preflight checks it. State lives in `FLEET_ANCHOR_STATE/executions`, under the existing
+ssh. Agent residence never grants execution ownership. Python 3.12 or newer is required on the
+anchor, where the registry runs, and on every box that runs batches, where `execution slot` runs
+through `scripts/py` (ludics-lite#403); the per-box preflight checks for a python3 with fcntl, not
+yet for its version. State lives in `FLEET_ANCHOR_STATE/executions`, under the existing
 coordinator lease lock. Use the same fleet environment as `claim`.
 
 The vocabulary is SKILL.md's: a worker *requests*, the coordinator *reserves* (one record in
