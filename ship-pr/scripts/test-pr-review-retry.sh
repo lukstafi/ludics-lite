@@ -908,6 +908,67 @@ test_a_plain_retry_keeps_its_exits_apart() {
   assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "by the read policy"
 }
 
+# --- the await's own edges (pinned before the v2 port, ludics-lite#403) --------------------------
+
+# The interval is seconds and at least one (10b94dd, f46932e): a zero would busy-loop the API for
+# the whole two-hour ceiling. Both spellings of the flag take a value.
+test_the_await_interval_is_whole_seconds_above_zero() {
+  reset_fixture
+  run_await -i 0 example/repo#4242
+  assert_eq "$AWAIT_RC" 2 "a zero interval is refused ($AWAIT_OUT)"
+  assert_contains "$AWAIT_OUT" "the interval must be at least 1 second, got '0'" "and says why"
+  reset_fixture
+  run_await --interval=soon example/repo#4242
+  assert_eq "$AWAIT_RC" 2 "a non-numeric interval is refused ($AWAIT_OUT)"
+  assert_contains "$AWAIT_OUT" "the interval must be seconds, got 'soon'" "and says why"
+  assert_eq "$(gh_calls)" "" "neither reads anything"
+  reset_fixture
+  run_await -i=5 example/repo#4242
+  assert_eq "$AWAIT_RC" 0 "a whole number of seconds is accepted ($AWAIT_OUT)"
+}
+
+# A pasted `gh run watch` line keeps working: the two native flags this await subsumes are no-ops,
+# and every OTHER flag is refused rather than dropped (09b2453) — a discarded flag is how a typo'd
+# repo flag becomes a watch against whatever REPO resolves to.
+test_the_await_takes_the_native_no_ops_and_refuses_other_flags() {
+  reset_fixture
+  run_await --exit-status --compact example/repo#4242
+  assert_eq "$AWAIT_RC" 0 "the native no-ops are accepted ($AWAIT_OUT)"
+  reset_fixture
+  run_await --repo-typo example/repo example/repo#4242
+  assert_eq "$AWAIT_RC" 2 "an unknown flag is refused ($AWAIT_OUT)"
+  assert_contains "$AWAIT_OUT" "unsupported flag '--repo-typo'" "naming it"
+  assert_eq "$(gh_calls)" "" "and nothing is read"
+}
+
+# A run stopped without a verdict (a cancel, a superseding push) is exit 4, never red and never
+# green (10b94dd).
+test_a_cancelled_run_is_stopped_not_judged() {
+  reset_fixture
+  RUN_CONCLUSION=cancelled
+  run_await example/repo#4242
+  assert_eq "$AWAIT_RC" 4 "a cancel is no verdict ($AWAIT_OUT)"
+  assert_contains "$AWAIT_OUT" "concluded cancelled — stopped, not judged" "and says so"
+}
+
+# A long await says it is still waiting, at the heartbeat, and never sleeps past its own deadline
+# (0c4580d): an interval longer than what is left is capped at what is left.
+test_the_await_beats_and_never_sleeps_past_its_deadline() {
+  local started
+  reset_fixture
+  retune CHECKS_HEARTBEAT=0
+  RUN_STATUS=in_progress
+  RUN_CONCLUSION=""
+  AWAIT_WAIT=2
+  started=$SECONDS
+  run_await -i 600 example/repo#4242
+  assert_eq "$AWAIT_RC" 4 "still running at the deadline is no verdict ($AWAIT_OUT)"
+  assert_contains "$AWAIT_OUT" "still waiting on run 4242 in example/repo: in_progress after 0 min" \
+    "the heartbeat says what it is waiting on"
+  [ $((SECONDS - started)) -lt 60 ] ||
+    bail "a 600s interval slept past a 2s deadline ($((SECONDS - started))s)"
+}
+
 # --- the shared parse -------------------------------------------------------------------------
 
 # parse_ref is what both this await and every PR argument read their argument with; pinning both
@@ -971,6 +1032,10 @@ tests=(
   test_a_failed_run_is_still_exit_1
   test_transport_failure_is_unknown
   test_no_verdict_is_exit_4
+  test_the_await_interval_is_whole_seconds_above_zero
+  test_the_await_takes_the_native_no_ops_and_refuses_other_flags
+  test_a_cancelled_run_is_stopped_not_judged
+  test_the_await_beats_and_never_sleeps_past_its_deadline
   test_a_fixed_graphql_answer_is_a_rejection
   test_a_graphql_outage_still_retries
   test_a_near_miss_still_retries

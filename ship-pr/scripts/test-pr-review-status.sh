@@ -58,6 +58,9 @@ FAIL_FEED=""
 # A comment POST refusing (a watch's re-request of a failed run, #453). What does post is kept in
 # $TEST_ROOT/posted, one comment per line, and served back by the comments read after it.
 FAIL_POST=""
+# A posted comment the comments feed has not caught up with yet: the POST lands, and the reads after
+# it do not serve it back.
+HIDE_POSTED=""
 # A 👍 landing mid-watch: from this reactions read on (counted from the case's reset), the feed
 # answers REACTIONS_JSON plus a 👍 — how a case puts one between a round's read and the write
 # that round decided on.
@@ -92,6 +95,7 @@ reset_fixture() {
   FAIL_GRAPHQL=""
   FAIL_FEED=""
   FAIL_POST=""
+  HIDE_POSTED=""
   THUMBS_ON_REACTIONS_READ=""
   rm -f "$TEST_ROOT/pushed" "$TEST_ROOT/posted" "$TEST_ROOT"/nth.*
   : >"$REQUEST_LOG"
@@ -192,7 +196,7 @@ gh() {
   "repos/$REPO/issues/7/comments?per_page=100")
     fixture_feed_down comments && return 1
     response="$COMMENTS_JSON"
-    [ ! -s "$TEST_ROOT/posted" ] ||
+    [ -n "$HIDE_POSTED" ] || [ ! -s "$TEST_ROOT/posted" ] ||
       response=$(jq -c --slurpfile p "$TEST_ROOT/posted" '. + $p' <<<"$response")
     ;;
   "repos/$REPO/issues/7/comments")
@@ -680,7 +684,7 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   # whose owner is gone — without touching a CONCURRENT watch's, which is the failure mode that
   # matters: several watches share a TMPDIR routinely, one per PR in flight.
   idle_fixture
-  local root live dead dead_dir live_dir own
+  local root live dead dead_dir live_dir
   root="$TEST_ROOT/snap-root"
   mkdir -p "$root"
   # A pid that is certainly gone: a child that has already exited and been reaped.
@@ -699,11 +703,8 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   : >"$root/pr-review-snap.$dead.feeds.pr"
   : >"$root/pr-review-snap.$live.feeds.pr"
 
-  local saved_root="$SNAP_ROOT" saved_dir="$SNAP_DIR" saved_snap="$SNAP"
-  SNAP_ROOT="$root" SNAP_DIR="" SNAP=""
-  run_watch 0,0,0
-  own="$SNAP_DIR"
-  SNAP_ROOT="$saved_root" SNAP_DIR="$saved_dir" SNAP="$saved_snap"
+  # The scratch root is the watch's TMPDIR: the sweep reads the environment of the call.
+  TMPDIR="$root" run_watch 0,0,0
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
 
@@ -720,13 +721,13 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   if [ ! -e "$root/pr-review-snap.$live.feeds.pr" ]; then
     bail "a live watch's loose snapshot file must survive another watch's sweep"
   fi
-  # And the watch's own files went into a directory of its own, not loose into the root, so there
-  # is nothing a SIGKILL could leave that a later sweep cannot collect as one unit.
-  assert_eq "$(find "$root" -maxdepth 1 -type f -name "pr-review-snap.$$.*" | wc -l | tr -d ' ')" 0 \
-    "the snapshot files should live inside a per-process directory, not beside it"
-  case "$own" in "$root"/pr-review-snap.$$.*) ;;
-  *) bail "the watch's own snapshot directory should be named for this process, got '$own'" ;;
-  esac
+  # And the watch left nothing of its own in the root once it returned: no loose snapshot file,
+  # and no directory of its own either, so the live watch's two entries are all there is. Where a
+  # round is kept while the watch runs (a per-process directory in the shell, memory in the Python)
+  # is not visible from outside; what a watch that returned leaves behind is.
+  assert_eq "$(cd "$root" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')" \
+    "$(printf '%s\n' "pr-review-snap.$live.BBBBBB" "pr-review-snap.$live.feeds.pr" | LC_ALL=C sort | tr '\n' ' ')" \
+    "a watch that returned leaves no snapshot file or directory of its own beside the live one's"
   rm -rf "$root"
 }
 
@@ -764,10 +765,7 @@ test_every_other_family_a_dead_process_leaves_is_swept_too() {
   # no owner, so this sweep has nothing to decide about it and must leave it exactly where it is.
   : >"$root/pr-review-gh.vswQwU"
 
-  local saved_root="$SNAP_ROOT" saved_dir="$SNAP_DIR" saved_snap="$SNAP"
-  SNAP_ROOT="$root" SNAP_DIR="" SNAP=""
-  run_watch 0,0,0
-  SNAP_ROOT="$saved_root" SNAP_DIR="$saved_dir" SNAP="$saved_snap"
+  TMPDIR="$root" run_watch 0,0,0
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
 
@@ -2032,6 +2030,22 @@ test_watch_surfaces_a_re_request_that_did_not_post() {
   assert_contains "$WATCH_OUT" "watermark: " "and ends on a watermark"
 }
 
+# The `failed` arm's other half (dc0c749): the request is on the PR, but the comments feed has not
+# caught up with it, so the rounds after the post still read the run as failed and never
+# re-requested. One post per head per process — it is polled, not posted again — and the request's
+# grace, not the failed state's lack of one, bounds the window.
+test_watch_does_not_post_twice_while_the_feed_lags_its_request() {
+  retune GRACE=2
+  failed_run_fixture
+  HIDE_POSTED=1
+  run_watch 0,1,0 1 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 \
+    "one request, however many rounds still read the failure"
+  assert_contains "$WATCH_ERR" "re-requested the review with '@codex review'" "the watch made it"
+  assert_eq "$WATCH_RC" 1 "the request's grace ran out with nothing read back: a quiet window, re-arm"
+  assert_contains "$WATCH_OUT" "no reviewer activity about head" "and it says so"
+}
+
 tests=(
   test_empty_reviews_need_their_own_findings
   test_idle_clean_says_next_move_is_yours
@@ -2116,6 +2130,7 @@ tests=(
   test_watch_surfaces_a_re_request_that_did_not_post
   test_watch_waits_out_a_re_request_posted_on_its_last_poll
   test_watch_does_not_post_over_an_approval_that_landed_since_the_round
+  test_watch_does_not_post_twice_while_the_feed_lags_its_request
 )
 
 run_tests "${tests[@]}" -- "$@"
