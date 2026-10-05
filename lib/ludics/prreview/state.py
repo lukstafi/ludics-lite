@@ -19,9 +19,16 @@ from dataclasses import dataclass
 from typing import assert_never
 
 from ludics.prreview import jqsem as jq
+from ludics.prreview.threads import (
+    OpenThreads,
+    WalkRejected,
+    WalkUnread,
+    threads_advice,
+    threads_named,
+    unresolved_threads,
+)
 from ludics.prreview.core import (
     GhFailed,
-    GhOk,
     GhSession,
     GhUnanswered,
     Json,
@@ -29,8 +36,6 @@ from ludics.prreview.core import (
     ListResult,
     ListUnparsed,
     api_list,
-    json_stream,
-    shell_quote,
 )
 from ludics.prreview.reads import (
     CODE_REVIEW_ROW,
@@ -663,228 +668,13 @@ def status_state(
 
 # --- open review threads under an approval (ludics-lite#289) --------------------------------------
 
-THREADS_PAGE_CAP = 50
-THREADS_QUERY = (
-    "query($owner:String!, $name:String!, $pr:Int!, $after:String) {\n"
-    "  repository(owner:$owner, name:$name) { pullRequest(number:$pr) {\n"
-    "    reviewThreads(first:100, after:$after) {\n"
-    "      totalCount pageInfo { hasNextPage endCursor }\n"
-    "      nodes { id isResolved path\n"
-    "        comments(first:1) { nodes { fullDatabaseId databaseId author { login } } } } } } } }"
-)
-
-
-@dataclass(frozen=True)
-class ThreadsRead:
-    """The whole connection was read (or the walk was stopped by the page reader)."""
-
-
-@dataclass(frozen=True)
-class ThreadsUnread:
-    """Why the connection was not read whole; ``rc`` 4 when GraphQL rejected the query, else 3."""
-
-    why: str
-    rc: int
-
-
-type ThreadsWalk = ThreadsRead | ThreadsUnread
-
-
-def _meta(resp: str) -> str:
-    """threads_walk's ``meta``: ``<total>\\t<rows>\\t<has next>\\t<cursor>`` of a connection, or
-    empty for anything that is not one."""
-    docs = json_stream(resp)
-    if docs is None:
-        return ""
-    out: list[str] = []
-    try:
-        for doc in docs:
-            if not (
-                isinstance(doc, dict)
-                and jq.kind(jq.idx(doc, "nodes")) == "array"
-                and jq.kind(jq.idx(doc, "totalCount")) == "number"
-                and jq.kind(jq.path(doc, "pageInfo", "hasNextPage")) == "boolean"
-            ):
-                continue
-            nodes = doc["nodes"]
-            assert isinstance(nodes, list)
-            out.append(
-                f"{jq.text(doc['totalCount'])}\t{len(nodes)}\t"
-                f"{jq.text(jq.path(doc, 'pageInfo', 'hasNextPage'))}\t"
-                f"{jq.text(jq.alt(jq.path(doc, 'pageInfo', 'endCursor'), ''))}"
-            )
-    except jq.JqError:
-        return ""
-    return jq.captured(out)
-
-
-# SHARED-CANDIDATE: threads_walk
-def threads_walk(
-    session: GhSession, repo: str, pr: str, page_fn: Callable[[str], int], cap: int
-) -> ThreadsWalk:
-    """``threads_walk``: page the PR's reviewThreads, handing each page's answer to ``page_fn``
-    (0 read on, 1 stop here, 2 the page did not parse)."""
-    owner = repo.split("/", 1)[0]
-    name = repo.rsplit("/", 1)[-1]
-    cursor = ""
-    read_n = 0
-    for page in range(1, cap + 1):
-        after = ["-f", f"after={cursor}"] if cursor else []
-        result = session.retry(
-            "read",
-            [
-                "api",
-                "graphql",
-                "-f",
-                f"query={THREADS_QUERY}",
-                "-F",
-                f"owner={owner}",
-                "-F",
-                f"name={name}",
-                "-F",
-                f"pr={pr}",
-                *after,
-                "--jq",
-                ".data.repository.pullRequest.reviewThreads",
-            ],
-        )
-        match result:
-            case GhOk(stdout=resp):
-                pass
-            case GhFailed():
-                return ThreadsUnread(
-                    f"GraphQL REJECTED the review-threads read ({session.err_line()})", 4
-                )
-            case GhUnanswered():
-                return ThreadsUnread(
-                    "GraphQL did not answer the review-threads read after"
-                    f" {session.config.api_attempts} attempts ({session.err_line()})",
-                    3,
-                )
-            case _:
-                assert_never(result)
-        total, n, has_next, cursor = jq.bash_read(_meta(resp), 4)
-        if not is_digits((total or "x") + (n or "x")):
-            return ThreadsUnread(
-                f"the review-threads read answered page {page} without a thread connection", 3
-            )
-        status = page_fn(resp)
-        if status == 1:
-            return ThreadsRead()
-        if status != 0:
-            return ThreadsUnread(
-                f"the review-threads read answered page {page} with threads that did not parse", 3
-            )
-        read_n += int(n)
-        if has_next != "true":
-            if read_n < int(total):
-                return ThreadsUnread(
-                    f"the review-threads read ended at {read_n} thread(s) while the PR states {total}",
-                    3,
-                )
-            return ThreadsRead()
-        if not cursor:
-            return ThreadsUnread(
-                f"the review-threads read said page {page} has a successor and gave no cursor to it",
-                3,
-            )
-    return ThreadsUnread(
-        f"the review-threads read was still paging after {cap} pages of 100, so it is refused"
-        f" rather than judged on its first {read_n} thread(s)",
-        3,
-    )
-
-
-def _open_rows(resp: str) -> list[str]:
-    """unresolved_page's rows: ``<first comment id>\\t<author>\\t<path>`` per thread whose
-    isResolved is not literally true."""
-    docs = json_stream(resp)
-    if docs is None:
-        raise jq.JqError("the page did not parse")
-    rows: list[str] = []
-    for doc in docs:
-        nodes = jq.idx(doc, "nodes")
-        if nodes is None:
-            raise jq.JqError("Cannot iterate over null")
-        if not isinstance(nodes, (list, dict)):
-            raise jq.JqError(f"Cannot iterate over {jq.kind(nodes)}")
-        for node in nodes if isinstance(nodes, list) else list(nodes.values()):
-            if jq.eq(jq.idx(node, "isResolved"), True):
-                continue
-            first = jq.nth(jq.path(node, "comments", "nodes"), 0)
-            ident = jq.alt(jq.alt(jq.idx(first, "fullDatabaseId"), jq.idx(first, "databaseId")), "-")
-            author = jq.alt(jq.path(first, "author", "login"), "-")
-            path = jq.alt(jq.idx(node, "path"), "-")
-            rows.append(jq.tsv([jq.text(ident), jq.text(author), jq.text(path)]))
-    return rows
-
-
-@dataclass(frozen=True)
-class OpenThreads:
-    rows: list[str]
-
-
-type UnresolvedResult = OpenThreads | ThreadsUnread
-
-
-# SHARED-CANDIDATE: unresolved_threads
-def unresolved_threads(session: GhSession, repo: str, pr: str, cap: int) -> UnresolvedResult:
-    rows: list[str] = []
-
-    def page(resp: str) -> int:
-        try:
-            rows.extend(_open_rows(resp))
-        except jq.JqError:
-            return 2
-        return 0
-
-    walked = threads_walk(session, repo, pr, page, cap)
-    match walked:
-        case ThreadsRead():
-            return OpenThreads(rows)
-        case ThreadsUnread():
-            return walked
-        case _:
-            assert_never(walked)
-
-
-# SHARED-CANDIDATE: threads_named
-def threads_named(rows: list[str]) -> tuple[int, str]:
-    """``<count>`` and the first ten named, the path shell-quoted."""
-    n = 0
-    shown = ""
-    for row in rows:
-        ident, login, path = jq.bash_read(row, 3)
-        if not ident:
-            continue
-        n += 1
-        if n > 10:
-            continue
-        shown += (", " if shown else "") + f"{ident} by {login} on {shell_quote(path)}"
-    if n > 10:
-        shown += f", and {n - 10} more"
-    return n, shown
-
-
-# SHARED-CANDIDATE: threads_advice
-def threads_advice(repo: str, num: str) -> str:
-    pr = num or "<pr>"
-    return (
-        "An open thread is a finding nobody closed, whatever head it cites: one written against an"
-        " earlier head is live if this head did not change its lines, and `watch` prints such"
-        " findings as NOT about head and moves past them (ludics-lite#289). Read each one, answer"
-        f" it with a fix or a rebuttal (pr-review.sh reply {repo}#{pr} <id> '<answer>'), then close"
-        f" it (pr-review.sh resolve {repo}#{pr} <id>); clearing this needs no push"
-    )
-
-
-# SHARED-CANDIDATE: approval_gate
 def approval_gate(session: GhSession, repo: str, pr: str, line: str, cap: int) -> str:
+    """``approval_gate``: an ``approved`` line checked for open review threads (threads.py)."""
     if state_tok(line) != "approved":
         return line
     found = unresolved_threads(session, repo, pr, cap)
     match found:
-        case ThreadsUnread(why=why):
+        case WalkRejected(line=why) | WalkUnread(line=why):
             return (
                 f"unknown|-|{state_merge(line)}|{why}, so whether open review threads stand under"
                 f" this approval ({state_detail(line)}) is unknown"

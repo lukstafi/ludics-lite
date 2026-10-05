@@ -17,8 +17,16 @@ from dataclasses import dataclass
 from typing import Literal, assert_never
 
 from ludics.prreview import knobs
-from ludics.prreview.core import GhFailed, GhOk, GhUnanswered, Json, shell_quote
+from ludics.prreview.core import GhFailed, GhOk, GhUnanswered, Json
 from ludics.prreview.clock import age_of, age_text, fmt_age, freshest_age, newest
+from ludics.prreview.threads import (
+    OpenThreads,
+    WalkRejected,
+    WalkUnread,
+    threads_advice,
+    threads_named,
+    unresolved_threads,
+)
 from ludics.prreview.watch_feeds import (
     Ctx,
     Head,
@@ -48,12 +56,10 @@ from ludics.prreview.watch_jq import (
     lt,
     max_by,
     onig,
-    path,
     sort_by,
     startswith,
     string,
     sub_once,
-    type_name,
     unique,
 )
 from ludics.prreview.watch_poll import REVIEWED_COMMIT_RE
@@ -611,18 +617,6 @@ def conflict_note(merge: str, repo: str, pr: str) -> str:
             return ""
 
 
-# SHARED-CANDIDATE: threads_advice
-def threads_advice(repo: str, pr: str) -> str:
-    p = pr or "<pr>"
-    return (
-        "An open thread is a finding nobody closed, whatever head it cites: one written against an"
-        " earlier head is live if this head did not change its lines, and `watch` prints such"
-        " findings as NOT about head and moves past them (ludics-lite#289). Read each one, answer"
-        f" it with a fix or a rebuttal (pr-review.sh reply {repo}#{p} <id> '<answer>'), then close"
-        f" it (pr-review.sh resolve {repo}#{p} <id>); clearing this needs no push"
-    )
-
-
 # SHARED-CANDIDATE: status_line
 def status_line(state: State, repo: str, pr: str) -> str:
     detail = state.detail
@@ -712,167 +706,19 @@ def threads_page_cap() -> int:
     return knobs.threads_page_cap(os.environ)
 
 
-THREADS_QUERY = """query($owner:String!, $name:String!, $pr:Int!, $after:String) {
-  repository(owner:$owner, name:$name) { pullRequest(number:$pr) {
-    reviewThreads(first:100, after:$after) {
-      totalCount pageInfo { hasNextPage endCursor }
-      nodes { id isResolved path
-        comments(first:1) { nodes { fullDatabaseId databaseId author { login } } } } } } } }"""
-
-
-@dataclass(frozen=True)
-class ThreadsRead:
-    rows: str
-
-
-@dataclass(frozen=True)
-class ThreadsUnread:
-    """Why the connection was not read whole: GraphQL rejected it (``rejected``) or anything else."""
-
-    reason: str
-    rejected: bool
-
-
-def _tsv(value: str) -> str:
-    """One field of jq's ``@tsv``."""
-    return value.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
-
-
-def _open_rows(page: Json) -> str:
-    rows = ""
-    for node in as_list(idx(page, "nodes")):
-        if idx(node, "isResolved") is True:
-            continue
-        first = path(node, "comments", "nodes", 0)
-        tid = jstr(alt(alt(idx(first, "fullDatabaseId"), idx(first, "databaseId")), "-"))
-        login = jstr(alt(path(node, "comments", "nodes", 0, "author", "login"), "-"))
-        where = jstr(alt(idx(node, "path"), "-"))
-        rows += "\t".join(_tsv(f) for f in (tid, login, where)) + "\n"
-    return rows
-
-
-# SHARED-CANDIDATE: unresolved_threads
-def unresolved_threads(ctx: Ctx, pr: str) -> ThreadsRead | ThreadsUnread:
-    """``threads_walk`` with ``unresolved_page``: every open thread, or why the read is not whole."""
-    import json
-
-    owner = ctx.repo.split("/", 1)[0]
-    name = ctx.repo.rsplit("/", 1)[-1]
-    cursor = ""
-    read_n = 0
-    rows = ""
-    cap = threads_page_cap()
-    for page in range(1, cap + 1):
-        args = [
-            "api", "graphql", "-f", f"query={THREADS_QUERY}", "-F", f"owner={owner}", "-F",
-            f"name={name}", "-F", f"pr={pr}",
-        ]
-        if cursor:
-            args += ["-f", f"after={cursor}"]
-        args += ["--jq", ".data.repository.pullRequest.reviewThreads"]
-        result = ctx.session.retry("read", args)
-        match result:
-            case GhOk(stdout=resp):
-                pass
-            case GhFailed():
-                return ThreadsUnread(
-                    f"GraphQL REJECTED the review-threads read ({ctx.session.err_line()})", True
-                )
-            case GhUnanswered():
-                return ThreadsUnread(
-                    "GraphQL did not answer the review-threads read after"
-                    f" {ctx.session.config.api_attempts} attempts ({ctx.session.err_line()})",
-                    False,
-                )
-            case _:
-                assert_never(result)
-        try:
-            doc: Json = json.loads(resp)
-        except ValueError:
-            doc = None
-        total_text = n_text = ""
-        has_next: Json = None
-        if (
-            isinstance(doc, dict)
-            and isinstance(doc.get("nodes"), list)
-            and type_name(doc.get("totalCount")) == "number"
-            and isinstance(_page_info(doc).get("hasNextPage"), bool)
-        ):
-            nodes = doc.get("nodes")
-            total_text = jstr(doc.get("totalCount"))
-            n_text = str(len(nodes)) if isinstance(nodes, list) else ""
-            has_next = _page_info(doc).get("hasNextPage")
-            cursor = jstr(alt(_page_info(doc).get("endCursor"), ""))
-        if not (total_text.isdigit() and n_text.isdigit()):
-            return ThreadsUnread(
-                f"the review-threads read answered page {page} without a thread connection", False
-            )
-        try:
-            rows += _open_rows(doc)
-        except JqError:
-            return ThreadsUnread(
-                f"the review-threads read answered page {page} with threads that did not parse",
-                False,
-            )
-        read_n += int(n_text)
-        if has_next is not True:
-            if read_n < int(total_text):
-                return ThreadsUnread(
-                    f"the review-threads read ended at {read_n} thread(s) while the PR states"
-                    f" {total_text}",
-                    False,
-                )
-            return ThreadsRead(rows.rstrip("\n"))
-        if not cursor:
-            return ThreadsUnread(
-                f"the review-threads read said page {page} has a successor and gave no cursor to it",
-                False,
-            )
-    return ThreadsUnread(
-        f"the review-threads read was still paging after {cap} pages of 100, so it is"
-        f" refused rather than judged on its first {read_n} thread(s)",
-        False,
-    )
-
-
-def _page_info(doc: dict[str, Json]) -> dict[str, Json]:
-    info = doc.get("pageInfo")
-    return info if isinstance(info, dict) else {}
-
-
-# SHARED-CANDIDATE: threads_named
-def threads_named(rows: str) -> tuple[int, str]:
-    """``threads_named``: the count, and the first ten named (the path shell-quoted)."""
-    from ludics.prreview.watch_feeds import ifs_read
-
-    n = 0
-    shown = ""
-    for line in rows.split("\n"):
-        tid, login, where = ifs_read(line, 3)
-        if not tid:
-            continue
-        n += 1
-        if n > 10:
-            continue
-        shown += f"{', ' if shown else ''}{tid} by {login} on {shell_quote(where)}"
-    if n > 10:
-        shown += f", and {n - 10} more"
-    return n, shown
-
-
-# SHARED-CANDIDATE: approval_gate
 def approval_gate(ctx: Ctx, pr: str, state: State) -> State:
+    """``approval_gate``: an ``approved`` state checked for open review threads (threads.py)."""
     if state.tok != "approved":
         return state
-    read = unresolved_threads(ctx, pr)
+    read = unresolved_threads(ctx.session, ctx.repo, pr, threads_page_cap())
     match read:
-        case ThreadsUnread(reason=reason):
+        case WalkRejected(line=reason) | WalkUnread(line=reason):
             return unknown(
                 state.merge,
                 f"{reason}, so whether open review threads stand under this approval"
                 f" ({state.detail}) is unknown",
             )
-        case ThreadsRead(rows=rows):
+        case OpenThreads(rows=rows):
             if not rows:
                 return state
             n, shown = threads_named(rows)

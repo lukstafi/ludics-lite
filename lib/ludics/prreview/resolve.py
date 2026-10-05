@@ -22,12 +22,11 @@ API rejected the mutation; 2 usage, or GraphQL rejected the lookup (about the qu
 already closed by this invocation.
 """
 
-import json
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, assert_never
+from typing import assert_never
 
 from ludics import cli
 from ludics.prreview import knobs
@@ -39,19 +38,22 @@ from ludics.prreview.core import (
     Json,
     die,
     fail,
-    json_stream,
     pr_arg,
 )
 from ludics.prreview.reply import split_ids
+from ludics.prreview.threads import (
+    JqError,
+    PageVerdict,
+    WalkDone,
+    WalkRejected,
+    WalkUnread,
+    jq_field,
+    jq_text,
+    thread_id,
+    threads_walk,
+)
 
 # --- the review-threads walk (shared with the open-thread gate) -------------------------------------
-
-THREADS_QUERY = """query($owner:String!, $name:String!, $pr:Int!, $after:String) {
-  repository(owner:$owner, name:$name) { pullRequest(number:$pr) {
-    reviewThreads(first:100, after:$after) {
-      totalCount pageInfo { hasNextPage endCursor }
-      nodes { id isResolved path
-        comments(first:1) { nodes { fullDatabaseId databaseId author { login } } } } } } } }"""
 
 # THREADS_PAGE_CAP, as the forward hands it over (knobs.threads_page_cap).
 PAGE_CAP_ENV = knobs.ENV_THREADS_PAGE_CAP
@@ -59,189 +61,6 @@ PAGE_CAP_ENV = knobs.ENV_THREADS_PAGE_CAP
 
 def page_cap(env: Mapping[str, str]) -> int:
     return knobs.threads_page_cap(env)
-
-
-@dataclass(frozen=True)
-class WalkDone:
-    """The page reader stopped the walk (it has what it wanted), or the whole connection was read:
-    the rows reached the totalCount the last page states."""
-
-
-@dataclass(frozen=True)
-class WalkRejected:
-    """GraphQL rejected the query (threads_walk's 4): nothing about any thread is known."""
-
-    line: str
-
-
-@dataclass(frozen=True)
-class WalkUnread:
-    """The read did not complete (threads_walk's 3): no answer, a malformed or short answer, or the
-    page cap. None of it is evidence about any thread."""
-
-    line: str
-
-
-type WalkResult = WalkDone | WalkRejected | WalkUnread
-type PageVerdict = Literal["more", "stop", "unparsed"]
-
-
-class JqError(Exception):
-    """What jq would have failed on: a field read off a value that is not an object, an index off
-    one that is not an array."""
-
-
-def jq_field(value: Json, key: str) -> Json:
-    """jq's ``.key``: null passes through as null, an object answers, anything else is an error."""
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value.get(key)
-    raise JqError(key)
-
-
-def jq_first(value: Json) -> Json:
-    """jq's ``.[0]``: null for null or an empty array."""
-    if value is None:
-        return None
-    if isinstance(value, list):
-        return value[0] if value else None
-    raise JqError("0")
-
-
-def jq_alt(left: Json, right: Json) -> Json:
-    """jq's ``//``: the right side for null and false."""
-    return right if left is None or left is False else left
-
-
-def jq_text(value: Json) -> str:
-    """jq's ``tostring``, which string interpolation also applies: a string as itself, anything
-    else as its compact JSON."""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-# SHARED-CANDIDATE: THREAD_ID_JQ
-def thread_id(node: Json) -> str:
-    """THREAD_ID_JQ, ``((.comments.nodes[0] | .fullDatabaseId // .databaseId // "-") | tostring)``:
-    a thread's name, its first comment's id, full width first. Raises ``JqError`` where jq erred."""
-    first = jq_first(jq_field(jq_field(node, "comments"), "nodes"))
-    return jq_text(jq_alt(jq_alt(jq_field(first, "fullDatabaseId"), jq_field(first, "databaseId")), "-"))
-
-
-@dataclass(frozen=True)
-class _Meta:
-    total: int
-    n: int
-    has_next: bool
-    cursor: str
-
-
-def _connection(resp: str) -> tuple[dict[str, Json], _Meta] | None:
-    """The page's connection and what the walk reads off it, or None when the answer is not a
-    connection: an object with a nodes array, a numeric totalCount and a boolean hasNextPage (a
-    ``pullRequest`` of null, GraphQL's way of erroring inside a 200, is refused with the rest)."""
-    docs = json_stream(resp)
-    if not docs:
-        return None
-    conn = docs[0]
-    if not isinstance(conn, dict):
-        return None
-    nodes = conn.get("nodes")
-    total = conn.get("totalCount")
-    try:
-        has_next = jq_field(conn.get("pageInfo"), "hasNextPage")
-        cursor = jq_alt(jq_field(conn.get("pageInfo"), "endCursor"), "")
-    except JqError:
-        return None
-    if not isinstance(nodes, list) or not isinstance(has_next, bool):
-        return None
-    # "\(.totalCount)" must be digits alone: a bool is no number, and a float prints with a point.
-    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-        return None
-    return conn, _Meta(total, len(nodes), has_next, jq_text(cursor))
-
-
-# SHARED-CANDIDATE: threads_walk
-def threads_walk(
-    session: GhSession,
-    repo: str,
-    pr: str,
-    on_page: Callable[[dict[str, Json]], PageVerdict],
-    *,
-    cap: int,
-) -> WalkResult:
-    """``threads_walk``: page PR ``pr``'s reviewThreads with THREADS_QUERY, the cursor passed as a
-    variable, handing each page's connection to ``on_page`` -- ``more`` to read on, ``stop`` when
-    it has what it wanted, ``unparsed`` when the page's threads did not parse. The read is whole
-    only when the rows read reach the totalCount the last page states; one still paging at ``cap``
-    pages is refused as unread rather than judged on its prefix."""
-    owner = repo.split("/", 1)[0]
-    name = repo.rsplit("/", 1)[-1]
-    cursor = ""
-    read_n = 0
-    for page in range(1, cap + 1):
-        args = [
-            "api",
-            "graphql",
-            "-f",
-            f"query={THREADS_QUERY}",
-            "-F",
-            f"owner={owner}",
-            "-F",
-            f"name={name}",
-            "-F",
-            f"pr={pr}",
-        ]
-        if cursor:
-            args += ["-f", f"after={cursor}"]
-        args += ["--jq", ".data.repository.pullRequest.reviewThreads"]
-        result = session.retry("read", args)
-        match result:
-            case GhOk(stdout=resp):
-                pass
-            case GhFailed():
-                return WalkRejected(f"GraphQL REJECTED the review-threads read ({session.err_line()})")
-            case GhUnanswered():
-                return WalkUnread(
-                    "GraphQL did not answer the review-threads read after"
-                    f" {session.config.api_attempts} attempts ({session.err_line()})"
-                )
-            case _:
-                assert_never(result)
-        parsed = _connection(resp)
-        if parsed is None:
-            return WalkUnread(f"the review-threads read answered page {page} without a thread connection")
-        conn, meta = parsed
-        verdict = on_page(conn)
-        match verdict:
-            case "more":
-                pass
-            case "stop":
-                return WalkDone()
-            case "unparsed":
-                return WalkUnread(
-                    f"the review-threads read answered page {page} with threads that did not parse"
-                )
-            case _:
-                assert_never(verdict)
-        read_n += meta.n
-        if not meta.has_next:
-            if read_n < meta.total:
-                return WalkUnread(
-                    f"the review-threads read ended at {read_n} thread(s) while the PR states {meta.total}"
-                )
-            return WalkDone()
-        cursor = meta.cursor
-        if not cursor:
-            return WalkUnread(
-                f"the review-threads read said page {page} has a successor and gave no cursor to it"
-            )
-    return WalkUnread(
-        f"the review-threads read was still paging after {cap} pages of 100, so it is refused"
-        f" rather than judged on its first {read_n} thread(s)"
-    )
 
 
 # --- resolve ----------------------------------------------------------------------------------------
