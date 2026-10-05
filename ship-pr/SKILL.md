@@ -210,7 +210,10 @@ Before **every** push that touches code, run the gates the repository's CI judge
 the formatter check if it has one — its AGENTS.md or CLAUDE.md names it — and in this repository, the skills repo, `scripts/preflight.sh`, which *is* CI's `lint`
 job rather than a reconstruction of it (shell syntax, the mode bits, shellcheck at error
 severity, the PowerShell parse, the parse guard and the prompt, jq-shape and scratch-directory
-guards). A push that CI reds on a syntax error or a lost mode bit costs a CI round and, since
+guards). Run with no step named, it also runs the small-guards suites a Markdown edit can break
+(`test-check-prompts.sh`, and `test-sync-routines.sh` for `routines/`) whenever Markdown differs
+from the merge base with `origin/main` (`--base <ref>` for another); `--guards all` runs every
+suite of CI's small-guards job (ludics-lite#553). A push that CI reds on a syntax error or a lost mode bit costs a CI round and, since
 automated reviews fire on every push, a review round — and after the reviewer has approved it
 costs the approval too, which is the round ludics-lite#221 was filed for. A round's fixes are
 exactly as able to break a gate as the first commit was, so the habit belongs on the push and not

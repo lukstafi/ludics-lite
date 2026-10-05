@@ -1011,6 +1011,206 @@ else
 fi
 WORKFLOW="$ROOT/.github/workflows/skill-scripts.yml"
 
+# --- the guards: the small-guards job's suites, run when what they judge changed ---------------
+#
+# THE PIN, the guard table against the `prompts` job (`small guards (ubuntu)`): every guard is a
+# live step of that job, and every live step of it is a guard or a step-table command. Its
+# boundary is the SET: it asks whether `preflight.sh --guards all` runs what the job runs, not
+# whether the job's step can fail -- that job's steps carry a reporting tail by convention, which
+# the bare-invocation pin above refuses to read for exactly that reason, and check-prompts.sh,
+# the job's one bare step, is held by that pin. A `python3 <file>` step is read as <file>.
+prompts_job_suites() {
+  awk "$WORKFLOW_AWK"'
+    function emit(   w) {
+      if (scmd == "" || job != "  prompts:" || !live()) return
+      if (scmd == "python3") { split(sargs, w, / /); print w[1] } else print scmd
+    }
+  ' "$WORKFLOW"
+}
+guard_commands=$("$PF" guards | awk -F'\t' '{ print $2 }')
+# guard_drift: what the job runs that preflight does not, then (after a `|`) the guards the job
+# does not run.
+guard_drift() {
+  local suites cmd extra="" missing=""
+  suites=$(prompts_job_suites)
+  while IFS= read -r cmd; do
+    [ -n "$cmd" ] || continue
+    grep -Fqx -- "$cmd" <<<"$guard_commands" || grep -Fqx -- "$cmd" <<<"$table_commands" || extra="$extra $cmd"
+  done <<EOF
+$suites
+EOF
+  while IFS= read -r cmd; do
+    [ -n "$cmd" ] || continue
+    grep -Fqx -- "$cmd" <<<"$suites" || missing="$missing $cmd"
+  done <<EOF
+$guard_commands
+EOF
+  printf '%s|%s' "$extra" "$missing"
+}
+[ -n "$(prompts_job_suites)" ] && ok "the small-guards job's suites can be read" \
+  || ko "no suite read from the prompts job -- the guard pin below would pass over nothing"
+[ -n "$guard_commands" ] && ok "the guard table names suites" \
+  || ko "preflight.sh guards named nothing -- the guard pin below would pass over nothing"
+drift=$(guard_drift)
+[ "$drift" = "|" ] \
+  && ok "the guard table and the small-guards job are one set of suites" \
+  || ko "the guard table and the small-guards job disagree (job-only|guard-only): $drift"
+# Both directions, on a scratch copy of the workflow.
+if probe_workflow_swap "        run: scripts/test-py.sh || { echo '::error title=suite failed::test-py.sh'; exit 1; }" \
+  "        run: scripts/test-py.sh || { echo '::error title=suite failed::test-py.sh'; exit 1; }
+      - name: A new guard
+        if: \${{ !cancelled() }}
+        run: python3 scripts/test-something-new.py || { echo '::error title=suite failed::x'; exit 1; }"; then
+  [ "$(guard_drift)" = " scripts/test-something-new.py|" ] \
+    && ok "...and a suite added to the job and not to the guard table trips the pin" \
+    || ko "a new small-guards suite did not trip the guard pin (verdict: $(guard_drift))"
+else
+  ko "the swap probe rewrote nothing: the prompts job no longer spells the test-py.sh step as this file expects"
+fi
+if probe_workflow_swap "        run: scripts/test-py.sh || { echo '::error title=suite failed::test-py.sh'; exit 1; }" \
+  "        run: scripts/test-py-renamed.sh || { echo '::error title=suite failed::test-py.sh'; exit 1; }"; then
+  [ "$(guard_drift)" = " scripts/test-py-renamed.sh| scripts/test-py.sh" ] \
+    && ok "...and a guard the job stopped running trips it from the other side" \
+    || ko "a guard missing from the job did not trip the guard pin (verdict: $(guard_drift))"
+else
+  ko "the swap probe rewrote nothing: the prompts job no longer spells the test-py.sh step as this file expects"
+fi
+WORKFLOW="$ROOT/.github/workflows/skill-scripts.yml"
+
+# THE BEHAVIOUR, on a scratch git repository whose guard suites are stubs that say they ran. The
+# prompt-fixtures stub asserts the one rule PR #544 broke (ludics-lite#553): ship-pr/SKILL.md must
+# carry a `  --base <b> --regenerable <d>` continuation line, which test-check-prompts.sh's cleanup
+# probes need. The SKILL.md is this checkout's own, so the edit below is the prose edit that went
+# red in CI after a clean preflight.
+gtree() { # gtree <name>: T is a fresh git repository on `main` with every guard stubbed
+  local entry name cmd
+  tree "$1"
+  mkdir -p "$T/routines"
+  while IFS=$'\t' read -r name cmd _; do
+    mkdir -p "$T/$(dirname "$cmd")"
+    case "$cmd" in
+    *.py) printf 'print("ran-%s")\n' "$name" >"$T/$cmd" ;;
+    *) printf '#!/usr/bin/env bash\necho "ran-%s"\n' "$name" >"$T/$cmd" ;;
+    esac
+    chmod +x "$T/$cmd"
+  done <<EOF
+$("$PF" guards)
+EOF
+  cat >"$T/scripts/test-check-prompts.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "ran-prompt-fixtures"
+grep -q -- '^  --base [^ ]* --regenerable [^ ]*$' ship-pr/SKILL.md \
+  || { echo "FAIL: the cleanup probes need a '  --base <b> --regenerable <d>' continuation line in ship-pr/SKILL.md"; exit 1; }
+EOF
+  cp "$ROOT/ship-pr/SKILL.md" "$T/ship-pr/SKILL.md"
+  printf '# routines\n' >"$T/routines/README.md"
+  printf '# notes\n' >"$T/notes.txt"
+  git -C "$T" init -q -b main >/dev/null 2>&1 &&
+    git -C "$T" add -A &&
+    git -C "$T" -c user.name=t -c user.email=t@example.invalid commit -qm base &&
+    git -C "$T" checkout -qb feature
+}
+gcommit() { git -C "$T" -c user.name=t -c user.email=t@example.invalid commit -qam "$1"; }
+# The incident's edit: the continuation line goes, the prose around it stays.
+drop_regenerable() {
+  awk '!/^  --base [^ ]* --regenerable [^ ]*$/' "$T/ship-pr/SKILL.md" >"$T/ship-pr/SKILL.md.new" &&
+    mv "$T/ship-pr/SKILL.md.new" "$T/ship-pr/SKILL.md"
+}
+
+if gtree guards_clean && grep -q -- '^  --base [^ ]* --regenerable ' "$T/ship-pr/SKILL.md"; then
+  ok "the guard controls' repository could be built from this checkout's ship-pr/SKILL.md"
+  expect "with no Markdown changed, the changed mode runs no guard" \
+    0 "prompt-fixtures: not run (nothing matching '*.md' differs from the merge base with main" \
+    -- "$PF" --root "$T" --guards changed --base main syntax
+  guard_out=$("$PF" --root "$T" --guards changed --base main syntax 2>&1)
+  grep -qF 'ran-' <<<"$guard_out" && ko "a guard ran with nothing changed -- $guard_out" \
+    || ok "...and none of the stubs ran"
+  expect "...and names the guards with no file trigger as left to --guards all" \
+    0 'not run here: reporters nudge-fixtures base-helper-fixtures py-wrapper' \
+    -- "$PF" --root "$T" --guards changed --base main syntax
+  printf 'x\n' >>"$T/notes.txt"
+  gcommit "not Markdown"
+  expect "...nor does a change to a file no trigger matches" \
+    0 'prompt-fixtures: not run' -- "$PF" --root "$T" --guards changed --base main syntax
+
+  drop_regenerable
+  expect "THE INCIDENT (ludics-lite#553): a prose edit to ship-pr/SKILL.md that breaks a prompt rule fails preflight" \
+    1 'prompt-fixtures: FAIL' -- "$PF" --root "$T" --guards changed --base main syntax
+  expect "...through the guard, which says it is due and why" \
+    1 "prompt-fixtures: due (a tracked file matching '*.md' differs from the merge base with main" \
+    -- "$PF" --root "$T" --guards changed --base main syntax
+  expect "...while the step it was run with still passes, as check-prompts.sh did in that PR" \
+    1 'syntax: PASS' -- "$PF" --root "$T" --guards changed --base main syntax
+  expect "...and the routines guard, whose trigger did not fire, is not run" \
+    1 "routines-fixtures: not run (nothing matching 'routines/*.md'" \
+    -- "$PF" --root "$T" --guards changed --base main syntax
+  # The default run is the changed mode: every step, then the due guards. The scratch tree lacks
+  # the steps' scripts, so the run is red anyway; what is asserted is that the guard is decided
+  # and run without any flag.
+  expect "...and with no STEP named, the default run decides the guards the same way" \
+    1 'prompt-fixtures: FAIL' -- "$PF" --root "$T" --base main
+  expect "...while naming a STEP leaves the guards out unless --guards asks for them" \
+    0 'syntax: PASS' -- "$PF" --root "$T" --base main syntax
+  expect "...and --guards none leaves them out of a default run" \
+    1 'prompts: FAIL' -- "$PF" --root "$T" --guards none --base main
+  guard_out=$("$PF" --root "$T" --guards none --base main 2>&1)
+  grep -qF 'ran-' <<<"$guard_out" && ko "--guards none ran a guard -- $guard_out" \
+    || ok "...running none of them"
+  gcommit "drop the continuation line"
+  expect "...and the same edit committed is judged the same: the merge base, not the index, is the reference" \
+    1 'prompt-fixtures: FAIL' -- "$PF" --root "$T" --guards changed --base main syntax
+  # origin/main is the default base.
+  git -C "$T" update-ref refs/remotes/origin/main main
+  expect "...and origin/main is the base when none is named" \
+    1 "differs from the merge base with origin/main" -- "$PF" --root "$T" --guards changed syntax
+else
+  ko "could not build the guard controls' repository: the cases below would prove nothing"
+fi
+
+if gtree guards_scope; then
+  printf '# new\n' >"$T/ship-pr/notes.md"
+  expect "an untracked Markdown file is not a change the push carries, so it triggers nothing" \
+    0 'prompt-fixtures: not run' -- "$PF" --root "$T" --guards changed --base main syntax
+  git -C "$T" add ship-pr/notes.md
+  expect "...and the same file staged is" \
+    0 'ran-prompt-fixtures' -- "$PF" --root "$T" --guards changed --base main syntax
+  printf 'edited\n' >>"$T/routines/README.md"
+  expect "a routines/ Markdown edit runs the routines guard" \
+    0 'ran-routines-fixtures' -- "$PF" --root "$T" --guards changed --base main syntax
+  expect "...and the prompt guard beside it, since its trigger is every *.md" \
+    0 'ran-prompt-fixtures' -- "$PF" --root "$T" --guards changed --base main syntax
+  expect "a base that cannot be resolved runs the triggered guards rather than guessing" \
+    0 'prompt-fixtures: due (cannot tell what changed: no such commit: nosuch' \
+    -- "$PF" --root "$T" --guards changed --base nosuch syntax
+  if command -v python3 >/dev/null 2>&1; then
+    expect "--guards all runs every guard, the Python ones under python3" \
+      0 'ran-reporters' -- "$PF" --root "$T" --guards all syntax
+    expect "...the last of them included" 0 'ran-py-wrapper' -- "$PF" --root "$T" --guards all syntax
+    expect "...and each one is a step of the summary" 0 '7 passed, 0 failed' -- "$PF" --root "$T" --guards all syntax
+  else
+    ok "SKIP: no python3, so the --guards all controls do not run here (CI runs them)"
+  fi
+  expect "a guard named on the command line runs whatever the mode" \
+    0 'ran-base-helper-fixtures' -- "$PF" --root "$T" base-helper-fixtures
+  rm "$T/scripts/test-py.sh"
+  expect "...and one whose suite is missing fails rather than passing over it" \
+    1 'py-wrapper: FAIL (scripts/test-py.sh is not there' -- "$PF" --root "$T" py-wrapper
+else
+  ko "could not build the guard scope repository: the cases below would prove nothing"
+fi
+tree guards_nogit
+expect "a root that is not a git work tree runs the triggered guards rather than guessing" \
+  1 'is not the root of a git work tree; running it rather than guessing' \
+  -- "$PF" --root "$T" --guards changed syntax
+expect "an unknown guard mode is a usage error" 2 "--guards takes all, changed or none" -- "$PF" --root "$T" --guards sometimes
+expect "a guard name is no step and no query word, and the table says so" 0 'prompt-fixtures	scripts/test-check-prompts.sh	*.md' -- "$PF" guards
+if patch_table guardclash "  'prompt-fixtures:-'"; then
+  expect "a step named like a guard is refused, since either may be named on the command line" \
+    2 "names 'prompt-fixtures' twice" -- "$TMP/guardclash/scripts/preflight.sh" steps
+else
+  ko "could not patch a guard-named step into a copy of preflight.sh"
+fi
+
 # --- the recursion guard on this very suite ---------------------------------------------------
 #
 # preflight runs this file as its `preflight-fixtures` step, and this file runs preflight. The

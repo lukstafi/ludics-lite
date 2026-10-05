@@ -4,8 +4,9 @@
 # rather than by restating it -- so what a push is judged by and what the local loop runs are one
 # command, and a change to either is a change to both (ludics-lite#221, #123).
 #
-# Usage: preflight.sh [--root DIR] [--require-tools] [--as-ci] [STEP...]
-#        preflight.sh steps | globs | files
+# Usage: preflight.sh [--root DIR] [--require-tools] [--as-ci] [--guards all|changed|none]
+#                     [--base REF] [STEP|GUARD...]
+#        preflight.sh steps | globs | files | guards
 #
 # With no STEP it runs them all, each one whether or not an earlier one failed -- the workflow's
 # `if: !cancelled()` shape -- and prints a summary. Exit 0 when nothing failed, 1 when something
@@ -29,6 +30,35 @@
 #                      them too, so leaving them out here made the local command a subset of CI)
 #   - jq-version       the jq on PATH is the fleet's minor, 1.8 (ludics-lite#508), and says which
 #                      jq it found and where
+#
+# THE GUARDS are the other half of a push's verdict: the suites of CI's `small guards (ubuntu)`
+# job (`prompts` in the workflow) that the steps above do not already run. A prose edit to a skill
+# can pass every step here and still fail one of them -- PR #544 dropped a literal that
+# test-check-prompts.sh needs ship-pr/SKILL.md to carry, and went red in CI after a clean
+# preflight (ludics-lite#553). They are not steps, because they take minutes rather than seconds
+# and most pushes cannot break them; which of them run is --guards MODE:
+#   - changed  (the default when no STEP is named) each guard with a file trigger runs when a
+#              tracked file matching it differs from the merge base of --base REF (default
+#              origin/main) and HEAD -- committed, staged or only edited, since that is what the
+#              push will carry. A checkout where that cannot be told (no such REF, not a git
+#              work tree) runs them: a guard skipped on a guess is the miss this exists to end.
+#   - all      every guard, which is what the small-guards job runs on every head.
+#   - none     no guard (the default when a STEP is named, so `preflight.sh syntax` stays one
+#              step and CI's lint job, which names its steps, runs none).
+# A GUARD named on the command line runs whatever the mode. The table (`preflight.sh guards`):
+#   - prompt-fixtures      scripts/test-check-prompts.sh, on any *.md: check-prompts.sh reads
+#                          every SKILL.md, both index READMEs and (its slot count) every *.md, and
+#                          its suite reads the live ship-pr/SKILL.md's shape -- wider than the
+#                          ship-pr/, issue-wave/ and routines/ the issue named, which miss the
+#                          root README and the other skills
+#   - routines-fixtures    scripts/test-sync-routines.sh, on routines/*.md: its pin compares the
+#                          routines table with sync-routines.sh
+#   - reporters            scripts/test-workflow-reporters.py   } no file trigger: a Markdown
+#   - nudge-fixtures       ship-pr/hooks/test-ship-pr-nudge.py  } edit cannot break them, so they
+#   - base-helper-fixtures scripts/test-run-against-base.sh     } run under --guards all or by
+#   - py-wrapper           scripts/test-py.sh                   } name, and CI runs them always
+# scripts/test-preflight.sh pins the table to the job: every guard is a step of it, and every
+# step of it is a guard or one of the steps above.
 #
 # MISSING TOOLS. Without --require-tools a step whose interpreter is absent is SKIPped by name and
 # does not fail the run: pwsh is on neither fleet mac, and a preflight that goes red for a tool
@@ -57,7 +87,8 @@
 #
 # `steps` prints "name<TAB>command<TAB>tool" per step (`-` for one implemented here, an empty tool
 # for one that needs nothing beyond this shell), `globs` the file-list
-# patterns, `files` the paths they expand to in the judged checkout. They are the read-only half of
+# patterns, `files` the paths they expand to in the judged checkout, `guards`
+# "name<TAB>command<TAB>trigger" per guard (an empty trigger for one with none). They are the read-only half of
 # "one place": scripts/test-preflight.sh pins the step table against the lint job's steps, and
 # issue-wave/scripts/test-fleet-worker.sh reads `globs` for its lint-coverage guard rather than
 # re-deriving the list from the YAML the way it did while the list lived there.
@@ -96,6 +127,17 @@ STEPS=(
   'jq-version:-'
 )
 
+# THE GUARD TABLE: `name:command:trigger`, the trigger a git pathspec (its `*` crosses `/`) or
+# empty. A `.py` command runs under python3, as the job runs it.
+GUARDS=(
+  'prompt-fixtures:scripts/test-check-prompts.sh:*.md'
+  'routines-fixtures:scripts/test-sync-routines.sh:routines/*.md'
+  'reporters:scripts/test-workflow-reporters.py:'
+  'nudge-fixtures:ship-pr/hooks/test-ship-pr-nudge.py:'
+  'base-helper-fixtures:scripts/test-run-against-base.sh:'
+  'py-wrapper:scripts/test-py.sh:'
+)
+
 # The jq minor the fleet and CI run (ludics-lite#508). CI pins the patch in
 # .github/actions/setup-jq/action.yml and the Linux installer in scripts/install-linux.sh;
 # scripts/test-preflight.sh holds both to this minor.
@@ -108,11 +150,13 @@ JQ_MINOR=1.8
 # command twice and the other never, with both paths still in `steps` for the pin to accept. Both
 # are refused here, before anything is judged, because a table that does not mean what it says is
 # not something to run a check from.
-QUERY_WORDS='steps globs files'
+QUERY_WORDS='steps globs files guards'
 
+# The guards share the steps' namespace, since either may be named on the command line, and are
+# validated with them.
 validate_table() {
   local entry name seen=' '
-  for entry in "${STEPS[@]}"; do
+  for entry in "${STEPS[@]}" "${GUARDS[@]}"; do
     name=${entry%%:*}
     case "$seen" in
     *" $name "*) die "the step table names '$name' twice: the lookup would answer with the first entry and the second would never run" ;;
@@ -149,6 +193,21 @@ step_command() { # step_command <name>: the external command, `-`, or empty when
   for entry in "${STEPS[@]}"; do
     if [ "${entry%%:*}" = "$1" ]; then
       printf '%s' "${entry#*:}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+guard_field() { # guard_field <name> <2|3>: the guard's command or trigger; 1 when there is no such guard
+  local entry rest
+  for entry in "${GUARDS[@]}"; do
+    if [ "${entry%%:*}" = "$1" ]; then
+      rest=${entry#*:}
+      case "$2" in
+      2) printf '%s' "${rest%%:*}" ;;
+      3) printf '%s' "${rest#*:}" ;;
+      esac
       return 0
     fi
   done
@@ -344,12 +403,14 @@ step_tool() { # step_tool <name>
   shellcheck) printf 'shellcheck' ;;
   powershell) printf 'pwsh' ;;
   jq-version) printf 'jq' ;;
+  *) case "$(guard_field "$1" 2)" in *.py) printf 'python3' ;; esac ;;
   esac
 }
 
 run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped, 4 passed with a warning
   local name="$1" cmd tool
-  cmd=$(step_command "$name") || die "no such step: $name (run 'preflight.sh steps')"
+  cmd=$(step_command "$name") || cmd=$(guard_field "$name" 2) ||
+    die "no such step: $name (run 'preflight.sh steps' or 'preflight.sh guards')"
   tool=$(step_tool "$name")
   if [ -n "$tool" ] && ! have "$tool"; then
     if [ -n "$REQUIRE_TOOLS" ]; then
@@ -371,15 +432,26 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped, 4 passed with a warni
   if [ "$cmd" != '-' ]; then
     # Fail closed on a step whose script is not there: CI's own step would be a red `No such file`,
     # and a local pass over a check that did not run is the failure this script exists to end.
-    if [ ! -x "$cmd" ]; then
-      printf 'preflight: %s: FAIL (%s is not there or not executable)\n' "$name" "$cmd"
-      return 1
-    fi
-    if [ "$name" = preflight-fixtures ]; then
-      PREFLIGHT_IN_FIXTURES=1 "./$cmd"
-    else
-      "./$cmd"
-    fi
+    case "$cmd" in
+    *.py)
+      if [ ! -f "$cmd" ]; then
+        printf 'preflight: %s: FAIL (%s is not there)\n' "$name" "$cmd"
+        return 1
+      fi
+      python3 "./$cmd"
+      ;;
+    *)
+      if [ ! -x "$cmd" ]; then
+        printf 'preflight: %s: FAIL (%s is not there or not executable)\n' "$name" "$cmd"
+        return 1
+      fi
+      if [ "$name" = preflight-fixtures ]; then
+        PREFLIGHT_IN_FIXTURES=1 "./$cmd"
+      else
+        "./$cmd"
+      fi
+      ;;
+    esac
   else
     case "$name" in
     syntax) step_syntax ;;
@@ -415,6 +487,8 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped, 4 passed with a warni
 ROOT=
 REQUIRE_TOOLS=
 AS_CI=
+GUARDS_MODE=
+BASE_REF=origin/main
 WANTED=()
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -434,6 +508,19 @@ while [ "$#" -gt 0 ]; do
   --as-ci)
     AS_CI=1
     shift
+    ;;
+  --guards)
+    [ "$#" -ge 2 ] || die "--guards needs a mode: all, changed or none"
+    case "$2" in
+    all | changed | none) GUARDS_MODE=$2 ;;
+    *) die "--guards takes all, changed or none, not '$2'" ;;
+    esac
+    shift 2
+    ;;
+  --base)
+    [ "$#" -ge 2 ] || die "--base needs a ref"
+    BASE_REF=$2
+    shift 2
     ;;
   -*) die "unknown option: $1" ;;
   *)
@@ -480,17 +567,101 @@ if [ "${#WANTED[@]}" -eq 1 ]; then
     printf '%s\n' "${FILES[@]}"
     exit 0
     ;;
+  guards)
+    for entry in "${GUARDS[@]}"; do
+      printf '%s\t%s\t%s\n' "${entry%%:*}" "$(guard_field "${entry%%:*}" 2)" "$(guard_field "${entry%%:*}" 3)"
+    done
+    exit 0
+    ;;
   esac
 fi
+
+for name in ${WANTED[@]+"${WANTED[@]}"}; do
+  step_command "$name" >/dev/null || guard_field "$name" 2 >/dev/null ||
+    die "no such step: $name (run 'preflight.sh steps' or 'preflight.sh guards')"
+done
 
 if [ "${#WANTED[@]}" -eq 0 ]; then
   for entry in "${STEPS[@]}"; do WANTED+=("${entry%%:*}"); done
   printf 'preflight: judging %s\n' "$ROOT"
+  [ -n "$GUARDS_MODE" ] || GUARDS_MODE=changed
 fi
+[ -n "$GUARDS_MODE" ] || GUARDS_MODE=none
 
-for name in "${WANTED[@]}"; do
-  step_command "$name" >/dev/null || die "no such step: $name (run 'preflight.sh steps')"
-done
+is_wanted() { # is_wanted <name>
+  local w
+  for w in "${WANTED[@]}"; do [ "$w" = "$1" ] && return 0; done
+  return 1
+}
+
+# CHANGE_BASE: the merge base the `changed` mode compares against, or empty with CHANGE_WHY
+# saying why it cannot be told -- which runs every triggered guard rather than none.
+CHANGE_BASE=
+CHANGE_WHY=
+change_base() {
+  local toplevel
+  [ -z "$CHANGE_BASE$CHANGE_WHY" ] || return 0
+  # The judged root must BE the work tree root, as for the file list: a scratch tree under a
+  # checkout would otherwise be compared through the repository above it.
+  toplevel=$(git rev-parse --show-toplevel 2>/dev/null) &&
+    toplevel=$(CDPATH= cd "$toplevel" 2>/dev/null && pwd -P)
+  if [ -z "${toplevel:-}" ] || [ "$toplevel" != "$ROOT" ]; then
+    CHANGE_WHY="$ROOT is not the root of a git work tree"
+  elif ! git rev-parse --verify --quiet "$BASE_REF^{commit}" >/dev/null; then
+    CHANGE_WHY="no such commit: $BASE_REF (fetch it, or name another with --base)"
+  elif ! CHANGE_BASE=$(git merge-base "$BASE_REF" HEAD 2>/dev/null) || [ -z "$CHANGE_BASE" ]; then
+    CHANGE_BASE=
+    CHANGE_WHY="no merge base of $BASE_REF and HEAD"
+  fi
+}
+
+# Decide the guards before anything runs, so the reasons print above the verdicts they explain.
+case "$GUARDS_MODE" in
+all)
+  for entry in "${GUARDS[@]}"; do
+    is_wanted "${entry%%:*}" || WANTED+=("${entry%%:*}")
+  done
+  ;;
+changed)
+  untriggered=
+  for entry in "${GUARDS[@]}"; do
+    name=${entry%%:*}
+    is_wanted "$name" && continue
+    trigger=$(guard_field "$name" 3)
+    if [ -z "$trigger" ]; then
+      untriggered="$untriggered $name"
+      continue
+    fi
+    change_base
+    if [ -z "$CHANGE_BASE" ]; then
+      printf 'preflight: %s: due (cannot tell what changed: %s; running it rather than guessing)\n' "$name" "$CHANGE_WHY"
+      WANTED+=("$name")
+      continue
+    fi
+    # The working tree against the merge base: committed, staged and unstaged edits to tracked
+    # files alike, and nothing untracked, which is the scope the steps judge.
+    git diff --quiet --no-ext-diff "$CHANGE_BASE" -- "$trigger" >/dev/null 2>&1
+    case $? in
+    0)
+      printf "preflight: %s: not run (nothing matching '%s' differs from the merge base with %s, %s; --guards all runs it)\n" \
+        "$name" "$trigger" "$BASE_REF" "$(git rev-parse --short "$CHANGE_BASE")"
+      ;;
+    1)
+      printf "preflight: %s: due (a tracked file matching '%s' differs from the merge base with %s, %s)\n" \
+        "$name" "$trigger" "$BASE_REF" "$(git rev-parse --short "$CHANGE_BASE")"
+      WANTED+=("$name")
+      ;;
+    *)
+      printf "preflight: %s: due (git could not compare '%s' with the merge base; running it rather than guessing)\n" \
+        "$name" "$trigger"
+      WANTED+=("$name")
+      ;;
+    esac
+  done
+  [ -z "$untriggered" ] ||
+    printf 'preflight: not run here:%s (no file trigger; --guards all runs them, as CI always does)\n' "$untriggered"
+  ;;
+esac
 
 passed=0
 failed=0
