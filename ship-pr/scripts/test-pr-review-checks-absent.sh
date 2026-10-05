@@ -1882,6 +1882,44 @@ test_an_option_shaped_advisory_ere_is_a_pattern() {
   assert_not_contains "$ADVISORY_OUT" "x--helpy" "and the ERE is still matched as a pattern"
 }
 
+# The list is grep's to read, as it always was: a translation of the ERE that read a pattern outside
+# its own grammar as matching nothing turned an advisory red into a build red, and an advisory pass
+# into a build pass -- an ABSENT head read as green (parity review of the Python port). Two readings
+# both greps share that the translation missed: `\b`, and a newline, which makes each line a pattern.
+docs_red_probe() {
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"github pages docs","conclusion":"failure","html_url":"u/docs"},
+                                        {"name":"build","conclusion":"success","html_url":"u/build"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+}
+
+test_the_advisory_ere_is_greps_to_read() {
+  local pattern
+  for pattern in '^(claude|Claude Code)$|\bdocs\b' $'^claude$\n^github pages docs$'; do
+    reset_fixture
+    retune ADVISORY_FROM_ENV=1 BUILD_ADVISORY="$pattern"
+    docs_red_probe
+    advisory_read
+    assert_eq "$ADVISORY_RC" 0 "the docs red is advisory under '$pattern' ($ADVISORY_OUT)"
+    assert_contains "$ADVISORY_OUT" "green — 1 build checks passed" "so build alone is the signal"
+  done
+}
+
+# In the caller's locale: BSD grep refuses `[+-.]` in a UTF-8 locale and reads it in C, so the file
+# holding it is refused where grep refuses it and read where grep reads it -- whichever this box's
+# grep does (GNU grep may read it in both).
+test_the_advisory_file_is_validated_in_the_callers_locale() {
+  local loc want
+  for loc in en_US.UTF-8 C; do
+    want=0
+    printf '' | LC_ALL="$loc" grep -Eq -- '^[+-.]$' 2>/dev/null || [ "$?" -ne 2 ] || want=2
+    reset_fixture
+    docs_red_probe
+    ADVISORY_BODY=$'^github pages docs$\n^[+-.]$'
+    LC_ALL="$loc" advisory_read
+    assert_eq "$ADVISORY_RC" "$want" "LC_ALL=$loc: the file is refused exactly when grep refuses it ($ADVISORY_OUT)"
+  done
+}
+
 # SHIP_PR_ADVISORY_CHECKS set when the script was sourced still wins, without a read: here the
 # variable's list is the default one, so `macos`, which only the file names, stays red.
 test_the_variable_wins_over_the_file() {
@@ -2124,6 +2162,8 @@ tests=(
   test_an_advisory_file_that_cannot_be_used_refuses
   test_the_variable_wins_over_the_file
   test_an_option_shaped_advisory_ere_is_a_pattern
+  test_the_advisory_ere_is_greps_to_read
+  test_the_advisory_file_is_validated_in_the_callers_locale
   test_each_advisory_line_keeps_its_anchors
   test_an_unconfirmed_404_is_not_an_absent_file
   test_a_job_list_inside_the_settle_holds_its_run

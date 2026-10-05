@@ -145,6 +145,14 @@ class Production(unittest.TestCase):
                 self.assertEqual(done.returncode, 2, "a bare number with no repo is refused")
                 self.assertEqual(self.calls(), [], "and nothing is read")
 
+    def test_an_empty_wait_is_no_wait(self) -> None:
+        # The shell's `--wait=` set wait_for to '' and its arithmetic read that as 0.
+        self.route(GREEN)
+        for entry in self.entries():
+            with self.subTest(entry=entry[0]):
+                done = self.run_cmd(entry, "checks", "o/r#7", "--wait=")
+                self.assertEqual((done.returncode, done.stdout.splitlines()[-1]), (0, "checks: verdict=green"))
+
 
 if __name__ == "__main__":
     unittest.main()

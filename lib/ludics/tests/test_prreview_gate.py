@@ -1,4 +1,4 @@
-"""Units of the ``checks``/``merge`` port: the ERE boundary, the shell readings, the workflow-YAML
+"""Units of the ``checks``/``merge`` port: the advisory list as grep reads it, the shell readings, the workflow-YAML
 readers, the glob, the drift's hunk reader, the closing-keyword filter, and the gate's fold and
 wait loop driven through an in-process gh (``GhSession(run=...)``) and an injected clock.
 
@@ -8,56 +8,76 @@ conformance suite; these pin the rules inside the port that a regression would b
 
 import contextlib
 import io
+import os
+import subprocess
 import unittest
+from unittest import mock
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from ludics import proc
-from ludics.prreview import closekw, ere, shtext, workflows
+from ludics.prreview import closekw, shtext, workflows
 from ludics.prreview.core import Config, GhSession, Json
 from ludics.prreview.drift import compare_file_set, compare_hunks
 from ludics.prreview.gate import Clock, Gate, advisory_parse, conclusion_class, load_gate_config, newest_first
 
 
-class Ere(unittest.TestCase):
-    def matches(self, pattern: str, text: str) -> bool:
-        compiled = ere.compile_ere(pattern)
-        assert compiled is not None, pattern
-        return compiled.search(text) is not None
+def grep_refuses_in(locale: str, pattern: str) -> bool:
+    """Does this box's grep refuse ``pattern`` under ``locale``? (The oracle the shell asked.)"""
+    env = {**os.environ, "LC_ALL": locale}
+    done = subprocess.run(["grep", "-Eq", "--", pattern], input=b"", env=env, capture_output=True, check=False)
+    return done.returncode == 2
 
-    def test_the_default_list_reads_as_grep_reads_it(self) -> None:
-        default = "^(claude|Claude Code|github pages docs)$"
-        self.assertTrue(self.matches(default, "claude"))
-        self.assertTrue(self.matches(default, "Claude Code"))
-        self.assertFalse(self.matches(default, "claude-nightly"))
-        self.assertFalse(self.matches(default, "build"))
 
-    def test_each_joined_line_keeps_its_anchors(self) -> None:
-        joined = "^claude|macos$"
-        self.assertTrue(self.matches(joined, "claude-nightly"))
-        self.assertFalse(self.matches(joined, "macos-extra"))
-        self.assertTrue(self.matches(joined, "x-macos"))
+class Advisory(unittest.TestCase):
+    """The advisory list is grep's to read, as it was the shell's: these pin patterns a translation
+    to ``re`` read differently from grep (parity review of the port)."""
 
-    def test_brackets_classes_and_intervals(self) -> None:
-        self.assertTrue(self.matches("^[[:alpha:]]+ [0-9]{2,3}$", "build 12"))
-        self.assertFalse(self.matches("^[[:alpha:]]+ [0-9]{2,3}$", "build 1"))
-        self.assertTrue(self.matches("[]a]", "]"))
-        self.assertTrue(self.matches("[a-]", "-"))
-        self.assertTrue(self.matches("[^]a]", "b"))
-        self.assertTrue(self.matches("a{", "a{"))
-        self.assertTrue(self.matches(r"a\.b", "a.b"))
-        self.assertFalse(self.matches(r"a\.b", "axb"))
-        self.assertTrue(self.matches("--help", "x--helpy"))
-        self.assertTrue(self.matches(r"(a)\1", "aa"))
+    def advisory(self, pattern: str, name: str) -> bool:
+        gate = make_gate(FakeGh(), FakeClock(), SHIP_PR_ADVISORY_CHECKS=pattern)
+        return gate.is_advisory(name)
 
-    def test_what_the_two_greps_read_differently_is_refused(self) -> None:
-        for pattern in ("*a", "(+a)", "a|*b", "^*", "a**", "a+?", "a{1}{2}", "a|", "|a", "(|a)", "a)",
-                        "(a", "a\\", r"\d", r"\1", "[a", "[[:foo:]]", "[z-a]", "a{256}", "a{2,1}", "a{1"):
-            with self.subTest(pattern=pattern):
-                self.assertIsNone(ere.translate(pattern))
+    def test_the_default_list(self) -> None:
+        gate = make_gate(FakeGh(), FakeClock())
+        self.assertEqual(
+            [gate.is_advisory(n) for n in ("claude", "Claude Code", "github pages docs", "claude-nightly", "build")],
+            [True, True, True, False, False],
+        )
+
+    def test_an_escape_both_greps_read_is_read(self) -> None:
+        pattern = r"^(claude|Claude Code)$|\bdocs\b"
+        self.assertTrue(self.advisory(pattern, "github pages docs"))
+        self.assertFalse(self.advisory(pattern, "build"))
+
+    def test_a_newline_separates_patterns(self) -> None:
+        pattern = "^claude$\n^github pages docs$"
+        self.assertTrue(self.advisory(pattern, "github pages docs"))
+        self.assertTrue(self.advisory(pattern, "claude"))
+        self.assertFalse(self.advisory(pattern, "build"))
 
     def test_an_option_shaped_pattern_is_a_pattern(self) -> None:
-        self.assertFalse(self.matches("--help", "build"))
+        self.assertFalse(self.advisory("--help", "build"))
+        self.assertTrue(self.advisory("--help", "x--helpy"))
+
+    def test_a_pattern_grep_refuses_matches_nothing(self) -> None:
+        self.assertFalse(self.advisory("^(claude", "claude"))
+
+    def test_the_callers_locale_is_greps(self) -> None:
+        locale = "en_US.UTF-8"
+        if not grep_refuses_in(locale, "[+-.]"):
+            self.skipTest(f"this box's grep reads [+-.] in {locale}")
+        with mock.patch.dict(os.environ, {"LC_ALL": locale}):
+            self.assertFalse(self.advisory("^(claude|github pages docs)$|^[+-.]$", "github pages docs"))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(advisory_parse("^github pages docs$\n^[+-.]$", "f"))
+        with mock.patch.dict(os.environ, {"LC_ALL": "C"}):
+            self.assertTrue(self.advisory("^(claude|github pages docs)$|^[+-.]$", "github pages docs"))
+            self.assertEqual(advisory_parse("^github pages docs$\n^[+-.]$", "f"), "^github pages docs$|^[+-.]$")
+
+    def test_a_line_grep_refuses_refuses_the_file(self) -> None:
+        for body in ("^claude$\n^(macos", "[a", "[z-a]", "^claude$\n^(macos)\\1$"):
+            with self.subTest(body=body), contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(advisory_parse(body, "f"))
 
 
 class ShellReadings(unittest.TestCase):

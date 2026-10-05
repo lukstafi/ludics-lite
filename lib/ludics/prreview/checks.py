@@ -6,8 +6,9 @@ nothing judged. The last stdout line is always ``checks: verdict=<v>`` from a cl
 (ludics-lite#423): ``fleet-worker.sh prs`` reads the verdict from it, never from the prose.
 
 Exit: the gate's (0 green or a confirmed absence, 1 red, 3 unread, 4 no verdict yet, 5 superseded),
-or the policy's refusal (2, 3). ``--wait=`` takes whole seconds; the shell fed anything else to its
-arithmetic, which failed obscurely, so here it is a usage error (2).
+or the policy's refusal (2, 3). ``--wait=`` takes whole seconds, and an empty value is no wait (the
+shell's arithmetic read '' as 0); the shell fed anything else to its arithmetic, which failed
+obscurely (``abc`` ended the command with status 0 and no output), so here it is a usage error (2).
 """
 
 import os
@@ -23,7 +24,9 @@ VERDICTS = (
 
 
 def parse_wait(value: str, command: str) -> int:
-    """A ``--wait=<seconds>`` value: whole seconds, or a usage error."""
+    """A ``--wait=<seconds>`` value: whole seconds (empty is 0), or a usage error."""
+    if value == "":
+        return 0
     if not is_digits(value):
         die(f"{command}: --wait takes whole seconds, got '{value}'")
     return int(value)

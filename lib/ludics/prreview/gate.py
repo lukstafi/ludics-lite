@@ -10,8 +10,8 @@ override's waiver (``apply_waiver``/``is_waived``, #392), the check fold (``buil
 The shell's comments above each of those functions carry the incident history and every review
 round's reason; read them there before changing a rule here. What changed in the port is the
 mechanism only: the globals the shell threaded through command substitutions (VERDICT, CHECK_*,
-GATE_WAIVE, WAIVED, GATE_BASE) are the attributes of one ``Gate``, and grep's reading of the
-advisory EREs is ``ere``'s (see its boundary). Every gh call is the shell's, argument for argument,
+GATE_WAIVE, WAIVED, GATE_BASE) are the attributes of one ``Gate``. The advisory EREs are still
+grep's to read (``ere``: grep is asked, as the shell asked it). Every gh call is the shell's, argument for argument,
 and its TSV is read the way the shell's ``IFS=$'\\t' read`` read it (``shtext.tab_fields``), since
 the column-shifting that read does on an empty field is part of what the placeholders guard.
 """
@@ -234,8 +234,7 @@ class Gate:
     check_lines: str = ""
     waive_mode: Literal["", "record", "apply"] = ""
     waived: set[str] = field(default_factory=lambda: set[str]())
-    _advisory_re: re.Pattern[str] | None = None
-    _advisory_src: str | None = None
+    _advisory_seen: dict[tuple[str, str], bool] = field(default_factory=lambda: dict[tuple[str, str], bool]())
 
     def __post_init__(self) -> None:
         if not self.advisory:
@@ -245,12 +244,13 @@ class Gate:
 
     # SHARED-CANDIDATE: is_advisory
     def is_advisory(self, name: str) -> bool:
-        """``is_advisory``: the name matches the advisory ERE. A pattern outside ``ere``'s boundary
-        matches nothing (grep's refusal was a non-match too), which is the stricter gate."""
-        if self._advisory_src != self.advisory:
-            self._advisory_src = self.advisory
-            self._advisory_re = ere.compile_ere(self.advisory)
-        return self._advisory_re is not None and self._advisory_re.search(name) is not None
+        """``is_advisory``: grep matches the name against the advisory ERE (a pattern grep refuses
+        matches nothing, as in the shell). One process's answers are kept: a wait loop asks the same
+        names every round, and grep's answer for a pattern, a name and an environment is fixed."""
+        key = (self.advisory, name)
+        if key not in self._advisory_seen:
+            self._advisory_seen[key] = ere.matches(self.advisory, name)
+        return self._advisory_seen[key]
 
     def advisory_policy(self) -> int:
         """``advisory_policy``: the advisory list from the repository's ADVISORY_FILE on its default
@@ -825,8 +825,8 @@ class Gate:
 def advisory_parse(text: str, where: str) -> str | None:
     """``advisory_parse``: the file's ERE lines joined by ``|`` (blank lines, ``#`` comments and a
     trailing CR aside), or None -- having said why -- for a file that is not such a list: no ERE
-    line, a backreference (or an escaped backslash before a digit), a line or a join ``ere``
-    refuses."""
+    line, a backreference (or an escaped backslash before a digit), a line or a join grep
+    refuses (``ere.valid``)."""
     joined = ""
     n = 0
     for raw in text.split("\n"):
@@ -838,7 +838,7 @@ def advisory_parse(text: str, where: str) -> str | None:
         if re.search(r"\\[1-9]", line):
             warn(f"{where} holds a line with a backreference, which a list cannot keep: {line}")
             return None
-        if ere.translate(line) is None:
+        if not ere.valid(line):
             warn(f"{where} holds a line that is not an ERE grep accepts: {line}")
             return None
         n += 1
@@ -849,7 +849,7 @@ def advisory_parse(text: str, where: str) -> str | None:
             "every name; fix the file.",
         )
         return None
-    if ere.translate(joined) is None:
+    if not ere.valid(joined):
         warn(f"{where}'s lines do not join into an ERE grep accepts: {joined}")
         return None
     return joined
