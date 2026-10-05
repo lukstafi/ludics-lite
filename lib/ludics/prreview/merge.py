@@ -21,6 +21,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import assert_never
 
 from ludics import cli
 from ludics.prreview.checks import parse_wait
@@ -354,6 +355,8 @@ class Merge:
                     return
                 case GhFailed() | GhUnanswered() | GhArgsRefused():
                     pass
+                case _:
+                    assert_never(result)
             err = self.session.err_line()
             if "Base branch was modified" in err:
                 head = self.session.retry("read", ["api", f"repos/{repo}/pulls/{pr}", "--jq", '.head.sha // "-"'])

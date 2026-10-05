@@ -11,6 +11,7 @@ read is refused as unread, never taken for "none are open".
 
 import json
 from dataclasses import dataclass
+from typing import assert_never
 
 from ludics.prreview.core import GhFailed, GhOk, GhSession, GhUnanswered, Json, fail, shell_quote
 from ludics.prreview.shtext import JqError, is_number, jq_alt, jq_get, jq_tostring, tab_fields
@@ -94,6 +95,8 @@ def unresolved_threads(session: GhSession, repo: str, pr: str, page_cap: int) ->
                     f"GraphQL did not answer the review-threads read after {session.config.api_attempts}"
                     f" attempts ({session.err_line()})"
                 )
+            case _:
+                assert_never(result)
         try:
             doc: Json = json.loads(resp)
         except ValueError:

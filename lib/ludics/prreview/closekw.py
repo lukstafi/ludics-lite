@@ -49,12 +49,22 @@ def _lower(text: str) -> str:
 
 
 def scrub_urls(text: str) -> str:
-    """``scrub_urls``: every URL, with or without a scheme, blanked to a space."""
+    """``scrub_urls``: every URL, with or without a scheme, blanked to a space. A run link's
+    fragment is not an issue (round 3), and a schemeless host with a path, a query or a port is a
+    URL too (rounds 5, 8, 10, 11); the owner part is tightened to what a login can hold."""
     return _URL_HOST.sub(" ", _URL_SCHEME.sub(" ", text))
 
 
 def refs_of(unit: str, repo: str) -> list[str]:
-    """``refs_of``: the distinct issue references in ``unit``, as written."""
+    """``refs_of``: the distinct issue references in ``unit``, as written.
+
+    The boundary BEFORE a reference is a whitelist -- the unit's start, whitespace, an opening
+    bracket or quote, Markdown emphasis, a comma or semicolon -- because every blacklist of what a
+    URL puts before a hash was outflanked by the next URL shape (rounds 5 and 7). A number starts
+    at 1 (`#0` is prose, round 4). A boundary is owed AFTER the digits too (`#123abc` is a colour,
+    round 9). `owner/name` may lead its name with punctuation (`github/.github`, round 2). This
+    repository's qualified spelling is the bare one (round 5), and spellings are compared without
+    case (round 6), so one issue named twice is one issue (round 3)."""
     rest = unit
     out: list[str] = []
     seen: set[str] = set()
@@ -87,6 +97,13 @@ class Finding:
 
 
 def _scan_unit(unit: str, quoted: bool, repo: str) -> Finding | None:
+    # URLs go BEFORE the keyword is located, so the keyword and the references are read off the
+    # same text: a keyword in a URL path was a directive until round 16. The keyword's boundaries
+    # are whitelists on both sides: `close-out` and `closed/tracker#10` bind nothing (round 6), a
+    # non-ASCII letter after it makes another word (`fixés`, round 8), `_` is not a boundary
+    # (`auto_closes_items`, round 13), and a dot is one only when no identifier character follows
+    # (`fixes.md`, `fix._config`, rounds 14 and 15). The references are read FORWARD from the
+    # keyword: GitHub's syntax is the keyword followed by the reference (round 15).
     unit = scrub_urls(unit)
     m = _KEYWORD.search(_lower(unit))
     if m is None:
@@ -96,6 +113,8 @@ def _scan_unit(unit: str, quoted: bool, repo: str) -> Finding | None:
         return None
     if len(refs) < 2 and not quoted:
         return None
+    # The sentence is contributor-controlled text on its way to a terminal: a control byte could
+    # erase or forge the warning it appears in (round 13), so it is shown as `?`.
     shown = re.sub(r"^[ \t>*+-]+", "", unit, count=1)
     shown = re.sub(r"[ \t]+$", "", shown, count=1)
     shown = _CONTROL.sub("?", shown)
@@ -126,8 +145,13 @@ def scan(text: str, repo: str, plain: bool) -> list[Finding]:
     fence_len = 0
     for record in text.split("\n"):
         line = record[:-1] if record.endswith("\r") else record
+        # Up to three leading columns are indentation and four make a CODE block, counted in
+        # tab-expanded columns (rounds 4 and 6); an indented line is neither quote nor fence.
         indented = _columns(line) >= 4
         trimmed = re.sub(r"^[ \t]+", "", line, count=1)
+        # A quote or fence inside a LIST ITEM is still one (round 3): markers are peeled, an ordered
+        # one only up to nine digits (round 10), and four columns past a marker's one space of
+        # padding are code inside the item (round 11).
         while not indented:
             if re.match(r"[-*+][ \t]", trimmed):
                 trimmed = trimmed[2:]
@@ -142,6 +166,10 @@ def scan(text: str, repo: str, plain: bool) -> list[Finding]:
                 indented = True
                 break
             trimmed = re.sub(r"^[ \t]+", "", trimmed, count=1)
+        # A fence closes only on its OWN delimiter, at least as long as its opener, with nothing
+        # but blanks after it (rounds 1 and 2); a backtick opener's info string holds no backtick
+        # (round 6); and an indented delimiter neither opens nor closes one -- inside a fence it is
+        # content, and leaving a fence open is the safe error (rounds 12 and 16).
         quoted = False
         if not indented and trimmed[:3] in ("```", "~~~"):
             fch = trimmed[0]
@@ -160,10 +188,16 @@ def scan(text: str, repo: str, plain: bool) -> list[Finding]:
             quoted = True
         if not indented and trimmed.startswith(">"):
             quoted = True
+        # An indented code block is not SCANNED (round 11) -- except in a commit message, which is
+        # not Markdown: there an indented line is how a message quotes, and it closes all the same.
         if indented and not fence and not plain:
             continue
         if indented and not fence:
             quoted = True
+        # Terminal punctuation followed by whitespace ends a unit, with no abbreviation rule (its
+        # errors were false positives, round 5) and nothing enumerated between the stop and the
+        # space -- anything not starting with an alphanumeric may stand there, which covers every
+        # Markdown link form (rounds 3, 7, 8, 9) while a version number does not split.
         marked = _SENTENCE_END.sub(lambda mm: mm.group(0) + "\x01", line)
         for unit in marked.split("\x01"):
             found = _scan_unit(unit, quoted, repo)

@@ -10,13 +10,17 @@ and BSD grep 2.6 (macOS) both accept AND read the same way --
   after an atom; a ``{`` not followed by a digit as a literal; bracket expressions with ranges,
   a leading ``^``, a leading or trailing ``-``, a leading ``]``, the twelve ``[:class:]`` names and
   single-character ``[=x=]`` / ``[.x.]``; ``\\1``..``\\9`` naming a group already closed; the
-  GNU-and-BSD escapes ``\\w \\W \\s \\S \\b \\B \\< \\>``; and a backslash before punctuation,
-  which is that character.
+  GNU-and-BSD escapes ``\\w \\W \\s \\S \\< \\>``; and a backslash before punctuation, which is
+  that character.
 
 Everything else is REFUSED (``translate`` returns None), even where one of the two greps accepts it:
 a repetition with nothing before it (``*a``, ``(+a)``), two repetitions in a row (``a**``, ``a+?``),
 an empty branch beside a ``|``, an unmatched ``)``, a trailing backslash, and a backslash before a
-letter or digit outside the list above (``\\d`` is a digit to BSD grep and a ``d`` to GNU grep).
+letter or digit outside the list above (``\\d`` is a digit to BSD grep and a ``d`` to GNU grep;
+BSD grep's ``\\b`` matches inside ``-``, GNU grep's does not).
+Character classes and the word escapes are ASCII, as grep reads them in the C locale; ``.`` is
+one character, as grep reads it in a UTF-8 locale.
+
 For the repository's advisory file a refusal is a configuration error (exit 2), and for the
 variable a pattern that matches nothing -- in both cases the stricter gate, never a guess.
 """
@@ -45,8 +49,6 @@ _ESCAPES = {
     "W": r"\W",
     "s": r"\s",
     "S": r"\S",
-    "b": r"\b",
-    "B": r"\B",
     "<": r"\b(?=\w)",
     ">": r"\b(?<=\w)",
 }
@@ -152,7 +154,7 @@ class _Parser:
                     raise _Refused
                 return f"(?:\\{e})", True
             if e in _ESCAPES:
-                return _ESCAPES[e], e not in "bB<>"
+                return _ESCAPES[e], e not in "<>"
             if e.isalnum() or e == "_":
                 raise _Refused
             return re.escape(e), True
@@ -230,7 +232,7 @@ def translate(pattern: str) -> str | None:
     if parser.i != len(pattern):
         return None
     try:
-        re.compile(out)
+        re.compile(out, re.ASCII)
     except re.error:
         return None
     return out
@@ -239,4 +241,4 @@ def translate(pattern: str) -> str | None:
 def compile_ere(pattern: str) -> re.Pattern[str] | None:
     """``translate``, compiled; None for a pattern outside the boundary."""
     src = translate(pattern)
-    return None if src is None else re.compile(src)
+    return None if src is None else re.compile(src, re.ASCII)

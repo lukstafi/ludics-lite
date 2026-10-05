@@ -22,7 +22,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, assert_never
 
 from ludics import cli
 from ludics.prreview import ere
@@ -300,6 +300,8 @@ class Gate:
                     f"({self.session.err_line()}). The gate's policy is UNKNOWN; nothing was judged. Retry.",
                 )
                 return 3
+            case _:
+                assert_never(result)
 
     def advisory_absent(self) -> int:
         """``advisory_absent``: 0 when a directory listing that answered leaves the file out; 2 when
@@ -329,6 +331,8 @@ class Gate:
                     if leaf in raw.split("\n"):
                         return 2
                     return 0
+                case _:
+                    assert_never(result)
         return 2
 
     # --- the check fold -------------------------------------------------------------------------------
@@ -543,13 +547,16 @@ class Gate:
                 continue
             seen.add(key)
             runs += 1
-            match conclusion_class(concl):
+            cls = conclusion_class(concl)
+            match cls:
                 case "red":
                     red_rows.append(f"{rid}\t{name}\t{concl}\t{suite or '-'}")
                 case "nogo":
                     nogo += 1
-                case _:
+                case "green" | "pending":
                     pass
+                case _:
+                    assert_never(cls)
         red = 0
         red_note = ""
         for row in red_rows:
@@ -799,6 +806,8 @@ class Gate:
                 cli.say(f"{head}: green — {self.check_green} build checks passed")
             case "" | "superseded" | "unknown":
                 pass
+            case _:
+                assert_never(self.verdict)
         if self.check_lines:
             sys.stdout.write(self.check_lines)
         match self.verdict:
