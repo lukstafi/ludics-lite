@@ -82,7 +82,21 @@ failure_body() { # <the ref the reviewer could not fetch>
 # 2026-09-26): no ref, no findings, no "Codex Review:" prefix (ludics-lite#421).
 ENV_FAILURE_BODY='To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).'
 
+# The whole `rounds` command, as a caller runs it: its prose line, its trailer and its exit, from
+# whichever implementation serves it (ludics-lite#403).
 run_rounds() {
+  local capture rc
+  set +e
+  capture=$(cmd_rounds 7 2>&1)
+  rc=$?
+  set -e
+  ROUNDS_OUTPUT="$capture"
+  ROUNDS_RC="$rc"
+}
+
+# The shell's own count, which `watch` reads until it is ported: only for the one program no feed
+# can reach on its own (see test_a_broken_jq_program_is_not_a_round_count).
+run_shell_rounds() {
   local capture rc
   set +e
   capture=$(rounds_line "$(review_rounds 7)" 2>&1)
@@ -504,11 +518,13 @@ test_rounds_ends_with_its_trailer() {
   assert_eq "$(tail -n 1 <<<"$out")" "rounds: n=unknown threshold=12" "and its trailer says unknown, not 0"
 }
 
-# --- a jq program that ERRORS must not render as a count (ludics-lite#89) -----------------------
-# The shim is the preamble's (`with_broken_jq`, ludics-lite#179), and so is the control that it
-# breaks only the program it is pointed at. The count's own arm already refuses; the head tally
-# beside it defaults, and what this pins is that the default is the visible `?` and never a
-# plausible number.
+# --- a read that does not parse must not render as a count (ludics-lite#89) ---------------------
+# The count's read is reached from outside: a review whose submission time is not a date. The
+# head tally beside it reads nothing the count did not read first, so no feed reaches it alone;
+# it is a jq program of the SHELL's review_rounds, which `watch` reads until it is ported, broken
+# by name with the preamble's shim (`with_broken_jq`, ludics-lite#179). The count's own arm
+# refuses; the tally defaults, and what this pins is that the default is the visible `?` and never
+# a plausible number.
 
 test_a_broken_jq_program_is_not_a_round_count() {
   set_reviews \
@@ -522,12 +538,22 @@ test_a_broken_jq_program_is_not_a_round_count() {
     "the ordinary reading of this fixture"
   assert_contains "$ROUNDS_OUTPUT" "over 2 head(s)" "and the head tally with it"
 
-  with_broken_jq 'reduce .[] as $r' run_rounds
-  assert_eq "$ROUNDS_RC" 3 "a broken count program is UNKNOWN, not a number"
+  set_reviews \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
+    "$(review "$REVIEWER" COMMENTED bbbb 'yesterday, about noon')"
+  run_rounds
+  assert_eq "$ROUNDS_RC" 3 "a count that could not be read is UNKNOWN, not a number"
   assert_contains "$ROUNDS_OUTPUT" "NOT 'no rounds yet'" "and the line says so"
+  assert_contains "$ROUNDS_OUTPUT" "the reviews feed did not parse" "naming the read"
   assert_not_contains "$ROUNDS_OUTPUT" "rounds with findings: 0" "must not print a zero count"
+  assert_eq "$(tail -n 1 <<<"$ROUNDS_OUTPUT")" "rounds: n=unknown threshold=12" "and the trailer says unknown"
 
-  with_broken_jq '| unique | map(select(. != "")) | length' run_rounds
+  set_reviews \
+    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
+    "$(review "$REVIEWER" COMMENTED bbbb 2026-09-01T11:00:00Z)"
+  run_shell_rounds
+  assert_contains "$ROUNDS_OUTPUT" "over 2 head(s)" "control: the shell's own head tally"
+  with_broken_jq '| unique | map(select(. != "")) | length' run_shell_rounds
   assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
     "an unreadable head tally does not make the count unknown"
   assert_contains "$ROUNDS_OUTPUT" "over ? head(s)" \

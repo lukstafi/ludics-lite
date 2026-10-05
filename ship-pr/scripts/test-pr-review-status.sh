@@ -268,8 +268,26 @@ gh() {
   gh_fixture_answer "$response"
 }
 
-# The state line and its rendering, as `status` and `watch` produce them.
+# The state line and its rendering, as `status` produces them. Once `status` is served by Python
+# (ludics-lite#403) that is the Python's own state and rendering, asked through the two entry points
+# of ludics.prreview that pr-review.sh's command line does not route to (`status-state <pr>
+# [<pending-request watermark>]`, `status-line <state line> [<pr number>]`), so every case here
+# judges what `status` runs; the arguments are what the shell functions read from their caller's
+# scope (watch_nudge_after, PR_NUM). The shell's status_state and status_line still serve `watch`
+# until it is ported, and run_shell_status asks them directly.
 run_status() {
+  if py_ported status; then
+    STATE=$(py_forward call status-state 7 "${watch_nudge_after:-}")
+    LINE=$(py_forward call status-line "$STATE" "${PR_NUM:-}")
+  else
+    run_shell_status
+  fi
+}
+
+# The shell's own state, which `watch` reads until it is ported. Only the cases that break one of
+# its jq programs by name (with_broken_jq) need it: a program no feed can reach on its own has no
+# black-box form, and no Python counterpart to break.
+run_shell_status() {
   STATE=$(status_state 7)
   LINE=$(status_line "$STATE")
 }
@@ -1168,22 +1186,35 @@ test_empty_reviews_need_their_own_findings() {
   assert_eq "$(state_tok "$STATE")" stalled "newer empty envelope cannot supersede current-head Running row"
 }
 
-# --- a jq program that ERRORS must not render as a fact (ludics-lite#89) ------------------------
-# Every jq program status_state runs is a literal inside pr-review.sh, so the way to make ONE of
-# them fail without touching the tracked script is to shim `jq` itself. The shim and its
-# `with_broken_jq <marker> <cmd>...` helper are the preamble's (ludics-lite#179), and so is the
-# control that it breaks only the invocation the marker names.
+# --- a read that does not parse must not render as a fact (ludics-lite#89) ----------------------
+# Each site is reached from OUTSIDE: a feed answering a shape its read cannot take (an entry that is
+# not an object, a body that is not text), so the case judges whichever implementation serves
+# `status` (ludics-lite#403). Where no feed can reach a site on its own -- an earlier read of the
+# same feed takes every shape it would -- the site is a jq program of the SHELL's status_state,
+# which `watch` still reads: those cases break it by name with the preamble's `with_broken_jq`
+# shim (ludics-lite#179) and run it through run_shell_status.
 
-# assert_unknown_when_broken <marker> <detail fragment> <site>: break the one program the marker
-# names, on whatever fixture the caller has standing, and require the state to refuse rather than
-# answer. Each case pairs this with a control run on the same fixture, so an `unknown` the shim
+# assert_unknown_state <detail fragment> <site>: the state standing after a run refuses rather than
+# answers. Each case pairs it with a control run on the same fixture, so an `unknown` the fixture
 # itself produced could not pass for the site's own refusal.
-assert_unknown_when_broken() {
-  with_broken_jq "$1" run_status
-  assert_eq "$(state_tok "$STATE")" unknown "$3: a jq program error must not render as a value"
-  assert_contains "$(state_detail "$STATE")" "$2" "$3: the detail should name the read that did not answer"
+assert_unknown_state() {
+  assert_eq "$(state_tok "$STATE")" unknown "$2: a read that did not parse must not render as a value"
+  assert_contains "$(state_detail "$STATE")" "$1" "$2: the detail should name the read that did not answer"
   assert_contains "$LINE" "this is NOT 'not approved', retry" \
-    "$3: the rendered line should refuse, not report"
+    "$2: the rendered line should refuse, not report"
+}
+
+# assert_unknown_when_broken <marker> <detail fragment> <site>: break the one shell program the
+# marker names and require the shell's state to refuse.
+assert_unknown_when_broken() {
+  with_broken_jq "$1" run_shell_status
+  assert_unknown_state "$2" "$3"
+}
+
+# A reviewer's comment whose body is not text: the shape that reaches a comment read past the
+# reviewer filter every one of them applies first.
+reviewer_entry_with_a_number_body() {
+  jq -cn --arg rev "$REVIEWER" '{id:41, user:{login:($rev + "[bot]")}, created_at:"2026-09-01T00:00:00Z", body:7}'
 }
 
 test_a_broken_jq_program_is_unknown_not_a_value() {
@@ -1193,12 +1224,21 @@ test_a_broken_jq_program_is_unknown_not_a_value() {
   run_status
   assert_eq "$(state_tok "$STATE")" idle "the ordinary reading of this fixture"
 
-  assert_unknown_when_broken 'any(.[]; .content == "+1")' \
-    "the reactions feed did not parse" "the reactions feed"
+  # An entry of the reactions feed that is not an object.
+  REACTIONS_JSON='["not a reaction"]'
+  run_status
+  assert_unknown_state "the reactions feed did not parse" "the reactions feed"
+  REACTIONS_JSON='[]'
+  # A reviewer's comment whose body is not text: the first read of the comments takes it.
+  COMMENTS_JSON="[$(reviewer_entry_with_a_number_body)]"
+  run_status
+  assert_unknown_state "the comments feed did not parse" "the reviewer's last comment"
+  COMMENTS_JSON='[]'
+  # The rest read the same feeds after a read that takes every shape they would: shell-only.
+  run_shell_status
+  assert_eq "$(state_tok "$STATE")" idle "control: the shell's own reading of this fixture"
   assert_unknown_when_broken 'sort_by(.submitted_at) | last' \
     "the reviews feed did not parse" "the reviews feed"
-  assert_unknown_when_broken '.created_at] | max // ""' \
-    "the comments feed did not parse" "the reviewer's last comment"
   # These two used to default to "|" — no verdict comment, no initialization failure — which is
   # a plausible fact about the PR and is the shape ludics-lite#89 was filed on.
   assert_unknown_when_broken 'sort_by(.at) | last' \
@@ -1212,7 +1252,7 @@ test_a_broken_jq_program_is_unknown_not_a_value() {
 
 test_a_broken_jq_program_is_unknown_on_the_failed_head_read() {
   failed_fixture "$FAILED_HEAD"
-  run_status
+  run_shell_status
   assert_eq "$(state_tok "$STATE")" failed "control: this fixture reaches the failed-head read"
   # It used to default to "", which reads as "no review of this head" — the very question this
   # arm is asking, answered by a read that did not happen.
@@ -1227,8 +1267,11 @@ test_a_broken_jq_program_is_unknown_on_the_pending_request_read() {
   local watch_nudge_after=0
   run_status
   assert_eq "$(state_tok "$STATE")" idle "control: the pending-request read changes nothing here"
-  assert_unknown_when_broken '^@codex review' \
-    "the pending-request comments feed did not parse" "the pending-request read"
+  # The pending-request read is the first to take the comments, and reads every author's: a
+  # comment above the watermark whose body is not text.
+  COMMENTS_JSON='[{"id":42,"user":{"login":"me"},"created_at":"2026-09-01T00:00:00Z","body":7}]'
+  run_status
+  assert_unknown_state "the pending-request comments feed did not parse" "the pending-request read"
 }
 
 test_a_broken_jq_program_is_unknown_on_the_current_head_evidence() {
@@ -1236,8 +1279,10 @@ test_a_broken_jq_program_is_unknown_on_the_current_head_evidence() {
   REACTIONS_JSON="[$(reaction +1 "$PAST")]"
   run_status
   assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the evidence scan"
-  assert_unknown_when_broken '$running | map(select(. == null))' \
-    "the current-head review evidence did not parse" "the current-head evidence scan"
+  # Under a 👍 the evidence scan is the first read of the comments: a reviewer's body not text.
+  COMMENTS_JSON="[$(reviewer_entry_with_a_number_body)]"
+  run_status
+  assert_unknown_state "the current-head review evidence did not parse" "the current-head evidence scan"
 }
 
 # The other half of ludics-lite#89: a `capture` that never errors, it just stops producing. The
@@ -1371,10 +1416,11 @@ test_a_thread_path_is_shell_quoted() {
 test_a_broken_jq_program_is_unknown_on_the_thread_read() {
   approved_fixture
   THREADS_JSON="[$(review_thread 77 false)]"
-  set +e
-  CMD_OUT=$(with_broken_jq 'select(.isResolved != true)' cmd_status 7 2>&1)
-  CMD_RC=$?
-  set -e
+  run_cmd_status
+  assert_contains "$CMD_OUT" "BUT 1 review thread(s) still UNRESOLVED" "control: this fixture reads the threads"
+  # A thread node that is not an object, inside a connection that is whole.
+  THREADS_JSON='["not a thread"]'
+  run_cmd_status
   assert_eq "$CMD_RC" 3 "open threads that did not parse are not 'none are open'"
   assert_contains "$CMD_OUT" "threads that did not parse" "the site says so"
 }
@@ -1636,7 +1682,7 @@ test_a_completed_row_approval_passes_the_thread_gate() {
 
 test_a_broken_jq_program_is_unknown_on_the_completed_row_read() {
   completed_fixture
-  run_status
+  run_shell_status
   assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the Completed-row read"
   assert_unknown_when_broken 'max_by(.at | instant) | ([.row' \
     "the summary comments feed did not parse" "the Completed-row read"
@@ -1831,8 +1877,11 @@ test_a_broken_jq_program_is_unknown_on_the_request_read() {
   failed_run_fixture
   run_status
   assert_eq "$(state_tok "$STATE")" failed "control: this fixture reaches the request read"
-  assert_unknown_when_broken '@codex[[:space:]]+review' \
-    "the review-request comments feed did not parse" "the request read"
+  # The request read is the one that reads OTHER authors' comment bodies: one that is not text.
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(jq -cn \
+    '{id:2, user:{login:"me"}, created_at:"2026-09-04T22:50:00Z", updated_at:"2026-09-04T22:50:00Z", body:7}')]"
+  run_status
+  assert_unknown_state "the review-request comments feed did not parse" "the request read"
 }
 
 test_watch_re_requests_a_failed_run_once() {

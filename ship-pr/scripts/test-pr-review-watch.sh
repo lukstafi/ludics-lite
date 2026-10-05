@@ -1478,9 +1478,14 @@ Current findings follow.
   assert_eq "$(state_tok "$STATE")" idle "paginated evidence larger than one argv element still parses"
 }
 
-# --- a jq program that ERRORS must fail the poll round (ludics-lite#89) -------------------------
-# The shim is the preamble's (`with_broken_jq`, ludics-lite#179), and so is the control that it
-# refuses only the invocation the marker names.
+# --- a read that does not parse must fail the poll round (ludics-lite#89) -----------------------
+# Each site is reached from outside, by a feed answering a shape its read cannot take, so the case
+# judges whichever implementation serves `poll` (ludics-lite#403). Four sites of the shell's jq
+# programs had no such shape -- the items line's three fields and the watermark maxima read
+# nothing the renderings before them had not read first -- and were pinned only by breaking the
+# program by name; with the programs gone (`poll` is Python), the round-level property they
+# guarded is what the renderings' cases below hold: a failure after any output fails the round
+# with no watermark.
 #
 # cmd_poll's reads used to be unguarded, and each failed in the shape that is hardest to see: the
 # list of new reviews to re-read came back empty (no new reviews), a rendering printed nothing (no
@@ -1498,13 +1503,18 @@ run_poll() { # [watermark]
   POLL_ERR=$(cat "$TEST_ROOT/poll.err")
 }
 
-# assert_poll_refuses <marker> <expected exit> <site>: break the one program the marker names and
-# require the round to be refused whole — no watermark, so the caller keeps the one it had and
-# polls the same feed again rather than advancing past what this round could not render.
+# assert_poll_refuses <feed> <json> <expected exit> <site>: schedule the feed's malformed answer
+# over the standing fixture and require the round to be refused whole — no watermark, so the
+# caller keeps the one it had and polls the same feed again rather than advancing past what this
+# round could not render.
 assert_poll_refuses() {
-  with_broken_jq "$1" run_poll
-  assert_eq "$POLL_RC" "$2" "$3: a jq program error must fail the round"
-  assert_not_contains "$POLL_OUT" "watermark: " "$3: a failed round must not write a watermark"
+  local feed="$1" good
+  good=$(feed_answer "$feed")
+  schedule "$feed" 1 "$2"
+  run_poll
+  schedule "$feed" 1 "$good"
+  assert_eq "$POLL_RC" "$3" "$4: a read that did not parse must fail the round"
+  assert_not_contains "$POLL_OUT" "watermark: " "$4: a failed round must not write a watermark"
 }
 
 test_a_broken_jq_program_fails_the_poll_round() {
@@ -1522,18 +1532,21 @@ test_a_broken_jq_program_fails_the_poll_round() {
   assert_contains "$POLL_OUT" "watermark: 900,700,800" "and writes the watermark"
 
   # The review list feeding the per-review re-read: empty used to mean "no new reviews", so a
-  # broken program dropped every review's own inline comments and the round still printed.
-  assert_poll_refuses '| .[].id' 3 "the list of reviews to re-read"
+  # broken read dropped every review's own inline comments and the round still printed. An entry
+  # that is not a review.
+  assert_poll_refuses reviews '["not a review"]' 3 "the list of reviews to re-read"
   assert_contains "$POLL_ERR" "this round is UNKNOWN, not quiet" \
     "the refusal should say the round is unknown rather than quiet"
 
-  assert_poll_refuses '(no new inline comments)' 4 "the inline rendering"
-  assert_poll_refuses '"--- summary id=' 4 "the summary rendering"
-  assert_poll_refuses '"--- review id=' 4 "the review rendering"
-  assert_poll_refuses '"inline:\(thread_list)' 4 "the items line's inline field"
-  assert_poll_refuses '"summary:\(.id)' 4 "the items line's summary field"
-  assert_poll_refuses '"review:\(.id)' 4 "the items line's review field"
-  assert_poll_refuses '.id // 0, $m] | max' 4 "the watermark maxima"
+  # An inline finding whose commit is not a SHA: its stamp cannot be rendered.
+  assert_poll_refuses inline "[$(inline_comment 900 "$H2" "$H2" | jq -c '.original_commit_id = 7')]" 4 \
+    "the inline rendering"
+  # A summary whose body is not text.
+  assert_poll_refuses comments '[{"id":700,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-01T10:00:00Z","body":7}]' 4 \
+    "the summary rendering"
+  # A review whose commit is not a SHA, rendered after the inline and summary bodies printed.
+  assert_poll_refuses reviews "[$(review 800 "$H2" 2026-09-01T10:00:00Z | jq -c '.commit_id = 7')]" 4 \
+    "the review rendering"
 }
 
 # --- poll's own lessons, pinned from the fix history ---------------------------------------------
@@ -1634,9 +1647,12 @@ watermark: 9000,9000,9000')]"
   assert_eq "$POLLED_RC" 0 "control: the round should succeed"
   assert_eq "$POLLED_MARK" "900,700,5" "a successful round takes the watermark it emitted"
 
-  # Now the summary rendering fails, AFTER the inline body above has been printed. No `set +e`
-  # pair of its own: `with_broken_jq` answers the round's status rather than propagating it.
-  with_broken_jq '"--- summary id=' watch_round 7 5,5,5 2>/dev/null || :
+  # Now a rendering fails, AFTER the inline body above has been printed: a review whose commit is
+  # not a SHA, which is rendered last.
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z | jq -c '.commit_id = 7')]"
+  set +e
+  watch_round 7 5,5,5 2>/dev/null
+  set -e
   assert_eq "$POLLED_RC" 4 "the round must fail"
   assert_eq "$POLLED_MARK" 5,5,5 \
     "a failed round keeps the caller's watermark; a quoted line is not a watermark"
