@@ -265,6 +265,7 @@ def _items(value: Json) -> list[Json] | None:
     return value if isinstance(value, list) else None
 
 
+# SHARED-CANDIDATE: conclusion_class
 def conclusion_class(concl: str) -> Literal["red", "green", "pending", "nogo"]:
     """``conclusion_class``: a verdict, no verdict yet, or stopped without one."""
     if concl in ("failure", "timed_out", "startup_failure"):
@@ -296,7 +297,6 @@ def newest_first[T](rows: Sequence[T], created: Callable[[T], str], rid: Callabl
     return out
 
 
-# SHARED-CANDIDATE: age_of
 def iso_seconds(text: str) -> float | None:
     """jq's ``fromdateiso8601``: a UTC ``YYYY-MM-DDTHH:MM:SSZ`` as epoch seconds, else None (jq 1.8
     refuses fractional seconds too)."""
@@ -311,6 +311,7 @@ def iso_seconds(text: str) -> float | None:
     return when.timestamp()
 
 
+# SHARED-CANDIDATE: encode_ref
 def encode_ref(ref: str) -> str:
     """``encode_ref``: a branch name for a REST path or query, every byte outside the unreserved
     set percent-encoded and ``/`` kept literal (slashed branch names are the common case)."""
@@ -757,6 +758,7 @@ class Base:
 
     # --- the workflow file ---
 
+    # SHARED-CANDIDATE: workflow_path
     def workflow_path(self, wid: str) -> str | None:
         """``workflow_path``: where that workflow's file lives -- one path, inside the repo."""
         doc = self.gh_json(["api", f"repos/{self.repo}/actions/workflows/{wid}"])
@@ -767,6 +769,7 @@ class Base:
             return None
         return path
 
+    # SHARED-CANDIDATE: workflow_body
     def workflow_body(self, path: str, ref: str) -> str | None:
         """``workflow_body``: the file's own text at that ref, under the raw media type."""
         result = self.gh(["api", "-H", "Accept: application/vnd.github.raw",
@@ -835,6 +838,7 @@ class Base:
 
     # --- the paths-ignore settle ---
 
+    # SHARED-CANDIDATE: commit_files
     def commit_files(self, sha: str) -> list[str] | None:
         """``commit_files``: the paths ONE commit changed (a rename's both names), paginated;
         None when the answer is not evidence -- empty, or 300 files or more."""
@@ -849,6 +853,7 @@ class Base:
             return None
         return [name for row in rows for name in row if name]
 
+    # SHARED-CANDIDATE: range_files
     def range_files(self, vsha: str, tip: str) -> list[str] | None:
         """``range_files``: every path changed on the FIRST-PARENT path from the judged commit up
         to the tip, or None when the range is not evidence: not an ancestor (a force-push), longer
@@ -1676,6 +1681,7 @@ class Wait:
         return 0
 
 
+# SHARED-CANDIDATE: age_of
 def _age_of(stamp: str, now: float) -> int | None:
     """``age_of``: whole seconds since an ISO timestamp, or None (the shell's "-") when there is
     nothing to measure from -- including a stamp in the future."""
