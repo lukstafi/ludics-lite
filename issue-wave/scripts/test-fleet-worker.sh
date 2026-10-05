@@ -2780,6 +2780,13 @@ expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --ta
 ( cd "$TMP" && "$FW" launch testbox rel --target-repo example/project --kind claude --brief "$brief" --cwd "pro j" >/dev/null ) && settle rel
 grep -q "^cwd=$proj\$" "$ISSUE_WAVE_STATE/workers/rel/meta" && ok "a relative --cwd is recorded as its absolute path" || ko "relative cwd recorded: $(grep '^cwd=' "$ISSUE_WAVE_STATE/workers/rel/meta")"
 expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --target-repo example/project --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
+# Every verb but the slot probe runs in Python, through the checkout's scripts/py: a copy of the
+# script away from its checkout has none, and says so (exit 2, the environment is wrong) instead of
+# leaving it to exec's own error.
+mkdir -p "$TMP/stray/issue-wave/scripts" && cp "$FW" "$TMP/stray/issue-wave/scripts/fleet-worker.sh"
+expect "a copy of the script away from its checkout names the missing scripts/py, exit 2" 2 \
+  "^fleet-worker.sh: no .*/stray/scripts/py: run this script from its skills checkout" -- \
+  bash "$TMP/stray/issue-wave/scripts/fleet-worker.sh" status testbox w1
 }
 
 section_left
