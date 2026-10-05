@@ -4537,6 +4537,39 @@ test_session_tmpdir_refusal() {
   echo "PASS: temporary roots inside the session are refused before mutation"
 }
 
+# An unusable TMPDIR refuses at the helper's first allocation in it, the worktree-list snapshot,
+# which comes before the base fetch and before any reservation: the shell helper's order, which the
+# port keeps by still allocating (and removing) that snapshot file.
+test_unwritable_tmpdir_refusal() {
+  local tmp tracking refusal rc=0
+  setup_case unwritable-tmpdir merge main-off
+  tmp="$CASE_ROOT/unwritable-tmp"
+  mkdir "$tmp"
+  tracking=$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)
+  [ "$tracking" != "$(git -C "$CASE_REMOTE" rev-parse refs/heads/master)" ] ||
+    fail "the fixture's tracking ref is already the remote tip, so an early fetch would go unseen"
+  chmod a-w "$tmp"
+  if mkdir "$tmp/.write-probe" 2>/dev/null; then
+    rmdir "$tmp/.write-probe"
+    chmod u+w "$tmp"
+    skip_boundary "an unwritable directory: this account creates entries in a directory without write permission (root, or a platform whose directories do not keep the mode bit)"
+    return 0
+  fi
+  refusal=$(TMPDIR="$tmp" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1) || rc=$?
+  chmod u+w "$tmp"
+  assert_eq "$rc" 1 "an unwritable TMPDIR is an environment refusal"
+  case "$refusal" in
+  *"could not allocate the worktree list snapshot"*) ;;
+  *) fail "the refusal was not the first temporary allocation: $refusal" ;;
+  esac
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)" "$tracking" \
+    "an unwritable TMPDIR must refuse before the base fetch"
+  assert_eq "$(git -C "$CASE_MAIN" for-each-ref refs/ship-pr)" "" \
+    "an unwritable TMPDIR must refuse before any reservation"
+  assert_topic_preserved
+  echo "PASS: an unwritable TMPDIR refuses at the first allocation, before the fetch"
+}
+
 test_config_lock_refusal() {
   setup_case config-lock merge main-off
   : >"$CASE_MAIN/.git/config.lock"
@@ -5613,6 +5646,7 @@ TESTS=(
   test_option_like_branch_name
   test_relative_tmpdir
   test_session_tmpdir_refusal
+  test_unwritable_tmpdir_refusal
   test_config_lock_refusal
   test_symbolic_repository_config_refusal
   test_symbolic_worktree_config_preflight

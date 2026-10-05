@@ -362,6 +362,35 @@ class EntryPoint(unittest.TestCase):
         )
         self.assertEqual(done.stdout.strip(), "- 1", done.stderr)
 
+    def test_children_inherit_the_callers_locale_untouched(self) -> None:
+        # Python coerces a C locale (PEP 538) by exporting LC_CTYPE=C.UTF-8; the shell helper
+        # never did, so neither Git nor its hooks saw it, and %q escaped non-ASCII bytes.
+        if os.name == "nt":
+            self.skipTest("PEP 538 coercion is POSIX-only")
+        scratch = os.path.realpath(tempfile.mkdtemp(prefix="ludics-pmc-locale."))
+        try:
+            record = f"{scratch}/lc_ctype"
+            fake = f"{scratch}/git"
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/bin/sh\n"
+                    f'printf "%s\\n" "${{LC_CTYPE-unset}}" >"{record}"\n'
+                    "exit 1\n"
+                )
+            os.chmod(fake, 0o755)
+            base = {k: v for k, v in os.environ.items() if not k.startswith(("LC_", "LANG"))}
+            base["PATH"] = f"{scratch}{os.pathsep}{base['PATH']}"
+            for setting, seen in ((None, "unset"), ("C", "C"), ("en_US.UTF-8", "en_US.UTF-8")):
+                env = dict(base) if setting is None else {**base, "LC_CTYPE": setting}
+                done = subprocess.run(
+                    ["bash", HELPER, "a", "b", "c"], capture_output=True, text=True, env=env, check=False
+                )
+                self.assertEqual(done.returncode, 1, done.stderr)
+                with open(record, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), seen + "\n", setting)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
     def test_a_missing_runner_refuses_without_touching_anything(self) -> None:
         scratch = os.path.realpath(tempfile.mkdtemp(prefix="ludics-pmc-copy."))
         try:
@@ -396,7 +425,9 @@ class Interrupted(unittest.TestCase):
         with open(f"{self.bin}/git", "w", encoding="utf-8") as f:
             f.write(
                 "#!/bin/sh\n"
-                'case " $* " in *" fetch --no-tags origin "*) kill -TERM "$PPID"; sleep 2 ;; esac\n'
+                'case " $* " in *" fetch --no-tags origin "*)\n'
+                '  kill -TERM "$PPID"; sleep 2; : >"$0.finished" ;;\n'
+                'esac\n'
                 f'exec {shutil.which("git")} "$@"\n'
             )
         os.chmod(f"{self.bin}/git", 0o755)
@@ -407,7 +438,8 @@ class Interrupted(unittest.TestCase):
     def git(self, *args: str) -> str:
         return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
 
-    def test_sigterm_releases_every_reservation(self) -> None:
+    def terminated(self) -> None:
+        """Run the helper to the TERM its base fetch sends it; it dies of the signal."""
         if os.name == "nt":
             self.skipTest("POSIX signals")
         done = subprocess.run(
@@ -418,6 +450,16 @@ class Interrupted(unittest.TestCase):
             check=False,
         )
         self.assertEqual(done.returncode, -15, done.stderr)
+
+    def test_sigterm_lets_the_running_git_finish(self) -> None:
+        # The shell's EXIT trap never signalled a child: a Git killed mid-update would leave its
+        # ref lock behind in the caller's repository. The fake's descendants hold the captured
+        # streams, so the run above returns only once the fake has finished, or been killed.
+        self.terminated()
+        self.assertTrue(os.path.exists(f"{self.bin}/git.finished"), "the running git was killed")
+
+    def test_sigterm_releases_every_reservation(self) -> None:
+        self.terminated()
         self.assertEqual(self.git("-C", self.main, "for-each-ref", "refs/ship-pr"), "")
         self.assertEqual([n for n in os.listdir(self.dir) if "ship-pr" in n], [])
         self.assertNotIn("\nlocked", self.git("-C", self.main, "worktree", "list", "--porcelain"))

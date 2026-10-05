@@ -1258,9 +1258,20 @@ class Cleanup:
         self.branch_owner = ""
         self.branch_owner_count = 0
         self.session_locked = False
-        done = git("-C", self.main, "worktree", "list", "--porcelain", "-z", out="capture")
+        # The listing is read from a capture, but the shell's snapshot file is still allocated and
+        # removed: it is the helper's first write into TEMP_ROOT, so an unusable TMPDIR refuses
+        # here, before the base fetch and before any reservation, as it did in the shell.
+        snapshot = system.mktemp_file(f"{self.temp_root}/ship-pr-worktree-list.XXXXXX")
+        if snapshot is None:
+            fail("could not allocate the worktree list snapshot")
+        try:
+            done = git("-C", self.main, "worktree", "list", "--porcelain", "-z", out="capture")
+        finally:
+            removed = system.unlink(snapshot)
         if done.rc != 0:
             fail("could not inspect registered worktrees")
+        if not removed:
+            fail("could not remove the worktree list snapshot")
         current = ""
         for entry in system.nul_records(done.out):
             if entry.startswith("worktree "):
@@ -1937,13 +1948,6 @@ class Cleanup:
         archived = self.session_archived_worktree
         error = system.atomic_rename(session, archived)
         if error is not None:
-            if isinstance(error, PermissionError) and os.name == "nt":
-                # ludics-lite#393: Windows refuses to rename a directory that any running process
-                # holds as its working directory, and the refusal would not otherwise say so.
-                note(
-                    "Windows will not rename a directory that a running process holds as its "
-                    f"working directory: is a session, shell or editor still open in {show(session)}?"
-                )
             fail(f"could not archive session worktree atomically: {show(session)}")
         # The session HEAD lock taken during the ownership handoff stays held across this rename
         # and the unregistering.

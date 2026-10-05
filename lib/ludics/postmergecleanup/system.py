@@ -175,19 +175,23 @@ def git(
     sys.stdout.flush()
     sys.stderr.flush()
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            input=stdin,
+            stdin=None if stdin is None else subprocess.PIPE,
             stdout=_redirect(out),
             stderr=_redirect(err),
             env=environ,
-            check=False,
         )
     except OSError as error:
         if err == "inherit":
             cli.note(PROG, f"git: {error.strerror}")
         return Done(126, "")
-    captured = decode(proc.stdout) if out == "capture" else ""
+    # Not subprocess.run: it kills the child on any exception, and a SIGTERM, SIGHUP or SIGINT
+    # reaches this process as one (``Signalled``, KeyboardInterrupt). A Git killed mid-update
+    # leaves its ref or index lock behind in the caller's repository; the shell's EXIT trap never
+    # signalled its children, so a Git running when the helper is stopped is left to finish.
+    stdout, _ = proc.communicate(stdin)
+    captured = decode(stdout) if out == "capture" else ""
     return Done(status_of(proc.returncode), captured)
 
 
