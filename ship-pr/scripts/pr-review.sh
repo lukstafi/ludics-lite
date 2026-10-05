@@ -899,13 +899,17 @@ budget_endpoint() {
       return 0
     }
     shift 2
+    # Every value-taking option's value is consumed, as `gh run view --help` lists them, so a
+    # `--json status` is not read as the run's id.
     for a in "$@"; do
       case "$skip" in
       repo) repo="$a" skip="" && continue ;;
+      value) skip="" && continue ;;
       esac
       case "$a" in
       --repo | -R) skip=repo ;;
       --repo=*) repo="${a#--repo=}" ;;
+      --json | --jq | -q | --template | -t | --attempt | -a | --job | -j) skip=value ;;
       -*) ;;
       *) [ -n "$id" ] || id="$a" ;;
       esac
@@ -1074,17 +1078,20 @@ hold_set() {
     mv -f "$tmp" "$BUDGET_DIR/quota-holds/$until.${tmp##*/.new.}"
 }
 
-# hold_lift <probe start>: the probed endpoint answered. Removes every entry that had ended when
-# the probe started, and remembers the longest of them in quota-last.
+# hold_lift <endpoint> <probe start>: that endpoint answered its probe. Removes ITS entries that
+# had ended when the probe started, and remembers the longest of them in quota-last. Another
+# endpoint's entries stay: its answer is its own (GraphQL and REST have separate quotas), so
+# the gate probes each in turn.
 hold_lift() {
-  local f u l longest=0
+  local f u l ep longest=0
   for f in "$BUDGET_DIR/quota-holds"/[0-9]*; do
     [ -f "$f" ] || continue
     u="${f##*/}"
     u="${u%%.*}"
     case "$u" in '' | *[!0-9]*) continue ;; esac
-    [ "$u" -le "$1" ] || continue
-    IFS=$'\t' read -r _ l _ <"$f" 2>/dev/null
+    [ "$u" -le "$2" ] || continue
+    IFS=$'\t' read -r ep l _ <"$f" 2>/dev/null
+    [ "$ep" = "$1" ] || continue
     case "$l" in '' | *[!0-9]*) ;; *) [ "$l" -le "$longest" ] || longest="$l" ;; esac
     rm -f "$f"
   done
@@ -1092,14 +1099,20 @@ hold_lift() {
 }
 
 # lock_take <dir>: status 0 once this process holds the lock <dir> (or already did), 1 while a live
-# process holds it, naming it in LOCK_HOLDER and LOCK_SINCE. A lock is a directory holding `owner`
+# process holds it, naming it in LOCK_HOLDER and LOCK_SINCE, 2 when it cannot be taken at all. A lock is a directory holding `owner`
 # (a pid, then the epoch it was taken). A holder that no longer runs is replaced, and so is a
 # directory still ownerless a second after it was first seen: its claimant died between the mkdir
 # and the write, and it would otherwise lock everyone out for good.
 lock_take() {
-  local dir="$1" holder seen=""
+  local dir="$1" holder seen="" tries=0
   LOCK_HOLDER="" LOCK_SINCE=""
   while ! mkdir "$dir" 2>/dev/null; do
+    # A mkdir that failed with no directory there failed for another reason than a holder (an
+    # unwritable state directory), and so does a lock that five reaps could not clear: status 2,
+    # rather than waiting on something no holder will ever release.
+    [ -d "$dir" ] || return 2
+    tries=$((tries + 1))
+    [ "$tries" -le 5 ] || return 2
     holder=$(sed -n 1p "$dir/owner" 2>/dev/null)
     [ "$holder" != "$$" ] || return 0
     if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
@@ -1167,19 +1180,27 @@ budget_gate() {
       return 3
     fi
     # The hold has ended. One process probes its endpoint; the rest wait for that probe's answer.
-    if lock_take "$BUDGET_DIR/quota-probe"; then
+    lock_take "$BUDGET_DIR/quota-probe"
+    case $? in
+    2)
+      GH_ERR="quota hold: cannot take the probe lock $BUDGET_DIR/quota-probe (SHIP_PR_STATE_DIR); no call was made"
+      printf '%s' "$GH_ERR" >"$GH_ERR_FILE" 2>/dev/null
+      return 3
+      ;;
+    0)
       probe_start=$(budget_now)
       verdict=$(budget_probe "$HOLD_EP")
       case "$verdict" in
       ok)
-        hold_lift "$probe_start"
+        hold_lift "$HOLD_EP" "$probe_start"
         warn "quota hold lifted: $HOLD_EP answered again"
         ;;
       *) hold_set "$HOLD_EP" "$verdict" ;;
       esac
       rm -rf "$BUDGET_DIR/quota-probe"
       continue
-    fi
+      ;;
+    esac
     if [ "$mode" = read ] && [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$now" -lt "$BUDGET_WAIT_UNTIL" ]; then
       sleep 5
       continue
@@ -1213,10 +1234,14 @@ observer_claim() {
   dir="$BUDGET_DIR/observers/$key"
   [ "$BUDGET_OBSERVER" != "$dir" ] || return 0
   mkdir -p "$BUDGET_DIR/observers" 2>/dev/null || die "cannot create $BUDGET_DIR/observers for the observer lock"
-  lock_take "$dir" ||
-    die "PR $REPO#$PR_NUM already has a $kind observer: pid $LOCK_HOLDER${LOCK_SINCE:+, since $(budget_at "$LOCK_SINCE")}." \
-      "One observer per PR: wait on that one, or stop it, rather than reading the PR twice." \
-      "Nothing was read."
+  lock_take "$dir"
+  case $? in
+  0) ;;
+  1) die "PR $REPO#$PR_NUM already has a $kind observer: pid $LOCK_HOLDER${LOCK_SINCE:+, since $(budget_at "$LOCK_SINCE")}." \
+    "One observer per PR: wait on that one, or stop it, rather than reading the PR twice." \
+    "Nothing was read." ;;
+  *) die "cannot take the $kind observer lock $dir (SHIP_PR_STATE_DIR). Nothing was read." ;;
+  esac
   BUDGET_OBSERVER="$dir"
 }
 
@@ -1273,9 +1298,24 @@ repo_from_cwd() {
   # whichever repo gh already decided the PRs live in. It is not gh_retry's call, so it passes the
   # quota hold's gate itself (see "the polling budget"). A hold is never a reason to fall back to
   # the remote below, which in a fork names the fork and not the repository gh resolved.
+  local out err
   budget_gate read || fail 3 "could not resolve the repository from the checkout: $(gh_err_line)." \
     "Pass it as owner/name, or wait for the hold."
-  gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null | grep . && return 0
+  err="${TMPDIR:-/tmp}/pr-review-gh.$$.repo-view"
+  out=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>"$err")
+  if [ -n "$out" ]; then
+    rm -f "$err"
+    printf '%s\n' "$out"
+    return 0
+  fi
+  # Refused on quota, it is a hold like any other call's, and still no reason for the remote.
+  if quota_failure "$(sed -n 1p "$err" 2>/dev/null)"; then
+    rm -f "$err"
+    budget_quota_hit repo view
+    fail 3 "could not resolve the repository from the checkout: gh repo view was refused on quota." \
+      "Pass it as owner/name, or wait for the hold."
+  fi
+  rm -f "$err"
   # ... but it rides GraphQL, so fall back to the origin remote, which answers the same question
   # locally and stays up when GraphQL does not.
   url=$(git remote get-url origin 2>/dev/null) || return 1
@@ -4571,7 +4611,7 @@ cmd_resolve() {
 # UNKNOWN; 4 no verdict — still running at the deadline, or stopped without being judged.
 cmd_run_watch() {
   local run_ref="" run_id="" repo="" flag_repo="" interval="$CHECKS_INTERVAL"
-  local line rc status concl sleep_for remaining
+  local line rc status concl sleep_for remaining last_status="" last_pause=""
   while [ $# -gt 0 ]; do
     case "$1" in
     -R | --repo)
@@ -4658,11 +4698,18 @@ cmd_run_watch() {
         "$(((now - started) / 60)) min"
       beat=$now
     fi
-    # Capped at the remaining deadline: -i is a documented pass-through, and an interval longer
-    # than what is left would sleep the process hours past the advertised ceiling before the
-    # clock is checked again.
+    # The polling budget's pause: the interval while the run's status moves, doubling toward the
+    # build cap while it does not. Capped at the remaining deadline: -i is a documented
+    # pass-through, and an interval longer than what is left would sleep the process hours past
+    # the advertised ceiling before the clock is checked again.
     remaining=$((deadline - now))
-    sleep_for="$interval"
+    if [ "$status" = "$last_status" ]; then
+      sleep_for=$(budget_pause "$interval" "$BUILD_POLL_CAP" "$last_pause" 0)
+    else
+      sleep_for=$(budget_pause "$interval" "$BUILD_POLL_CAP" "" 1)
+    fi
+    last_status="$status"
+    last_pause="$sleep_for"
     [ "$sleep_for" -le "$remaining" ] || sleep_for="$remaining"
     sleep "$sleep_for"
   done
@@ -5690,7 +5737,9 @@ gate_checks() {
     # toward the build cap while a queue sits still. Capped at the remaining deadline, same as
     # cmd_base and cmd_run_watch: a pause longer than what is left would sleep the process past
     # the advertised ceiling before the clock is checked again.
-    sig="$VERDICT|${CHECK_PENDING:-}|${CHECK_GREEN:-}|${CHECK_TOTAL:-}|$run_why"
+    # The signal's state alone: run_why is prose for a person, and it carries the head's age
+    # during the run-creation grace, which moves on every read whether or not anything else did.
+    sig="$VERDICT|${CHECK_PENDING:-}|${CHECK_GREEN:-}|${CHECK_TOTAL:-}"
     if [ "$sig" = "$last_sig" ]; then
       sleep_for=$(budget_pause "$CHECKS_INTERVAL" "$BUILD_POLL_CAP" "$last_pause" 0)
     else

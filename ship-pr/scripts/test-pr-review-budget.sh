@@ -48,6 +48,8 @@ FAIL_502=""          # an endpoint glob that answers 502 (transport)
 PROBE_ANSWERS=""     # nonempty: a probe answers even during the quota (a secondary limit on the
                      # refused operation, which the probe's cheaper request does not meet)
 PROBE_HOOK=""        # run as a probe answers: what lands meanwhile, e.g. another refusal's hold
+REPO_VIEW_QUOTA=""   # nonempty: `gh repo view` is refused on quota
+RUN_STATUSES=()      # the run await's reads, in order ("" = completed at once)
 GRAPHQL_PROBE=""     # how GraphQL's probe answers: "" (200, quota left), exhausted (a 200 with
                      # Remaining 0), secondary (a 200 whose body says so, no header)
 
@@ -118,6 +120,10 @@ gh() {
   fi
   if [ "${1:-} ${2:-}" = "repo view" ]; then
     printf 'repo view\n' >>"$CALL_LOG"
+    if [ -n "$REPO_VIEW_QUOTA" ]; then
+      echo "GraphQL: API rate limit exceeded for user ID 1." >&2
+      return 1
+    fi
     printf '%s\n' "$REPO"
     return 0
   fi
@@ -126,6 +132,16 @@ gh() {
     if [ "$(now)" -lt "$QUOTA_UNTIL" ]; then
       echo "gh: API rate limit exceeded for user ID 1. (HTTP 403)" >&2
       return 1
+    fi
+    if [ "${#RUN_STATUSES[@]}" -gt 0 ]; then
+      a=$(cat "$TEST_ROOT/runs.calls" 2>/dev/null) || a=0
+      printf '%s' "$((a + 1))" >"$TEST_ROOT/runs.calls"
+      [ "$a" -lt "${#RUN_STATUSES[@]}" ] || a=$((${#RUN_STATUSES[@]} - 1))
+      case "${RUN_STATUSES[$a]}" in
+      completed) printf 'completed\tsuccess\n' ;;
+      *) printf '%s\tpending\n' "${RUN_STATUSES[$a]}" ;;
+      esac
+      return 0
     fi
     printf 'completed\tsuccess\n'
     return 0
@@ -214,6 +230,9 @@ reset_fixture() {
   PROBE_ANSWERS=""
   PROBE_HOOK=""
   GRAPHQL_PROBE=""
+  REPO_VIEW_QUOTA=""
+  RUN_STATUSES=()
+  rm -f "$TEST_ROOT/runs.calls"
   retune ADVISORY_FROM_ENV=1
 }
 
@@ -460,6 +479,54 @@ test_resolving_the_repo_passes_the_hold() {
   run ended repo_from_cwd
   assert_eq "$(rc ended) $(out ended)" "0 $REPO" "an ended hold is probed and lifted ($(err ended))"
   assert_eq "$(requests | tr '\n' '|')" "probe graphql ok|repo view|" "the probe first, then gh"
+  # gh repo view refused on quota itself: a hold like any other call's, and still no guess.
+  reset_fixture
+  REPO_VIEW_QUOTA=1
+  run refused repo_from_cwd
+  assert_eq "$(rc refused)" 3 "a quota refusal of gh repo view is exit 3 ($(err refused))"
+  assert_eq "$(out refused)" "" "with no repository guessed from the remote"
+  assert_eq "$(standing | cut -f2)" graphql "and it sets the hold, on GraphQL"
+}
+
+# Entries for different endpoints end separately and are probed separately: GraphQL and REST have
+# separate quotas, so one answering lifts only its own entries, and the gate then probes the next.
+test_each_endpoint_is_probed_before_its_hold_lifts() {
+  reset_fixture
+  plant_hold "$((T0 - 10))" "repos/$REPO/pulls/7" 600
+  plant_hold "$((T0 - 1))" graphql 600
+  run single cmd_checks "$REPO#7"
+  assert_eq "$(rc single)" 0 "both answer, and the read goes out ($(err single))"
+  assert_eq "$(requests | sed -n 1,3p | tr '\n' '|')" "probe graphql ok|probe repos/$REPO/pulls/7 ok|read repos/$REPO/pulls/7|" \
+    "the latest entry's endpoint first, then the other's, each before its own entries go"
+  assert_eq "$(standing)" "" "and nothing stands after"
+}
+
+# The run await is an observer too: a run that stays queued backs off toward the build cap.
+test_the_run_await_backs_off_on_a_still_run() {
+  reset_fixture
+  RUN_STATUSES=(queued queued queued queued completed)
+  run await cmd_retry run watch "$REPO#55"
+  assert_eq "$(rc await)" 0 "the run's green is the verdict ($(err await))"
+  assert_eq "$(tr '\n' ' ' <"$SLEEP_LOG")" "60 120 240 480 " "an unchanged status doubles the pause"
+}
+
+# The endpoint a `run view` probe addresses: every value-taking option's value is consumed first.
+test_a_run_view_probe_finds_the_run_id() {
+  assert_eq "$(budget_endpoint run view --json status 123 --repo o/r)" "repos/o/r/actions/runs/123" \
+    "--json's value is not the run id"
+  assert_eq "$(budget_endpoint run view -R o/r --jq .status --attempt 2 -t x 456)" "repos/o/r/actions/runs/456" \
+    "nor --jq's, --attempt's or --template's"
+}
+
+# A lock that cannot be made at all (here: its parent is a file) is an error, status 2, at once:
+# not a holder to wait on forever.
+test_a_lock_that_cannot_be_made_is_an_error() {
+  local rc=0
+  reset_fixture
+  : >"$STATE_DIR/a-file"
+  lock_take "$STATE_DIR/a-file/lock" || rc=$?
+  assert_eq "$rc" 2 "an unmakeable lock is status 2"
+  assert_eq "$(cat "$SLEEP_LOG")" "" "without waiting"
 }
 
 # A refusal can land while an ended hold is being probed (a request already in flight). The lift
@@ -566,6 +633,10 @@ run_tests \
   test_a_reap_keeps_a_lock_retaken_meanwhile \
   test_another_host_is_outside_the_budget \
   test_a_graphql_200_can_still_be_quota \
+  test_each_endpoint_is_probed_before_its_hold_lifts \
+  test_the_run_await_backs_off_on_a_still_run \
+  test_a_run_view_probe_finds_the_run_id \
+  test_a_lock_that_cannot_be_made_is_an_error \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
