@@ -955,9 +955,10 @@ tree, and "I tested it earlier" is the stale test claim of #745. It is not for "
 that is the day it exists to refuse.
 
 `cancelled` is deliberately neither red nor green — a cancel is a job that was stopped, not one
-that found something, and a matrix sets `fail-fast: false` precisely so a red leg does not
-cancel its siblings and destroy the information. A cancel here comes from a superseding push or
-a manual stop, and re-running is what turns it into an answer; it is exit 4 like a running job, and
+that found something. A matrix left at GitHub's default `fail-fast: true` cancels its siblings when
+one leg fails; that leg's failure is the red the gate reports (exit 1), and the cancelled siblings
+are the information `fail-fast: false` keeps. Any other cancel comes from a superseding push or a
+manual stop, and re-running is what turns it into an answer; it is exit 4 like a running job, and
 `--allow-no-verdict` is no more acceptable for it.
 
 `--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), and so is a
