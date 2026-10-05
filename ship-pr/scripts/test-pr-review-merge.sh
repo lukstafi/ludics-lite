@@ -64,6 +64,12 @@ BASE_MOVED=""
 BASE_READ_FAIL=""                      # nonempty = the merge loop's base read answers with a 503
 HEAD_AFTER_MOVE=""                     # nonempty = the head the gate reads once the base moved
 MOVED_RUN_RC=""                        # nonempty = run_signal's status on the moved base
+BASE_KEEPS_MOVING=""                   # nonempty = every base read answers a base no read gave before
+CHECKS_FAIL=""                         # nonempty = the head's check-run read does not answer
+MERGEABLE=true                         # what the mergeable read answers; FAIL = it does not answer
+STATE_FAIL=""                          # nonempty = the merged-state read after the call does not answer
+DISABLE_AUTO_FAIL=""                   # nonempty = `pr merge --disable-auto` is refused
+MERGE_QUEUE_FAIL=""                    # nonempty = the merge-queue read gets a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
 # the names body, base and default-branch: gh_retry calls the fixture inside a command
 # substitution, so a variable it increments dies with that subshell, and the count has to travel
@@ -80,6 +86,7 @@ stub build_checks run_signal warn_base_drift
 build_checks() {
   local reads
   reads=$(fixture_call_count checks) || return 1
+  [ -z "$CHECKS_FAIL" ] || return 3
   if [ -n "$CHECK_ROWS_LATER" ] && [ "$reads" -ge 2 ]; then
     printf '%s\n' "$CHECK_ROWS_LATER"
   elif [ -n "$CHECK_ROWS" ]; then
@@ -103,7 +110,9 @@ run_signal() {
 }
 # The PR's base and head as the gate's reads see them: moved once the merge loop has read the base.
 fixture_base() {
-  if [ -n "$BASE_MOVED" ] && [ "$(fixture_call_total base-sha)" -ge 1 ]; then
+  if [ -n "$BASE_KEEPS_MOVING" ]; then
+    printf 'moved-%s\n' "$(fixture_call_total base-sha)"
+  elif [ -n "$BASE_MOVED" ] && [ "$(fixture_call_total base-sha)" -ge 1 ]; then
     printf '%s\n' "$BASE_MOVED"
   else
     printf '%s\n' base-sha
@@ -170,8 +179,20 @@ gh() {
         printf '%s\n' "$PR_BODY"
       fi
       ;;
-    *merged=*) echo "$MERGE_STATE" ;;
-    *'.mergeable'*) echo true ;;
+    *merged=*)
+      if [ -n "$STATE_FAIL" ]; then
+        printf 'gh: 503 No server is currently available to service your request\n' >&2
+        return 1
+      fi
+      echo "$MERGE_STATE"
+      ;;
+    *'.mergeable'*)
+      if [ "$MERGEABLE" = FAIL ]; then
+        printf 'gh: 503 No server is currently available to service your request\n' >&2
+        return 1
+      fi
+      echo "$MERGEABLE"
+      ;;
     *) bail "unexpected pulls read: $*" ;;
     esac
     ;;
@@ -238,12 +259,27 @@ gh() {
         gh_fixture_answer "$(review_threads_answer "$THREADS_JSON" "$@")"
       fi
       ;;
-    *mergeQueue*) printf 'CALL %s\n' "$*" >>"$CALLS_FILE"; echo "$MERGE_QUEUE" ;;
+    *mergeQueue*)
+      printf 'CALL %s\n' "$*" >>"$CALLS_FILE"
+      if [ -n "$MERGE_QUEUE_FAIL" ]; then
+        printf 'gh: 503 No server is currently available to service your request\n' >&2
+        return 1
+      fi
+      echo "$MERGE_QUEUE"
+      ;;
     *) bail "unexpected graphql call: $*" ;;
     esac
     ;;
   "pr merge")
     printf 'CALL %s\n' "$*" >>"$CALLS_FILE"
+    case "$*" in *--disable-auto*)
+      if [ -n "$DISABLE_AUTO_FAIL" ]; then
+        printf 'gh: 503 No server is currently available to service your request\n' >&2
+        return 1
+      fi
+      return 0
+      ;;
+    esac
     if [ -n "$MERGE_REFUSAL" ]; then
       printf '%s\n' "$MERGE_REFUSAL" >&2
       return 1
@@ -338,6 +374,12 @@ reset() {
   BASE_READ_FAIL=""
   HEAD_AFTER_MOVE=""
   MOVED_RUN_RC=""
+  BASE_KEEPS_MOVING=""
+  CHECKS_FAIL=""
+  MERGEABLE=true
+  STATE_FAIL=""
+  DISABLE_AUTO_FAIL=""
+  MERGE_QUEUE_FAIL=""
 }
 
 # The merge is bound to the head the gate read: a push during a long --wait must not land a head
@@ -1968,6 +2010,157 @@ test_an_unread_or_partial_series_says_the_scan_did_not_run() {
   assert_contains "$MERGE_OUTPUT" "scan did NOT run" "and is not a clean one"
 }
 
+# --- the merge command's own refusals, pinned from its fix history (ludics-lite#403) ---------------
+# Each of these is a path a review round wrote into cmd_merge and no case above walked. They are
+# pinned before the port so that the Python carries every one of them (the issue's "history first").
+
+# A reason, not a token: "--override yes" would make the gate a formality one keystroke wide, so a
+# one-word override is a usage error, in either spelling, and nothing is read or merged.
+test_an_override_is_a_reason_in_words() {
+  reset
+  CHECK_ROWS="$(row red ubuntu failure)"
+  run_merge --override yes
+  assert_eq "$MERGE_RC" 2 "a one-word override is a usage error ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "--override takes a REASON in words, not 'yes'" "and says what it wants"
+  assert_no_merge_call
+  run_merge --override=yes
+  assert_eq "$MERGE_RC" 2 "the = form is held to the same rule"
+  run_merge "--override=$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 0 "the = form carries a reason in words ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "OVERRIDE: merging example/repo#7 over a RED build signal — $OVERRIDE_WHY" \
+    "and announces it"
+  # With no reason at all the shell's own parameter check refuses it (bash's `${2:?}`, status 1):
+  # pinned as a refusal that names the missing reason, not by the status bash happens to use.
+  run_merge --override
+  [ "$MERGE_RC" -ne 0 ] || bail "an override with no reason at all must refuse ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "--override needs a reason" "naming what is missing"
+  assert_no_merge_call
+}
+
+# The gate's flags are the script's, and `gh pr merge`'s go after `--`.
+test_an_unknown_merge_option_is_a_usage_error() {
+  reset
+  run_merge --squash
+  assert_eq "$MERGE_RC" 2 "a gh flag before -- is not the script's ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "merge: unknown option '--squash'" "it names the option"
+  assert_contains "$MERGE_OUTPUT" "go after --" "and where it belongs"
+  assert_no_merge_call
+}
+
+# No verdict is not "nothing is red" (ahrefs/ocannl#745): without --allow-no-verdict a head with a
+# check still running refuses with exit 4 and names both ways forward.
+test_no_verdict_refuses_without_the_flag() {
+  reset
+  CHECK_ROWS="$(row pending macos pending)"
+  run_merge
+  assert_eq "$MERGE_RC" 4 "a running check is no verdict ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "no verdict after 0 min" "the refusal says how long it waited"
+  assert_contains "$MERGE_OUTPUT" "re-run with --allow-no-verdict to merge unread" "and names the flag"
+  assert_no_merge_call
+  run_merge --allow-no-verdict
+  assert_eq "$MERGE_RC" 0 "the flag merges it unread ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "ALLOW-NO-VERDICT: merging example/repo#7 with NO build verdict on the head commit" \
+    "and says so on stdout"
+  assert_contains "$MERGE_STDERR" "nothing has failed, nothing has passed either" "and on stderr"
+}
+
+# A gate that could not read the checks is UNKNOWN, and no flag merges past it.
+test_an_unread_build_signal_never_merges() {
+  reset
+  CHECKS_FAIL=1
+  run_merge --allow-no-verdict --override "$OVERRIDE_WHY"
+  assert_eq "$MERGE_RC" 3 "an unread signal is exit 3 ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "the build signal could not be READ" "and is not 'nothing is red'"
+  assert_no_merge_call
+}
+
+# "Not mergeable" is GitHub's stale pre-recompute answer as often as it is a conflict, so the
+# mergeable field decides (ocannl-staging#373): false is a real conflict, exit 1; an unread field
+# is unknown, exit 3; and a merge that keeps failing so after three attempts is base drift.
+test_not_mergeable_is_decided_by_the_mergeable_field() {
+  reset
+  MERGE_REFUSAL='gh: Pull request is not mergeable'
+  MERGEABLE=false
+  run_merge
+  assert_eq "$MERGE_RC" 1 "mergeable=false after the recompute is a real conflict ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "really does not merge cleanly (mergeable=false after the recompute)" \
+    "and says so"
+  assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 1 "with no retry"
+  reset
+  MERGE_REFUSAL='gh: Pull request is not mergeable'
+  MERGEABLE=FAIL
+  run_merge
+  assert_eq "$MERGE_RC" 3 "an unread mergeable field is unknown ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "its mergeable field is unknown" "and is named as such"
+  reset
+  MERGE_REFUSAL='gh: Pull request is not mergeable'
+  run_merge
+  assert_eq "$MERGE_RC" 1 "a merge that keeps failing as not mergeable stops ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "keeps failing as not mergeable after 3 attempts" "naming the count"
+  assert_eq "$(grep -c '^CALL pr merge' "$CALLS_FILE")" 3 "after three calls"
+}
+
+# A base that moves during every call is retried twice and then refused, never looped on.
+test_a_base_that_moves_during_every_call_stops_after_three() {
+  reset
+  MERGE_REFUSAL='GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)'
+  run_merge
+  assert_eq "$MERGE_RC" 1 "three base moves end the retries ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "base moved during each of 3 merge calls; its head is still head-sha" \
+    "naming the count and the unmoved head"
+  assert_eq "$(grep -c '^CALL pr merge' "$CALLS_FILE")" 3 "after three calls"
+}
+
+# An ABSENT verdict whose base moves on every read is not chased forever (ludics-lite#523).
+test_an_absent_base_that_keeps_moving_stops_after_three_reads() {
+  reset
+  NO_CHECKS=1
+  BASE_KEEPS_MOVING=1
+  run_merge
+  assert_eq "$MERGE_RC" 1 "a base that never holds still is refused ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "base kept moving under its ABSENT verdict (3 gate reads)" "naming the count"
+  assert_no_merge_call
+}
+
+# The answer to a merge call is the API's: a 4xx is a rejection (exit 1), anything else that is not
+# a gateway refusal may have landed (exit 3, pinned above), and a state read that did not answer
+# after a call that returned 0 is never reported as landed or not.
+test_a_rejected_merge_call_and_an_unconfirmed_state() {
+  reset
+  MERGE_REFUSAL='gh: Required status check "ci" is expected. (HTTP 405)'
+  run_merge
+  assert_eq "$MERGE_RC" 1 "a 4xx is the API's answer ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "gh pr merge was rejected: gh: Required status check" "quoting it"
+  reset
+  STATE_FAIL=1
+  run_merge
+  assert_eq "$MERGE_RC" 3 "an unconfirmed state is unknown ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "the state could not be confirmed" "and says so"
+  assert_contains "$MERGE_OUTPUT" "do NOT re-merge" "with the warning that matters"
+}
+
+# A close-out merge that could not take back the auto-merge it armed leaves a later head armed to
+# land ungated: exit 3, and the instruction to disable it by hand.
+test_a_deferred_close_out_that_cannot_be_disarmed_is_loud() {
+  reset
+  MERGE_STATE="merged=false state=OPEN"
+  DISABLE_AUTO_FAIL=1
+  run_merge --require-green
+  assert_eq "$MERGE_RC" 3 "an armed auto-merge that stays armed is exit 3 ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "auto-merge could NOT be disabled" "and says so"
+  assert_contains "$MERGE_OUTPUT" "Disable it by hand" "with the instruction"
+}
+
+# The queue is GraphQL-only, and an unread answer is not "no queue".
+test_an_unread_merge_queue_refuses_a_close_out() {
+  reset
+  MERGE_QUEUE_FAIL=1
+  run_merge --require-green
+  assert_eq "$MERGE_RC" 3 "an unread queue is unknown ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "could not read whether main has a merge queue" "and says so"
+  assert_no_merge_call
+}
+
 tests=(
   test_a_refused_merge_call_is_the_scripts_only_without_forwarded_flags
   test_superseded_head_never_merges
@@ -2055,6 +2248,16 @@ tests=(
   test_the_series_is_scanned_whatever_the_base
   test_the_series_is_scanned_whatever_the_merge_method
   test_a_deferred_merge_says_the_series_is_unbound
+  test_an_override_is_a_reason_in_words
+  test_an_unknown_merge_option_is_a_usage_error
+  test_no_verdict_refuses_without_the_flag
+  test_an_unread_build_signal_never_merges
+  test_not_mergeable_is_decided_by_the_mergeable_field
+  test_a_base_that_moves_during_every_call_stops_after_three
+  test_an_absent_base_that_keeps_moving_stops_after_three_reads
+  test_a_rejected_merge_call_and_an_unconfirmed_state
+  test_a_deferred_close_out_that_cannot_be_disarmed_is_loud
+  test_an_unread_merge_queue_refuses_a_close_out
 )
 
 run_tests "${tests[@]}" -- "$@"

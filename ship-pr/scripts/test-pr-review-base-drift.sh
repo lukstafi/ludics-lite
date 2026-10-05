@@ -416,6 +416,50 @@ test_unread_hunks_count_as_meeting() {
   assert_not_contains "$DRIFT_OUTPUT" "DISJOINT hunks (" "unread hunks must never read as disjoint"
 }
 
+# --- pinned from the fix history before the port (ludics-lite#403) ---------------------------------
+# At or over SHIP_PR_STALE_BASE the count is said loudly, on both streams -- and since the
+# ahrefs/ocannl#861 decision it is a WARNING that the roll-forward policy merges through, not a gate.
+test_a_stale_branch_is_loud_but_not_a_gate() {
+  set_compares 25 1 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "a branch at the threshold warns"
+  assert_contains "$DRIFT_OUTPUT" "!!! $REPO#7 is 25 COMMITS BEHIND its base (main)." "loudly"
+  assert_contains "$DRIFT_OUTPUT" "this does NOT block a clean merge" "and says it is not a gate"
+  assert_contains "$DRIFT_OUTPUT" "MERGING A STALE BRANCH: $REPO#7 is 25 commits behind main (warns at 20" \
+    "with the stderr line naming the threshold"
+  assert_contains "$DRIFT_OUTPUT" "base-drift file overlap $REPO#7: none" "and the overlap is still read"
+}
+
+# `off` disables the COUNT warning only: the overlap of the base's advance with the PR's paths is
+# still read and still loud.
+test_stale_base_off_keeps_the_overlap_warning() {
+  set_compares 25 1 '[{"filename":"shared.txt"}]' '[{"filename":"shared.txt"}]'
+  STALE_BASE=off
+  run_drift
+  assert_eq "$DRIFT_RC" 1 "the overlap still warns"
+  assert_not_contains "$DRIFT_OUTPUT" "COMMITS BEHIND" "the count warning is off"
+  assert_not_contains "$DRIFT_OUTPUT" "base freshness" "and so is the quiet count line"
+  assert_contains "$DRIFT_OUTPUT" "!!! BASE-DRIFT FILE OVERLAP" "the overlap is not"
+}
+
+# A compare answer with no usable behind_by is not "not behind"; and two compares that disagree on
+# their merge base are two different questions, so their overlap is unknown, never none.
+test_an_unreadable_count_or_two_merge_bases_is_unknown() {
+  set_compares 2 1 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
+  FORWARD_JSON=$(jq -c 'del(.behind_by)' <<<"$FORWARD_JSON")
+  run_drift
+  assert_eq "$DRIFT_RC" 3 "a missing count is unknown"
+  assert_contains "$DRIFT_OUTPUT" "did not contain a valid behind_by count" "and says so"
+  assert_not_contains "$DRIFT_OUTPUT" "base freshness" "no count is printed"
+  set_compares 2 1 '[{"filename":"pr.txt"}]' '[{"filename":"base.txt"}]'
+  REVERSE_JSON=$(jq -c '.merge_base_commit.sha = "another-base"' <<<"$REVERSE_JSON")
+  run_drift
+  assert_eq "$DRIFT_RC" 3 "two merge bases make the overlap unknown"
+  assert_contains "$DRIFT_OUTPUT" "base-drift file overlap $REPO#7: UNKNOWN — the two compare calls reported different merge bases" \
+    "and name why"
+  assert_contains "$DRIFT_OUTPUT" "2 commit(s) behind main" "the count itself still stands"
+}
+
 tests=(
   test_no_overlap
   test_exact_overlap
@@ -441,6 +485,9 @@ tests=(
   test_dirty_pr_is_loud
   test_computing_mergeability_is_not_a_conflict
   test_base_ref_is_encoded
+  test_a_stale_branch_is_loud_but_not_a_gate
+  test_stale_base_off_keeps_the_overlap_warning
+  test_an_unreadable_count_or_two_merge_bases_is_unknown
 )
 
 run_tests "${tests[@]}" -- "$@"

@@ -1888,8 +1888,69 @@ test_checks_ends_with_its_verdict_trailer() {
   check_trailer 2 unknown ""
 }
 
+# --- the gate's own refusals, pinned from its fix history (ludics-lite#403) ------------------------
+# Paths a review round wrote into the gate and no case above walked, pinned before the port.
+
+# A stopped check over a run list that is otherwise judged is INCOMPLETE: stopped is not a verdict,
+# so it is exit 4 and never a green (ludics-lite#38), with what DID pass counted.
+test_a_stopped_check_over_judged_runs_is_incomplete() {
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"},
+                                        {"name":"lint","conclusion":"cancelled","html_url":"v"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+  run_gate
+  assert_eq "$GATE_RC" 4 "a stopped check is no verdict"
+  assert_contains "$GATE_OUTPUT" "INCOMPLETE — 1 passed, the rest were stopped without a verdict" \
+    "headlined as incomplete, counting the green"
+  assert_contains "$GATE_OUTPUT" "no verdict  lint (cancelled — stopped, not judged)  v" \
+    "and the stopped check is listed"
+  check_trailer 4 mixed "INCOMPLETE"
+}
+
+# A check list that could not be read is UNKNOWN, which is NOT "nothing is red": the outage and a
+# commit with no checks are told apart (build_checks prints nothing on a failed read).
+test_an_unreadable_check_list_is_unknown() {
+  reset_fixture
+  COMMIT_AGE=1800
+  FAIL_ENDPOINT="*/check-runs?filter=latest&per_page=100"
+  run_gate
+  assert_eq "$GATE_RC" 3 "an unread check list is unknown"
+  assert_contains "$GATE_OUTPUT" "could not read the checks of $REPO#7 @deadbeef" "and says what was unread"
+  assert_not_contains "$GATE_OUTPUT" ": ABSENT" "never an absence"
+  check_trailer 3 unknown ""
+}
+
+# `checks` takes one option; anything else is a usage error. A bare --wait is the configured
+# ceiling, which a head that already has its verdict does not wait out.
+test_checks_options() {
+  local out rc
+  reset_fixture
+  set +e
+  out=$(cmd_checks 7 --bogus 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 2 "an unknown option is a usage error ($out)"
+  assert_contains "$out" "checks: unknown option '--bogus'" "naming it"
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ci","conclusion":"success","html_url":"u"}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+  check_trailer 0 green "green — 1 build checks passed" --wait
+}
+
+# A list line with an escaped backslash before a digit is refused with the backreferences: refusing
+# too much is a file to fix, never a weaker gate (review of #531).
+test_an_escaped_backslash_before_a_digit_is_refused_too() {
+  reset_fixture
+  ADVISORY_BODY='^claude\\1$'
+  check_trailer 2 unknown ""
+}
+
 tests=(
   test_checks_ends_with_its_verdict_trailer
+  test_a_stopped_check_over_judged_runs_is_incomplete
+  test_an_unreadable_check_list_is_unknown
+  test_checks_options
+  test_an_escaped_backslash_before_a_digit_is_refused_too
   test_wait_superseded_head
   test_wait_unchanged_head_turns_green
   test_head_reread_unknown
