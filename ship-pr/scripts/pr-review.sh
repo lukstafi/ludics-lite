@@ -265,7 +265,10 @@
 #      three are the ONLY sources, for every subcommand including `retry run watch` (`base`, which
 #      resolves a repo and a branch rather than a bare number, still reads the cwd's checkout),
 #      REVIEWER=login-prefix (default: codex app), WATCH_INTERVAL=seconds between polls (default
-#      90), WATCH_TIMEOUT=seconds to watch (900),
+#      90), WATCH_TIMEOUT=seconds to watch (900), SHIP_PR_REVIEW_POLL_CAP and
+#      SHIP_PR_BUILD_POLL_CAP=seconds the pause between unchanged polls doubles up to (300 for
+#      `watch`, 600 for a `--wait`), SHIP_PR_STATE_DIR=where the quota hold and the observer locks
+#      live (default ${XDG_STATE_HOME:-~/.local/state}/ship-pr; see "the polling budget"),
 #      SHIP_PR_API_ATTEMPTS=tries per gh call (4), SHIP_PR_API_BACKOFF=first pause in seconds (5,
 #      doubling to a 20s cap: ~35s of retrying before a call is declared dead),
 #      SHIP_PR_REVIEW_GRACE=seconds a due-but-unstarted review is waited for before `watch` returns
@@ -745,6 +748,35 @@ gh_err_line() {
   line=$(cat "$GH_ERR_FILE" 2>/dev/null)
   printf '%s' "${line:-${GH_ERR%%$'\n'*}}"
 }
+
+# --- the polling budget (ludics-lite#543, #551) ----------------------------------------------
+# One mechanism every observer shares (`watch`, `checks --wait`, `merge --wait`, `base --wait`,
+# `retry run watch`): THE PAUSE (an unchanged poll doubles the pause from the command's interval up
+# to its kind's cap), THE HOLD (a call GitHub refuses on quota stops every pr-review.sh sharing this
+# state directory until a probe of the FAILING endpoint answers, its end read from that endpoint's
+# own headers), and THE OBSERVER (one per PR and kind; a second is refused with exit 2 before it
+# reads). A quota failure is never the API's answer about the PR: it is exit 3, and never permits a
+# merge. Served by Python with every subcommand: lib/ludics/prreview/budget.py holds the mechanism,
+# its BOUNDARY and the on-disk format of the state directory, which every version on a host shares.
+# Only the knobs are resolved here, so a sourcing suite's assignment reaches the forward
+# (PY_FORWARD_VARS).
+REVIEW_POLL_CAP="${SHIP_PR_REVIEW_POLL_CAP:-300}"
+BUILD_POLL_CAP="${SHIP_PR_BUILD_POLL_CAP:-600}"
+for budget_knob in "SHIP_PR_REVIEW_POLL_CAP=$REVIEW_POLL_CAP" "SHIP_PR_BUILD_POLL_CAP=$BUILD_POLL_CAP"; do
+  case "${budget_knob#*=}" in
+  '' | *[!0-9]*) die "${budget_knob%%=*} must be whole seconds, got '${budget_knob#*=}'" ;;
+  esac
+done
+unset budget_knob
+# The state the hold and the observer locks live in. A fixture suite (source-only mode) gets none
+# unless it names one, so no suite reads or writes this host's real hold.
+if [ -n "${SHIP_PR_STATE_DIR:-}" ]; then
+  BUDGET_DIR="$SHIP_PR_STATE_DIR"
+elif [ "${SHIP_PR_TEST_SOURCE_ONLY:-}" = 1 ]; then
+  BUDGET_DIR=""
+else
+  BUDGET_DIR="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/ship-pr"
+fi
 
 # --- repo resolution ------------------------------------------------------------------------
 # A PR is addressed by a repository and a number, and the number alone names one PR in every
@@ -4490,14 +4522,19 @@ PY_FORWARD_VARS=(REPO=REPO REVIEWER=REVIEWER ROUND_THRESHOLD=SHIP_PR_ROUND_THRES
   CHECKS_HEARTBEAT=SHIP_PR_CHECKS_HEARTBEAT ABSENT_GRACE=SHIP_PR_BASE_ABSENT_GRACE
   BUILD_ADVISORY=LUDICS_BUILD_ADVISORY ADVISORY_FROM_ENV=LUDICS_PR_ADVISORY_FROM_ENV
   ADVISORY_SETTLE=LUDICS_PR_ADVISORY_SETTLE CONTENTS_DIR_CAP=LUDICS_PR_CONTENTS_DIR_CAP
-  IGNORE_MAX_COMMITS=LUDICS_PR_IGNORE_MAX_COMMITS THREADS_PAGE_CAP=LUDICS_THREADS_PAGE_CAP)
+  IGNORE_MAX_COMMITS=LUDICS_PR_IGNORE_MAX_COMMITS THREADS_PAGE_CAP=LUDICS_THREADS_PAGE_CAP
+  REVIEW_POLL_CAP=SHIP_PR_REVIEW_POLL_CAP BUILD_POLL_CAP=SHIP_PR_BUILD_POLL_CAP
+  BUDGET_DIR=LUDICS_PR_BUDGET_DIR)
 # The commands the Python runs that a sourcing suite may have replaced with a shell FUNCTION (its
 # fixture `gh`). The Python cannot call a function of this shell, so when one of these is a function
 # here the forward hands its definitions over through the shell bridge (lib/ludics/proc.py): a file
 # of this shell's functions and variables that each bridged call sources in a fresh bash, which is
 # what the shell's own `$(gh ...)` subshell saw. In a plain run none is a function, and nothing is
-# written.
-PY_BRIDGE_COMMANDS=(gh git)
+# written. `sleep` is one of them because a suite's `sleep` OBSERVES the wait (the pauses it logs,
+# what it lets happen meanwhile), which only a call can carry; a suite that defines one under
+# SHIP_PR_TEST_CLOCK advances that clock in it. The clock itself is never bridged: the Python reads
+# SHIP_PR_TEST_CLOCK (lib/ludics/README.md, "the shell bridge").
+PY_BRIDGE_COMMANDS=(gh git sleep)
 
 py_ported() { case "$PY_PORTED" in *" ${1:-} "*) return 0 ;; esac; return 1; }
 
