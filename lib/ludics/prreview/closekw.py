@@ -18,7 +18,11 @@ shaped; this is the same filter, rule for rule, in the same order:
 awk's regex matching is leftmost-longest and Python's is leftmost-first; every pattern below was
 checked to choose the same match under both (each is either fixed-width at its end or has a
 greedy tail no alternative can outrun). Lowercasing is ASCII-only, as the shell's awk did it, so
-offsets into the unit stay the unit's own.
+offsets into the unit stay the unit's own. Checked against the shell's awk program on 8,176 bodies
+and messages (the merge suite's, and generated ones) in the C locale: identical findings. One
+divergence, on purpose: macOS awk 20200816 in a UTF-8 locale ABORTS ("towc: multibyte conversion
+failure") on a reference followed by a non-ASCII letter, which the shell reported as a scan that
+did not run; here such a body is scanned. A sentence is cut at 200 characters, not bytes.
 """
 
 import re

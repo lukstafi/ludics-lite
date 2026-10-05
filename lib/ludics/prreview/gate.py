@@ -208,6 +208,8 @@ class Clock:
         return int(self.now())
 
 
+# SHARED-CANDIDATE: gate_checks (with build_checks, summarize_checks, run_signal, apply_waiver):
+# `base`'s tip_pr_head_verdict judges a merged PR's head through the same gate.
 @dataclass
 class Gate:
     """One command's build gate. The attributes are the shell's globals of the same name, which
