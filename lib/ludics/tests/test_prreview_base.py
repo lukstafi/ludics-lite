@@ -1,0 +1,441 @@
+"""``pr-review.sh base``: the pieces that decide a verdict, in process, and the production path
+end to end (``scripts/py`` and the shell script's ``main``) with a fake gh BINARY on PATH.
+
+The fixture suites (ship-pr/scripts/test-pr-review-base-*.sh) pin the command through the sourced
+function and the shell bridge; what is here pins what they cannot reach: the readers' boundaries
+one input at a time, the wait loop on a fake clock (no real sleeping), and the source-(a) gate run
+in the SOURCED script rather than in the bridge state, which is how production runs it.
+"""
+
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from collections.abc import Sequence
+from contextlib import redirect_stderr, redirect_stdout
+
+from ludics import cli, proc
+from ludics.prreview import base
+from ludics.prreview.base_yaml import glob_ere, paths_ignore_covers, workflow_filter, workflow_keys
+from ludics.prreview.core import Config, GhRefusedOwn, GhSession
+
+LIB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ROOT = os.path.dirname(LIB)
+PY = os.path.join(ROOT, "scripts", "py")
+PR_REVIEW = os.path.join(ROOT, "ship-pr", "scripts", "pr-review.sh")
+
+C = "c" * 40
+B = "b" * 40
+A = "a" * 40
+H = "e" * 40
+
+DOCS_IGNORED = """name: ci
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+"""
+
+PUSHLESS = """name: ci
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+  # Sunday and Wednesday.
+  schedule:
+    - cron: "0 3 * * 0,3"
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+"""
+
+
+class Readers(unittest.TestCase):
+    def test_encode_ref_keeps_the_unreserved_set_and_slashes(self) -> None:
+        self.assertEqual(base.encode_ref("claude/topic-1.x_~"), "claude/topic-1.x_~")
+        self.assertEqual(base.encode_ref("rel#1&x"), "rel%231%26x")
+        self.assertEqual(base.encode_ref("a b+é"), "a%20b%2B%C3%A9")
+
+    def test_the_filter_reader_reads_both_sequence_forms_and_refuses_the_rest(self) -> None:
+        self.assertEqual(workflow_filter(DOCS_IGNORED, "push", "paths-ignore"), ["docs/**", "**.md"])
+        flow = "on:\n  push:\n    paths-ignore: ['docs/**', \"*.md\"]\n"
+        self.assertEqual(workflow_filter(flow, "push", "paths-ignore"), ["docs/**", "*.md"])
+        refused = {
+            "a tab anywhere": DOCS_IGNORED.replace("    runs-on", "\truns-on"),
+            "an alias": "on:\n  push:\n    paths-ignore: *docs\n",
+            "an include filter only": "on:\n  push:\n    paths:\n      - src/**\n",
+            "no such event": "on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n",
+            "an empty flow": "on:\n  push:\n    paths-ignore: []\n",
+            "an empty item": "on:\n  push:\n    paths-ignore:\n      - \"\"\n",
+            "a scalar on": "on: push\n",
+        }
+        for why, text in refused.items():
+            with self.subTest(why):
+                self.assertIsNone(workflow_filter(text, "push", "paths-ignore"))
+
+    def test_the_keys_reader_reads_three_forms_and_tells_absent_from_unread(self) -> None:
+        self.assertEqual(workflow_keys(PUSHLESS), ["pull_request", "schedule", "workflow_dispatch"])
+        self.assertEqual(workflow_keys(DOCS_IGNORED), ["push"])
+        self.assertEqual(workflow_keys(DOCS_IGNORED, "push"), ["branches", "paths-ignore"])
+        self.assertEqual(workflow_keys("on: push\n"), ["push"])
+        self.assertEqual(workflow_keys("on: [push, 'pull_request']\n"), ["push", "pull_request"])
+        self.assertEqual(workflow_keys("on: [push]\n", "push"), [], "declared with no keys is an answer")
+        self.assertIsNone(workflow_keys(PUSHLESS, "push"), "a mapping that never reached it is not")
+        self.assertIsNone(workflow_keys("on: []\n"), "no trigger at all is a misread")
+        self.assertIsNone(workflow_keys("on:\n  - push\n"), "a sequence under on: is refused")
+        self.assertIsNone(workflow_keys("name: x\njobs: {}\n"), "no on: at all")
+
+    def test_glob_translation_carries_two_stars_and_refuses_the_rest(self) -> None:
+        self.assertEqual(glob_ere("docs/**"), "^docs/.*$")
+        self.assertEqual(glob_ere("*.md"), "^[^/]*\\.md$")
+        for pattern in ("", "!docs/**", "docs/?.md", "[ab].md", "docs/+"):
+            self.assertIsNone(glob_ere(pattern), pattern)
+        self.assertTrue(paths_ignore_covers(["docs/**", "**.md"], ["docs/a/b.txt", "src/README.md"]))
+        self.assertFalse(paths_ignore_covers(["docs/**"], ["docs/a", "src/main.ml"]))
+        self.assertFalse(paths_ignore_covers(["**", "[x]"], ["a"]),
+                         "an untranslatable pattern fails the whole question, even beside a match")
+
+    def test_the_advisory_ere_reads_posix_classes(self) -> None:
+        adv = base.Advisory("^(claude|Claude Code|github pages docs)$")
+        self.assertTrue(adv("Claude Code"))
+        self.assertFalse(adv("ci"))
+        self.assertTrue(base.Advisory("^[[:alpha:]]+ docs$")("pages docs"))
+        self.assertFalse(base.Advisory("(unclosed")("anything"), "an ERE grep refuses matches nothing")
+
+
+def row(wid: str, concl: str, sha: str, rid: str, created: str = "2026-09-10T00:00:00Z",
+        status: str = "completed") -> base.RunRow:
+    return base.RunRow(wid, "ci", status, concl, sha, created, f"https://x/{rid}", rid)
+
+
+class Folding(unittest.TestCase):
+    def test_newest_first_breaks_a_same_second_tie_on_the_higher_id(self) -> None:
+        rows = [row("1", "success", C, "71"), row("1", "failure", C, "72"),
+                row("1", "success", A, "70", "2026-09-09T00:00:00Z")]
+        ordered = base.newest_first(rows, lambda r: r.created_at, lambda r: r.run_id, lambda r: r.line())
+        self.assertEqual([r.run_id for r in ordered], ["72", "71", "70"])
+
+    def test_the_fold_keeps_newest_completed_and_newest_judged_apart(self) -> None:
+        rows = [row("1", "pending", C, "3", status="in_progress"), row("1", "cancelled", B, "2"),
+                row("1", "failure", A, "1"), row("2", "success", C, "9")]
+        f1, f2 = base.fold(rows)
+        self.assertEqual((f1.status, f1.sha, f1.concl, f1.csha, f1.vconcl, f1.vsha),
+                         ("in_progress", C, "cancelled", B, "failure", A))
+        self.assertEqual((f2.wfid, f2.vconcl), ("2", "success"))
+
+    def test_records_are_read_as_bash_read_them(self) -> None:
+        self.assertEqual(base.ifs_tab_fields("\ta\t\tb\tc\td\te\t", 4), ["a", "b", "c", "d\te"])
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".tsv") as f:
+            f.write(f"\n{C}\tpass\tw-1\t2026-09-26T09:00:00Z\n\n{C}\tfail\tw-2\t2026-09-26T10:00:00Z")
+        try:
+            self.assertEqual([r.rid for r in base.load_records(f.name)], ["w-1", "w-2"])
+        finally:
+            os.remove(f.name)
+
+
+# --- in process: the gh calls answered by endpoint, on a fake clock ----------------------------
+
+
+type Answer = str | tuple[int, str]
+
+
+class Endpoints:
+    """A gh stand-in for GhSession: answers by the endpoint (the first argument after ``api`` that
+    is not an option or an option's value) and records every endpoint asked."""
+
+    def __init__(self, answers: dict[str, Answer]) -> None:
+        self.answers = answers
+        self.asked: list[str] = []
+
+    def __call__(self, name: str, args: Sequence[str]) -> proc.Completed:
+        assert name == "gh" and args[0] == "api", args
+        endpoint = ""
+        skip = False
+        for arg in args[1:]:
+            if skip:
+                skip = False
+                continue
+            if arg in ("-H", "--jq", "-X"):
+                skip = True
+                continue
+            if arg.startswith("-"):
+                continue
+            endpoint = arg
+            break
+        self.asked.append(endpoint)
+        answer = self.answers.get(endpoint)
+        if answer is None:
+            return proc.Completed(1, "", f"gh: no fixture for {endpoint} (HTTP 404)\n")
+        if isinstance(answer, str):
+            return proc.Completed(0, answer + "\n", "")
+        rc, err = answer
+        return proc.Completed(rc, "", err)
+
+
+class FakeClock(base.Clock):
+    def __init__(self, start: float = 1_800_000_000.0) -> None:
+        self.t = start
+        self.slept: list[float] = []
+        super().__init__(time=lambda: self.t, sleep=self._sleep)
+
+    def _sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.t += seconds
+
+
+def runs(*items: dict[str, object]) -> str:
+    out: list[dict[str, object]] = []
+    for i, item in enumerate(items):
+        r: dict[str, object] = {"workflow_id": 1, "id": 1000 + i, "name": "ci", "status": "completed",
+                                "head_sha": "0" * 40,
+                                "created_at": f"2026-09-10T00:{59 - i:02d}:00Z",
+                                "html_url": f"https://x/{1000 + i}"}
+        r.update(item)
+        out.append(r)
+    return json.dumps({"workflow_runs": out})
+
+
+def config(repo: str = "o/r") -> Config:
+    return Config(repo=repo, reviewer="x", round_threshold=None, round_gap=0, api_attempts=1,
+                  api_backoff=0)
+
+
+KNOBS = {"SHIP_PR_BASE_ABSENT_GRACE": "300", "SHIP_PR_CHECKS_INTERVAL": "60",
+         "SHIP_PR_CHECKS_WAIT": "7200", "SHIP_PR_CHECKS_HEARTBEAT": "600"}
+
+
+def base_run(answers: dict[str, Answer], args: list[str], *, clock: FakeClock | None = None,
+             shell: base.ShellRunner | None = None,
+             knobs: dict[str, str] | None = None) -> tuple[int, str, str, Endpoints]:
+    gh = Endpoints(answers)
+    session = GhSession(config(), run=gh, sleep=lambda _s: None)
+    out, err = io.StringIO(), io.StringIO()
+    env = dict(KNOBS, **(knobs or {}))
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = cli.main_guard("pr-review.sh", lambda a: base.run(session, a, clock=clock or FakeClock(),
+                                                                shell=shell, env=env), args)
+    return rc, out.getvalue(), err.getvalue(), gh
+
+
+def world(tip: str, runs_page: str, **more: Answer) -> dict[str, Answer]:
+    answers: dict[str, Answer] = {
+        "repos/o/r/commits/main": json.dumps({"sha": tip}),
+        "repos/o/r/actions/workflows?per_page=100": json.dumps({"workflows": [{"id": 1, "name": "ci"}]}),
+        "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10": runs_page,
+        "repos/o/r/actions/workflows/1": json.dumps({"path": ".github/workflows/ci.yml"}),
+        f"repos/o/r/contents/.github/workflows/ci.yml?ref={tip}": DOCS_IGNORED,
+    }
+    answers.update(more)
+    return answers
+
+
+class WaitLoop(unittest.TestCase):
+    def test_a_covered_tip_is_green_on_the_first_round(self) -> None:
+        rc, out, _, gh = base_run(world(C, runs({"conclusion": "success", "head_sha": C})), ["main"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, f"o/r main: green (tip {C[:8]})\n  green    ci — success at {C[:8]}\n")
+        self.assertNotIn("repos/o/r/actions/workflows/1", gh.asked, "a covered tip reads no file")
+
+    def test_the_absence_grace_settles_on_the_clock_and_not_before(self) -> None:
+        answers = world(C, runs({"conclusion": "success", "head_sha": A}),
+                        **{f"repos/o/r/compare/{A}...{C}?per_page=20": json.dumps(
+                            {"total_commits": 1, "behind_by": 0,
+                             "commits": [{"sha": C, "parents": [{"sha": A}]}]}),
+                           f"repos/o/r/commits/{C}?per_page=100": json.dumps(
+                               {"files": [{"filename": "src/main.ml"}]})})
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock,
+                                 knobs={"SHIP_PR_BASE_ABSENT_GRACE": "120", "SHIP_PR_CHECKS_INTERVAL": "30"})
+        self.assertEqual(rc, 0, out)
+        self.assertIn("(waited 2 min: no run for the tip appeared", out)
+        self.assertEqual(clock.slept, [30, 30, 30, 30], "four rounds of thirty seconds spend the grace")
+
+    def test_a_docs_only_tip_settles_without_the_clock(self) -> None:
+        answers = world(C, runs({"conclusion": "success", "head_sha": A}),
+                        **{f"repos/o/r/compare/{A}...{C}?per_page=20": json.dumps(
+                            {"total_commits": 1, "behind_by": 0,
+                             "commits": [{"sha": C, "parents": [{"sha": A}]}]}),
+                           f"repos/o/r/commits/{C}?per_page=100": json.dumps(
+                               {"files": [{"filename": "docs/notes.md"}]})})
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("paths-ignore of ci, so no run for it is coming", out)
+        self.assertEqual(clock.slept, [])
+
+    def test_the_ceiling_caps_the_last_sleep(self) -> None:
+        clock = FakeClock()
+        page = runs({"status": "in_progress", "conclusion": None, "head_sha": C})
+        rc, out, _, _ = base_run(world(C, page), ["main", "--wait=70"], clock=clock)
+        self.assertEqual(rc, 4)
+        self.assertIn("NO VERDICT for the tip", out)
+        self.assertEqual(clock.slept, [60, 10], "the last sleep is what is left of the ceiling")
+
+    def test_an_unknown_read_is_exit_three_with_the_reason(self) -> None:
+        answers = world(C, runs())
+        answers["repos/o/r/actions/workflows?per_page=100"] = (1, "gh: Server Error (HTTP 500)\n")
+        rc, _, err, _ = base_run(answers, ["main"])
+        self.assertEqual(rc, 3)
+        self.assertIn("could not read o/r's workflow list (gh: Server Error (HTTP 500));", err)
+
+
+PULL = json.dumps([{"number": 7, "merged_at": "2026-09-26T08:00:53Z", "merge_commit_sha": C,
+                    "head": {"sha": H, "ref": "claude/topic"}, "base": {"ref": "main"}}])
+MERGE = json.dumps({"parents": [{"sha": B}, {"sha": H}],
+                    "commit": {"committer": {"email": "noreply@github.com"},
+                               "verification": {"verified": True}}})
+
+
+def pushless_world() -> dict[str, Answer]:
+    return world(C, runs({"conclusion": "success", "head_sha": A}), **{
+        f"repos/o/r/contents/.github/workflows/ci.yml?ref={C}": PUSHLESS,
+        f"repos/o/r/commits/{C}": MERGE,
+        f"repos/o/r/commits/{C}/pulls?per_page=100": PULL,
+        f"repos/o/r/actions/runs?head_sha={H}&per_page=100": json.dumps({"workflow_runs": [
+            {"created_at": "2026-09-26T07:41:00Z", "id": 8001, "workflow_id": 1, "status": "completed",
+             "conclusion": "success"}]}),
+        "repos/o/r/actions/runs/8001/jobs?per_page=100": json.dumps(
+            {"jobs": [{"name": "build", "conclusion": "success"}]}),
+    })
+
+
+def gate_shell(verdict: str, line: str, *, refuse: str = "") -> base.ShellRunner:
+    def shell(name: str, args: Sequence[str]) -> proc.Completed:
+        scratch = args[5]
+        if refuse:
+            with open(os.path.join(scratch, "refused"), "w", encoding="utf-8") as f:
+                f.write(refuse + "\n")
+        return proc.Completed(0, f"build signal {line}\n\n0\t{verdict}\n", "")
+    return shell
+
+
+class NamedSources(unittest.TestCase):
+    def test_a_clean_merge_of_a_green_head_judges_a_retired_workflow(self) -> None:
+        rc, out, _, _ = base_run(pushless_world(), ["main"],
+                                 shell=gate_shell("green", "o/r#7 @eeeeeeee: green — 1 build checks passed"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"o/r main: green (tip {C[:8]}; ci judged by PR #7's head run (roll-forward rule))", out)
+        self.assertIn("(roll-forward rule): o/r#7 @eeeeeeee: green — 1 build checks passed", out)
+
+    def test_a_gate_verdict_outside_the_vocabulary_is_unknown(self) -> None:
+        rc, _, err, _ = base_run(pushless_world(), ["main"], shell=gate_shell("superseded", "x"))
+        self.assertEqual(rc, 3)
+        self.assertIn("could not read a verdict source for o/r main's tip", err)
+
+    def test_a_refusal_inside_the_shell_gate_ends_the_command_with_two(self) -> None:
+        message = "pr-review.sh: the installed gh refused this script's own call"
+        with self.assertRaises(GhRefusedOwn):
+            gh = Endpoints(pushless_world())
+            b = base.Base(GhSession(config(), run=gh), base.load_knobs(KNOBS), "o/r",
+                          shell=gate_shell("green", "x", refuse=message))
+            b.tip_pr_head_verdict("main", C, [])
+        rc, _, err, _ = base_run(pushless_world(), ["main"], shell=gate_shell("green", "x", refuse=message))
+        self.assertEqual((rc, err), (2, message + "\n"))
+
+
+# --- end to end: a fake gh binary that answers by endpoint and applies --jq ----------------------
+
+_FAKE_GH = r'''
+import json, os, subprocess, sys
+here = os.path.dirname(os.path.abspath(__file__))
+args = sys.argv[1:]
+with open(os.path.join(here, "calls.log"), "a", encoding="utf-8") as log:
+    log.write(" ".join(args) + "\n")
+endpoint, jq, i = "", "", 1
+while i < len(args):
+    a = args[i]
+    if a in ("-H", "-X", "--jq"):
+        if a == "--jq":
+            jq = args[i + 1]
+        i += 2
+        continue
+    if not a.startswith("-") and not endpoint:
+        endpoint = a
+    i += 1
+with open(os.path.join(here, "answers.json"), encoding="utf-8") as f:
+    answers = json.load(f)
+if args[:1] != ["api"] or endpoint not in answers:
+    sys.stderr.write(f"gh: no fixture for {endpoint} (HTTP 404)\n")
+    sys.exit(1)
+body = answers[endpoint]
+if jq:
+    done = subprocess.run(["jq", "-r", jq], input=body, capture_output=True, text=True)
+    sys.stdout.write(done.stdout)
+    sys.stderr.write(done.stderr)
+    sys.exit(done.returncode)
+sys.stdout.write(body + "\n")
+'''
+
+
+class EndToEnd(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = os.path.realpath(tempfile.mkdtemp(prefix="ludics-base-test."))
+        with open(os.path.join(self.dir, "gh"), "w", encoding="utf-8") as f:
+            f.write(f"#!{sys.executable}\n{_FAKE_GH}")
+        os.chmod(os.path.join(self.dir, "gh"), 0o755)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def answer(self, answers: dict[str, Answer]) -> None:
+        plain = {k: v for k, v in answers.items() if isinstance(v, str)}
+        with open(os.path.join(self.dir, "answers.json"), "w", encoding="utf-8") as f:
+            json.dump(plain, f)
+
+    def run_cmd(self, entry: list[str], *args: str) -> subprocess.CompletedProcess[str]:
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("LUDICS_BRIDGE", "SHIP_PR_"))}
+        env.update({"PATH": self.dir + os.pathsep + env.get("PATH", ""), "REPO": "o/r",
+                    "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0"})
+        return subprocess.run([*entry, "base", *args], capture_output=True, text=True, env=env,
+                              cwd=self.dir, check=False)
+
+    def entries(self) -> list[list[str]]:
+        return [[PY, "-m", "ludics.prreview"], [PR_REVIEW]]
+
+    def test_a_green_tip_through_both_entries(self) -> None:
+        self.answer(world(C, runs({"conclusion": "success", "head_sha": C})))
+        for entry in self.entries():
+            with self.subTest(entry=entry[0]):
+                done = self.run_cmd(entry, "main")
+                self.assertEqual((done.returncode, done.stderr), (0, ""))
+                self.assertEqual(done.stdout.splitlines()[0], f"o/r main: green (tip {C[:8]})")
+
+    def test_source_a_runs_the_checks_gate_in_the_sourced_script(self) -> None:
+        answers = pushless_world()
+        answers.update({
+            "repos/o/r/pulls/7": json.dumps({"head": {"sha": H, "ref": "claude/topic"},
+                                             "base": {"sha": B}, "updated_at": "2026-09-26T07:40:00Z"}),
+            f"repos/o/r/commits/{H}/check-runs?filter=latest&per_page=100": json.dumps(
+                {"check_runs": [{"name": "build", "conclusion": "success",
+                                 "html_url": "https://x/check/1", "check_suite": {"id": 5}}]}),
+            f"repos/o/r/actions/runs?head_sha={H}&per_page=100": json.dumps({"workflow_runs": [
+                {"created_at": "2026-09-26T07:41:00Z", "id": 8001, "workflow_id": 1,
+                 "event": "pull_request", "name": "ci", "status": "completed",
+                 "conclusion": "success", "check_suite_id": 5}]}),
+        })
+        self.answer(answers)
+        for entry in self.entries():
+            with self.subTest(entry=entry[0]):
+                done = self.run_cmd(entry, "main")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn(f"o/r main: green (tip {C[:8]}; ci judged by PR #7's head run"
+                              " (roll-forward rule))", done.stdout)
+                with open(os.path.join(self.dir, "calls.log"), encoding="utf-8") as log:
+                    self.assertIn(f"repos/o/r/commits/{H}/check-runs", log.read(),
+                                  "the gate read the head's checks through the gh on PATH")
+                self.assertIn(f"(roll-forward rule): o/r#7 @{H[:8]}: green", done.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

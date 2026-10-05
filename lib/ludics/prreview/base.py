@@ -407,7 +407,7 @@ class Record:
         return "\t".join((self.sha, self.verdict, self.rid, self.when))
 
 
-def _ifs_tab_fields(line: str, count: int) -> list[str]:
+def ifs_tab_fields(line: str, count: int) -> list[str]:
     """``IFS=$'\\t' read -r a b c d``: tabs are IFS whitespace, so leading and trailing runs are
     dropped and a run between fields is one separator; the last field keeps the rest."""
     rest = line.strip("\t")
@@ -442,7 +442,7 @@ def load_records(path: str) -> list[Record]:
     records: list[Record] = []
     for index, line in enumerate(lines):
         last = index == len(lines) - 1
-        sha, verdict, rid, when = _ifs_tab_fields(line, 4)
+        sha, verdict, rid, when = ifs_tab_fields(line, 4)
         # `read || [ -n "$rsha" ]`: an unterminated last line is a row when it has a first field.
         if last and not sha:
             continue
