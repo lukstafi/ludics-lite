@@ -636,6 +636,186 @@ STUB
   done
 }
 
+# --- what the fix rounds taught `retry`, pinned before the port (ludics-lite#403) --------------
+# Each of these was a review round's finding, or a branch its fix added, that no case above
+# reached; the Python port has to keep every one of them. They drive `retry` itself, the command
+# a caller runs.
+
+# The flag spellings `gh run watch` takes, and the two native no-ops a pasted line carries (round 1
+# of self-improve#8's review): each reaches the verdict about the run it names, in one read.
+test_run_watch_takes_every_spelling_of_its_flags() {
+  local spec
+  local -a cmd
+  for spec in '-R example/repo 4242' '-R=example/repo 4242' '--repo example/repo 4242' \
+    '--repo=example/repo 4242' 'example/repo#4242 -i 5' 'example/repo#4242 -i=5' \
+    'example/repo#4242 --interval 5' 'example/repo#4242 --interval=5' \
+    'example/repo#4242 --exit-status --compact'; do
+    read -r -a cmd <<<"$spec"
+    reset_fixture
+    run_retry run watch "${cmd[@]}"
+    assert_eq "$RETRY_RC" 0 "'$spec' awaits the run ($RETRY_OUT)"
+    assert_eq "$RETRY_OUT" "run 4242 in example/repo: success" "and its one line is the verdict ($spec)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "after one read ($spec)"
+    assert_contains "$(gh_calls)" "run view 4242 --repo example/repo" "of that run ($spec)"
+  done
+  # `retry`'s own spellings in front of it change nothing: the await is never forwarded to gh.
+  for spec in '--read run watch' 'gh run watch' '--write gh run watch'; do
+    read -r -a cmd <<<"$spec"
+    reset_fixture
+    run_retry "${cmd[@]}" example/repo#4242
+    assert_eq "$RETRY_RC" 0 "'$spec' is the same await ($RETRY_OUT)"
+    assert_eq "$RETRY_OUT" "run 4242 in example/repo: success" "with the same verdict ($spec)"
+  done
+}
+
+# Everything else is refused before any read: an unknown flag (a catch-all that discarded it turned
+# a mistyped repo flag into a watch of whatever REPO named, round 1 of self-improve#8's review), a
+# flag missing its value, and an interval that is not whole seconds or is 0, which busy-looped the
+# API for up to the whole ceiling (round 9 of #13, folded in by #14).
+test_run_watch_refuses_what_it_does_not_take() {
+  local spec
+  local -a cmd
+  for spec in 'example/repo#4242 --foo' 'example/repo#4242 -x' 'example/repo#4242 --exit-status=true' \
+    'example/repo#4242 -R' 'example/repo#4242 --repo' 'example/repo#4242 -i' \
+    'example/repo#4242 --interval' 'example/repo#4242 -i 0' 'example/repo#4242 -i=0' \
+    'example/repo#4242 -i abc' 'example/repo#4242 -i 1.5' 'example/repo#4242 --interval='; do
+    read -r -a cmd <<<"$spec"
+    reset_fixture
+    run_retry run watch "${cmd[@]}"
+    assert_eq "$RETRY_RC" 2 "'$spec' is an invocation error ($RETRY_OUT)"
+    assert_eq "$(gh_calls)" "" "and reads nothing ($spec)"
+  done
+  reset_fixture
+  run_retry run watch example/repo#4242 --foo
+  assert_contains "$RETRY_OUT" "unsupported flag '--foo'" "an unknown flag is named"
+  reset_fixture
+  run_retry run watch example/repo#4242 -R
+  assert_contains "$RETRY_OUT" "-R needs owner/name" "a flag missing its value says what it needs"
+  reset_fixture
+  run_retry run watch example/repo#4242 -i 0
+  assert_contains "$RETRY_OUT" "the interval must be at least 1 second" "a zero interval is refused as one"
+  reset_fixture
+  run_retry run watch example/repo#4242 -i 1.5
+  assert_contains "$RETRY_OUT" "the interval must be seconds, got '1.5'" "and a fraction as not whole seconds"
+}
+
+# Which conclusions are a verdict: the red ones exit 1, the green ones 0, and a run that stopped
+# without being judged -- cancelled, stale, action_required, or completed with no conclusion at
+# all -- exits 4: never the 1 that reads as a failed run, and never a pass.
+test_run_watch_reads_each_conclusion_class() {
+  local concl
+  for concl in success skipped neutral; do
+    reset_fixture
+    RUN_CONCLUSION=$concl
+    run_retry run watch example/repo#4242
+    assert_eq "$RETRY_RC" 0 "$concl is green ($RETRY_OUT)"
+    assert_eq "$RETRY_OUT" "run 4242 in example/repo: $concl" "and the line names it"
+  done
+  for concl in failure timed_out startup_failure; do
+    reset_fixture
+    RUN_CONCLUSION=$concl
+    run_retry run watch example/repo#4242
+    assert_eq "$RETRY_RC" 1 "$concl is red ($RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "run 4242 in example/repo concluded $concl — the run FAILED" "and says so"
+  done
+  for concl in cancelled stale action_required ""; do
+    reset_fixture
+    RUN_CONCLUSION=$concl
+    run_retry run watch example/repo#4242
+    assert_eq "$RETRY_RC" 4 "'$concl' is no verdict ($RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "concluded ${concl:-pending} — stopped, not judged" "and says so"
+    assert_not_contains "$RETRY_OUT" "FAILED" "never a failure ('$concl')"
+  done
+}
+
+# A run still going is polled on the interval, but never slept past the deadline: an -i longer
+# than what was left slept the await far past its ceiling before the clock was read again (round
+# 5 of self-improve#8). While it waits, the heartbeat goes to stderr in place of the redraws `gh
+# run watch` streamed (self-improve#8).
+test_run_watch_sleeps_no_further_than_its_deadline() {
+  local started elapsed
+  reset_fixture
+  RUN_STATUS=in_progress
+  RUN_CONCLUSION=""
+  retune CHECKS_WAIT=3 CHECKS_HEARTBEAT=0
+  started=$SECONDS
+  run_retry run watch example/repo#4242 -i 30
+  elapsed=$((SECONDS - started))
+  assert_eq "$RETRY_RC" 4 "a run still going at the deadline has no verdict ($RETRY_OUT)"
+  [ "$elapsed" -lt 20 ] || bail "the await slept past its 3s deadline on a 30s interval: ${elapsed}s"
+  assert_contains "$RETRY_OUT" "still waiting on run 4242 in example/repo: in_progress after 0 min" \
+    "the heartbeat says what it is waiting on"
+  assert_contains "$RETRY_OUT" "NO VERDICT after 0 min (status: in_progress)" "and the end says so"
+  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 2 "one read at the start and one at the deadline"
+}
+
+# The plain retry's success is gh's own answer: its stdout and nothing else, whichever of the
+# spellings a caller pastes (the leading `gh`, --read, --write), and nothing at all for an empty
+# one. With no gh arguments left there is nothing to run, which is a usage error.
+test_a_plain_retry_passes_the_answer_through() {
+  local spec
+  local -a cmd
+  for spec in 'run view' '--read run view' '--write run view' 'gh run view' '--read gh run view'; do
+    read -r -a cmd <<<"$spec"
+    reset_fixture
+    run_retry "${cmd[@]}" 4242 --repo example/repo --json status,conclusion --jq .status
+    assert_eq "$RETRY_RC" 0 "'$spec' succeeds ($RETRY_OUT)"
+    assert_eq "$RETRY_OUT" completed "and prints gh's answer, alone ($spec)"
+    assert_eq "$(gh_calls)" "run view 4242 --repo example/repo --json status,conclusion --jq .status" \
+      "the call is the caller's, minus retry's own words ($spec)"
+  done
+  reset_fixture
+  run_retry --read run view 4242 --repo example/repo --json status --jq empty
+  assert_eq "$RETRY_RC" 0 "an empty answer is still an answer ($RETRY_OUT)"
+  assert_eq "$RETRY_OUT" "" "and prints nothing"
+  for spec in '' '--read' 'gh' '--write gh'; do
+    read -r -a cmd <<<"$spec"
+    reset_fixture
+    run_retry ${cmd[@]+"${cmd[@]}"}
+    assert_eq "$RETRY_RC" 2 "'$spec' has nothing to run ($RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "usage: retry [--read] <gh args...>" "and says how it is used"
+    assert_eq "$(gh_calls)" "" "and calls nothing ($spec)"
+  done
+}
+
+# The plain retry's failures, under each policy (9197c23): a 4xx is the API answering (exit 1, not
+# re-sent); a gateway refusal is re-sent under either policy, to an exit 3 that says the outcome is
+# unknown; and anything else ambiguous is re-sent by a read but not by a write, which says it may
+# have landed.
+test_a_plain_retry_keeps_its_exits_apart() {
+  local mode
+  retune API_ATTEMPTS=3
+  for mode in --read --write; do
+    reset_fixture
+    RUN_ERROR="gh: Not Found (HTTP 404)"
+    run_retry "$mode" run view 4242 --repo example/repo --json status
+    assert_eq "$RETRY_RC" 1 "a 404 is the API's answer ($mode: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "gh run was rejected: gh: Not Found (HTTP 404)" "quoted as one ($mode)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and not re-sent ($mode)"
+    reset_fixture
+    RUN_ERROR="gh: HTTP 503: Service Unavailable"
+    run_retry "$mode" run view 4242 --repo example/repo --json status
+    assert_eq "$RETRY_RC" 3 "a gateway refusal is transport ($mode: $RETRY_OUT)"
+    assert_contains "$RETRY_OUT" "gh run did not go through after 3 attempts (gh: HTTP 503: Service Unavailable)" \
+      "and says how many attempts it took ($mode)"
+    assert_contains "$RETRY_OUT" "the outcome is UNKNOWN" "and that nothing was learned ($mode)"
+    assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "after every attempt ($mode)"
+  done
+  reset_fixture
+  RUN_ERROR="gh: Internal Server Error (HTTP 500)"
+  run_retry run view 4242 --repo example/repo --json status
+  assert_eq "$RETRY_RC" 3 "an ambiguous write is not a verdict ($RETRY_OUT)"
+  assert_contains "$RETRY_OUT" "gh run failed AMBIGUOUSLY: gh: Internal Server Error (HTTP 500)" "and says why"
+  assert_contains "$RETRY_OUT" "a write may have landed" "and what that means"
+  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and the write policy does not re-send it"
+  reset_fixture
+  RUN_ERROR="gh: Internal Server Error (HTTP 500)"
+  run_retry --read run view 4242 --repo example/repo --json status
+  assert_eq "$RETRY_RC" 3 "the same failure on a read is transport ($RETRY_OUT)"
+  assert_contains "$RETRY_OUT" "did not go through after 3 attempts" "re-sent to the end"
+  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 3 "by the read policy"
+}
+
 # --- the shared parse -------------------------------------------------------------------------
 
 # parse_ref is what both this command and pr_arg read their argument with; pinning it directly
@@ -684,6 +864,12 @@ tests=(
   test_a_delegating_command_refusal_is_not_read
   test_the_scripts_own_refused_call_is_exit_2
   test_a_refused_own_call_stops_the_command
+  test_run_watch_takes_every_spelling_of_its_flags
+  test_run_watch_refuses_what_it_does_not_take
+  test_run_watch_reads_each_conclusion_class
+  test_run_watch_sleeps_no_further_than_its_deadline
+  test_a_plain_retry_passes_the_answer_through
+  test_a_plain_retry_keeps_its_exits_apart
   test_parse_ref
 )
 

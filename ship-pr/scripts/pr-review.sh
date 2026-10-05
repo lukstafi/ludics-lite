@@ -4036,13 +4036,18 @@ cmd_run_watch() {
   local line rc status concl sleep_for remaining
   while [ $# -gt 0 ]; do
     case "$1" in
+    # A flag missing its value is an invocation error, exit 2 like every other one here. It was
+    # `${2:?...}`, which exits 1 -- the code this await keeps for a run that FAILED -- with bash's
+    # own `line N: 2:` prefix on the message.
     -R | --repo)
-      flag_repo="${2:?$1 needs owner/name}"
+      [ -n "${2:-}" ] || die "run watch: $1 needs owner/name"
+      flag_repo="$2"
       shift
       ;;
     -R=* | --repo=*) flag_repo="${1#*=}" ;;
     -i | --interval)
-      interval="${2:?$1 needs seconds}"
+      [ -n "${2:-}" ] || die "run watch: $1 needs seconds"
+      interval="$2"
       shift
       ;;
     -i=* | --interval=*) interval="${1#*=}" ;;
