@@ -56,6 +56,9 @@ FAIL_GRAPHQL=""
 # A comment POST refusing (a watch's re-request of a failed run, #453). What does post is kept in
 # $TEST_ROOT/posted, one comment per line, and served back by the comments read after it.
 FAIL_POST=""
+# A posted comment the comments feed has not caught up with yet: the POST lands, and the reads after
+# it do not serve it back.
+HIDE_POSTED=""
 # A 👍 landing mid-watch: from this reactions read on (counted from the case's reset), the feed
 # answers REACTIONS_JSON plus a 👍 — how a case puts one between a round's read and the write
 # that round decided on.
@@ -89,6 +92,7 @@ reset_fixture() {
   THREADS_FIXTURE_TOTAL=""
   FAIL_GRAPHQL=""
   FAIL_POST=""
+  HIDE_POSTED=""
   THUMBS_ON_REACTIONS_READ=""
   rm -f "$TEST_ROOT/pushed" "$TEST_ROOT/posted" "$TEST_ROOT"/nth.*
   : >"$REQUEST_LOG"
@@ -180,7 +184,7 @@ gh() {
     ;;
   "repos/$REPO/issues/7/comments?per_page=100")
     response="$COMMENTS_JSON"
-    [ ! -s "$TEST_ROOT/posted" ] ||
+    [ -n "$HIDE_POSTED" ] || [ ! -s "$TEST_ROOT/posted" ] ||
       response=$(jq -c --slurpfile p "$TEST_ROOT/posted" '. + $p' <<<"$response")
     ;;
   "repos/$REPO/issues/7/comments")
@@ -1781,6 +1785,22 @@ test_watch_surfaces_a_re_request_that_did_not_post() {
   assert_contains "$WATCH_OUT" "watermark: " "and ends on a watermark"
 }
 
+# The `failed` arm's other half (dc0c749): the request is on the PR, but the comments feed has not
+# caught up with it, so the rounds after the post still read the run as failed and never
+# re-requested. One post per head per process — it is polled, not posted again — and the request's
+# grace, not the failed state's lack of one, bounds the window.
+test_watch_does_not_post_twice_while_the_feed_lags_its_request() {
+  retune GRACE=2
+  failed_run_fixture
+  HIDE_POSTED=1
+  run_watch 0,1,0 1 3
+  assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 \
+    "one request, however many rounds still read the failure"
+  assert_contains "$WATCH_ERR" "re-requested the review with '@codex review'" "the watch made it"
+  assert_eq "$WATCH_RC" 1 "the request's grace ran out with nothing read back: a quiet window, re-arm"
+  assert_contains "$WATCH_OUT" "no reviewer activity about head" "and it says so"
+}
+
 tests=(
   test_empty_reviews_need_their_own_findings
   test_idle_clean_says_next_move_is_yours
@@ -1857,6 +1877,7 @@ tests=(
   test_watch_surfaces_a_re_request_that_did_not_post
   test_watch_waits_out_a_re_request_posted_on_its_last_poll
   test_watch_does_not_post_over_an_approval_that_landed_since_the_round
+  test_watch_does_not_post_twice_while_the_feed_lags_its_request
 )
 
 run_tests "${tests[@]}" -- "$@"

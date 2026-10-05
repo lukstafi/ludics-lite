@@ -1758,6 +1758,75 @@ test_an_approval_beside_a_final_poll_round_is_checked_too() {
     "the approval beside it is reported over the open thread"
 }
 
+# --- edges the fix history encoded (pinned before the v2 port, ludics-lite#403) -------------------
+
+# A live 👀 that stops reading as live without a review of the head is a round that ended with
+# nothing (b6b09ee, "a spent 👀 must not read as a review is running"). One read is not proof — a
+# reaction read can come back empty once (test_one_empty_reaction_read_retains_the_live_boundary)
+# — so the second consecutive one is, and it ends the wait on the nudge advice after the final
+# poll, rather than holding the window or the grace.
+test_a_live_round_that_reads_ended_twice_ends_on_the_nudge_advice() {
+  reset_fixture
+  schedule reactions 1 "[$(reaction eyes "$(jq -rn '(now - 5) | todate')")]"
+  schedule reactions 2 '[]'
+  run_watch 0,0,0 1 5
+  assert_eq "$WATCH_RC" 0 "a round that ended with nothing is a verdict to act on"
+  assert_contains "$WATCH_OUT" \
+    "the 👀 round on PR $REPO#7 ended without a review of the head commit — consider nudging" \
+    "the verdict names what happened and the move"
+  assert_contains "$WATCH_OUT" "no reviewer activity about head ${H2:0:7}; status: review EXPECTED" \
+    "beside the state it was read from"
+  assert_eq "$(poll_rounds)" 4 "two loop reads after the live one, then the final poll"
+}
+
+# A 👀 older than any round takes is `stalled`, and the watch answers it like the other
+# nothing-is-coming verdicts: one final poll, the state re-read, then the line (b6b09ee, 71f2862).
+test_a_stalled_round_ends_the_wait_with_its_verdict() {
+  reset_fixture
+  retune STALL=30
+  schedule reactions 1 "[$(reaction eyes "$(jq -rn '(now - 60) | todate')")]"
+  run_watch 0,0,0 1 5
+  assert_eq "$WATCH_RC" 0 "a stall is something to act on"
+  assert_contains "$WATCH_OUT" "no reviewer activity about head ${H2:0:7}; status: STALLED — 👀 from" \
+    "the verdict is the stall, said beside the head it is about"
+  assert_eq "$(poll_rounds)" 2 "one loop read reaches it, and the final poll precedes the verdict"
+}
+
+# A window in which no poll answered is not a quiet window, and one whose LAST polls did not answer
+# did not observe its tail (9197c23): both exit 3, each saying which it was, never exit 1.
+test_a_blind_window_is_not_a_quiet_one() {
+  reset_fixture
+  FAIL_FEEDS_FROM=1
+  run_watch 0,0,0 5 1
+  assert_eq "$WATCH_RC" 3 "nothing observed is transport, not a verdict"
+  assert_contains "$WATCH_OUT" "could not read PR $REPO#7 for the whole 1s window — NOT the same as quiet" \
+    "the line says the whole window was blind"
+  assert_contains "$WATCH_OUT" "watermark: 0,0,0" "and hands the caller's watermark back"
+  reset_fixture
+  FAIL_FEEDS_FROM=2
+  run_watch 0,0,0 1 1
+  assert_eq "$WATCH_RC" 3 "an unobserved tail is transport too"
+  assert_contains "$WATCH_OUT" "poll(s) of the 1s window on PR $REPO#7 did not answer, so the tail of this window was NOT observed" \
+    "the line says the tail was blind"
+  assert_not_contains "$WATCH_OUT" "no reviewer activity" "and does not report a quiet window"
+}
+
+# A PR read that fails leaves the state unknown, which the loop holds without concluding anything,
+# and the quiet exit says the head was never read rather than naming none (692d42e). The opening
+# line on stderr is the log's record of what the window started from.
+test_an_unread_head_is_named_unread_in_the_quiet_exit() {
+  reset_fixture
+  FAIL_PULLS=1
+  run_watch 0,0,0
+  assert_eq "$WATCH_RC" 1 "the feeds answered and nothing came, so the window is quiet"
+  assert_contains "$WATCH_ERR" "watching PR $REPO#7, every 1s for up to 1s; from: UNKNOWN" \
+    "the opening line names the window and the state it started from"
+  assert_contains "$WATCH_ERR" "state unreadable this round on PR $REPO#7; holding 'unknown'" \
+    "an unknown state is held, round by round"
+  assert_contains "$WATCH_OUT" "no reviewer activity about head UNREAD in 1s; status: UNKNOWN" \
+    "the quiet line says the head was not read"
+}
+
 tests=(
   test_the_about_codex_block_is_folded_to_one_line
   test_what_is_not_the_about_codex_block_renders_as_is
@@ -1819,6 +1888,10 @@ tests=(
   test_an_approval_over_findings_scrolled_past_is_not_clean
   test_an_approval_landing_in_the_final_poll_is_checked_too
   test_an_approval_beside_a_final_poll_round_is_checked_too
+  test_a_live_round_that_reads_ended_twice_ends_on_the_nudge_advice
+  test_a_stalled_round_ends_the_wait_with_its_verdict
+  test_a_blind_window_is_not_a_quiet_one
+  test_an_unread_head_is_named_unread_in_the_quiet_exit
 )
 
 run_tests "${tests[@]}" -- "$@"
