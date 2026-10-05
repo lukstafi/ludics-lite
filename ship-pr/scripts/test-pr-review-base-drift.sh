@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # Focused fixture tests for pr-review.sh's merge-time base-drift file intersection.
+#
+# BLACK-BOX (ludics-lite#403): the drift read is what `merge` prints right before its merge call,
+# and every case reads it there -- `merge` (cmd_merge) driven against the fixture `gh` below, which
+# answers the rest of the merge plainly (a green head, no advisory list, nothing to close, no open
+# thread). No internal function is called, so the cases judge the shell and the Python alike. The
+# drift is a WARNING and never a gate, so every merge here lands (exit 0), and what the read
+# concluded is read off what it printed, which is its contract with the reader: UNKNOWN for a read
+# that could not be completed (the old status 3), `!!!` for a fact to act on (status 1), and
+# neither for a drift with nothing to say (status 0). DRIFT_RC keeps those numbers.
 
 set -euo pipefail
 
@@ -34,7 +43,9 @@ FAIL_TIP=""
 
 pr_json() {
   jq -cn --arg ref "$BASE_REF" --arg m "$MERGEABLE_STATE" \
-    '{base:{ref:$ref,sha:"stale-base-sha"},head:{label:"fork-owner:topic",sha:"head-sha"},mergeable_state:$m}'
+    '{base:{ref:$ref,sha:"stale-base-sha"},head:{label:"fork-owner:topic",sha:"head-sha",ref:"topic"},
+      mergeable_state:$m, updated_at:"2026-09-01T00:00:00Z", body:"", commits:1, mergeable:true,
+      merged:true, state:"closed"}'
 }
 
 compare_json() {
@@ -58,9 +69,35 @@ set_compares() {
 # jq.
 gh() {
   local response=""
+  if [ "${1:-} ${2:-}" = "pr merge" ]; then
+    printf '%s\n' "$*" >>"$TEST_ROOT/merge-calls"
+    return 0
+  fi
   gh_fixture_parse "$@"
   case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/pulls/7") response=$(pr_json) ;;
+  # The rest of the merge, answered plainly: no advisory list (a 404 the listing confirms), one
+  # green check over one finished run, the repository's default branch, a one-commit series with
+  # nothing to close, and no review thread.
+  "repos/$REPO/contents/.github/ship-pr-advisory-checks")
+    echo "gh: Not Found (HTTP 404)" >&2
+    return 1
+    ;;
+  "repos/$REPO/contents/.github") response='[{"name":"workflows","type":"dir"}]' ;;
+  "repos/$REPO/commits/head-sha/check-runs?filter=latest&per_page=100")
+    response='{"check_runs":[{"name":"ci","conclusion":"success","html_url":"u","check_suite":{"id":1}}]}'
+    ;;
+  "repos/$REPO/actions/runs?head_sha=head-sha&per_page=100")
+    response='{"workflow_runs":[{"id":100,"workflow_id":1,"event":"pull_request","name":"ci","status":"completed","conclusion":"success","created_at":"2026-09-01T00:00:00Z","check_suite_id":1}]}'
+    ;;
+  "repos/$REPO") response='{"default_branch":"main"}' ;;
+  "repos/$REPO/pulls/7/commits?per_page=100") response='[{"sha":"head-sha","commit":{"message":"A commit."}}]' ;;
+  graphql)
+    case "$FIXTURE_QUERY" in
+    *mergeQueue*) response='{"data":{"repository":{"mergeQueue":null}}}' ;;
+    *) response=$(review_threads_answer '[]' "$@") ;;
+    esac
+    ;;
   # The base branch's tip: what the compares must be anchored on. A compare against the PR's
   # stale-base-sha snapshot has no fixture and bails below, which is the point.
   "repos/$REPO/commits/main" | "repos/$REPO/commits/wip%20x")
@@ -91,12 +128,20 @@ gh() {
 
 run_drift() {
   local capture rc
+  : >"$TEST_ROOT/merge-calls"
   set +e
-  capture=$(warn_base_drift 7 2>&1)
+  capture=$(cmd_merge "$REPO#7" 2>&1)
   rc=$?
   set -e
   DRIFT_OUTPUT="$capture"
-  DRIFT_RC="$rc"
+  assert_eq "$rc" 0 "the drift is a warning, never a gate: the merge lands ($capture)"
+  assert_contains "$(cat "$TEST_ROOT/merge-calls")" "pr merge 7 --repo $REPO --match-head-commit head-sha" \
+    "and the merge call is made"
+  case "$capture" in
+  *UNKNOWN*) DRIFT_RC=3 ;;
+  *'!!!'*) DRIFT_RC=1 ;;
+  *) DRIFT_RC=0 ;;
+  esac
 }
 
 test_no_overlap() {

@@ -5,7 +5,15 @@
 # any check existed, and a green check standing over a sibling run that has not judged the head
 # (ludics-lite#38, round 2). None of those may leave the gate as exit 0. And the one place `merge`
 # has to act on what this gate read: an ABSENT verdict whose base moves before the merge call
-# (ludics-lite#523), run through cmd_merge with its other scans stubbed out.
+# (ludics-lite#523), and what an --override hands the gate (ludics-lite#392).
+#
+# BLACK-BOX (ludics-lite#403): every case drives the command line -- `checks` (cmd_checks) or
+# `merge` (cmd_merge), the forwarded subcommands -- with the fixture `gh` below as the only stand-in.
+# No case calls an internal function or replaces one, so the same cases judge the shell and the
+# Python implementation alike. The gate is read through `checks`, which reads the repository's
+# advisory list first (a 404 the listing confirms, unless a case says otherwise) and ends with its
+# `checks: verdict=` trailer; the override's waiver is read through `merge --override`, the only
+# command that hands the gate one; and the advisory list is read off what the gate then counts.
 
 set -euo pipefail
 
@@ -112,16 +120,10 @@ jobs:
 '
 MERGE_LOG="$TEST_ROOT/merge-calls"
 
-# cmd_merge's scans that are not about the build signal, stubbed for the merge cases (#523): the
-# body, the commit series and the review threads are test-pr-review-merge.sh's. warn_base_drift
-# runs right after the gate and before the merge loop, so it is where the base advances.
-stub warn_multi_close warn_series_close merge_threads_gate warn_base_drift
-warn_multi_close() { :; }
-warn_series_close() { :; }
-merge_threads_gate() { :; }
-warn_base_drift() {
-  [ -z "$BASE_ADVANCED" ] || : >"$TEST_ROOT/base-advanced"
-}
+# What merge reads besides the build signal -- the body, the commit series, the review threads, the
+# base drift -- is answered plainly below (nothing to close, nothing open, nothing drifted): those
+# are test-pr-review-merge.sh's subject. The base-drift read comes right after the gate and before
+# the merge loop, so its PR read (the one projecting `mergeable_state`) is where the base advances.
 advanced_adds() { [ -n "$ADVANCE_ADDS_WORKFLOW" ] && [ -e "$TEST_ROOT/base-advanced" ]; }
 
 # A workflow with NO path filter at all, which is what this repository's own CI looks like and
@@ -275,6 +277,11 @@ gh() {
   # do NOT overlap (the glob demands the slash), nor do "actions/runs?…" and "actions/runs/"*.
   case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/pulls/7")
+    # The base-drift read (the one projection carrying mergeable_state) runs after the gate and
+    # before the merge loop: the moment a case's base advance lands.
+    case "$FIXTURE_FILTER" in
+    *mergeable_state*) [ -z "$BASE_ADVANCED" ] || : >"$TEST_ROOT/base-advanced" ;;
+    esac
     fixture_head=$(next_of HEAD_SEQ)
     if [ "$fixture_head" = UNREADABLE ]; then return 1; fi
     [ ! -e "$TEST_ROOT/merged" ] || merged=true
@@ -283,12 +290,14 @@ gh() {
         --arg base "$(next_base)" --arg ref "$PR_HEAD_REF" \
         --argjson m "$merged" \
         '{head:({sha:$sha} + (if $ref == "" then {} else {ref:$ref} end)), updated_at:$at,
-          merged:$m, state:(if $m then "closed" else "open" end)}
-         + (if $base == "" then {} else {base:{sha:$base}} end)')
+          merged:$m, state:(if $m then "closed" else "open" end), body:"", commits:1,
+          mergeable:true, mergeable_state:"clean"}
+         + (if $base == "" then {base:{ref:"main"}} else {base:{sha:$base, ref:"main"}} end)')
     else
       response=$(jq -cn --arg sha "$fixture_head" --arg base "$(next_base)" --arg ref "$PR_HEAD_REF" \
-        '{head:({sha:$sha} + (if $ref == "" then {} else {ref:$ref} end))}
-         + (if $base == "" then {} else {base:{sha:$base}} end)')
+        '{head:({sha:$sha} + (if $ref == "" then {} else {ref:$ref} end)), body:"", commits:1,
+          mergeable:true, mergeable_state:"clean"}
+         + (if $base == "" then {base:{ref:"main"}} else {base:{sha:$base, ref:"main"}} end)')
     fi
     ;;
   "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=latest&per_page=100")
@@ -376,11 +385,25 @@ gh() {
   "repos/$REPO/compare/"*)
     response=$(jq -cn --argjson c "$COMPARE_COMMITS" --arg m "$MERGE_BASE" \
       '{merge_base_commit: {sha: $m}, total_commits: ($c | length), behind_by: 0,
+        ahead_by: ($c | length), files: [],
         commits: [$c | to_entries[] |
           {sha: .value,
            parents: [{sha: (if .key == 0 then $m else $c[.key - 1] end)}]}]}')
     ;;
+  # merge's own reads, answered plainly: the base branch's tip (the drift read's anchor), the
+  # repository's default branch, the commit series and the review threads.
+  "repos/$REPO/commits/main") response='{"sha":"7171717171717171717171717171717171717171"}' ;;
   "repos/$REPO/commits/"*) response=$(jq -cn --argjson f "$FILES_JSON" '{files:$f}') ;;
+  "repos/$REPO") response='{"default_branch":"main"}' ;;
+  "repos/$REPO/pulls/7/commits?per_page=100")
+    response=$(jq -cn --arg s "$HEAD_SHA" '[{sha:$s, commit:{message:"A commit."}}]')
+    ;;
+  graphql)
+    case "$FIXTURE_QUERY" in
+    *mergeQueue*) response='{"data":{"repository":{"mergeQueue":null}}}' ;;
+    *) response=$(review_threads_answer '[]' "$@") ;;
+    esac
+    ;;
   *) bail "unexpected fixture endpoint: $FIXTURE_ENDPOINT" ;;
   esac
   gh_fixture_answer "$response"
@@ -405,10 +428,12 @@ run_merge() {
   MERGE_CALLS=$(cat "$MERGE_LOG")
 }
 
+# The gate, read through `checks` with its --wait (0: one read). Both streams, as the gate's own
+# capture was; the trailer closes stdout.
 run_gate() {
   local capture rc
   set +e
-  capture=$(gate_checks 7 "${1:-0}" ${2:+"$2"} 2>&1)
+  capture=$(cmd_checks 7 --wait="${1:-0}" 2>&1)
   rc=$?
   set -e
   GATE_OUTPUT="$capture"
@@ -830,6 +855,19 @@ test_merge_lands_an_absent_verdict_the_moved_base_still_settles() {
   run_merge
   assert_eq "$MERGE_RC" 0 "an unmoved base merges ($MERGE_OUTPUT)"
   assert_not_contains "$MERGE_OUTPUT" "gating the head again" "and is not gated twice"
+  assert_contains "$MERGE_OUTPUT" "none can be created by ci" "on the absence the recognition gave"
+  assert_contains "$MERGE_CALLS" "--match-head-commit $HEAD_SHA" "bound to the gated head"
+  # A close-out merge still refuses it: a record-based merge must have READ a green, and a head
+  # nothing builds has none to read (moved here from test-pr-review-merge.sh, whose gate is now
+  # read black-box too and does not model the recognition's feeds).
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  run_merge --require-green
+  assert_eq "$MERGE_RC" 4 "a close-out merge needs a green it READ ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "the build signal is absent" "the refusal names the verdict"
+  assert_contains "$MERGE_OUTPUT" "path filters" "and points at the dispatch that would get one"
+  assert_eq "$MERGE_CALLS" "" "no merge call is made"
 }
 
 # --- review round 8 ---------------------------------------------------------------------------
@@ -1433,7 +1471,10 @@ test_non_advisory_job_failure_is_a_red_run() {
 # ludics-lite#392: what merge --override hands the gate. A waived leg's run concludes `failure` once
 # its sibling finishes, and its job is the waived check by name, so the run's red is explained, as
 # an advisory job's is; the verdict is the waiver's, not a run-level red nobody named. The second
-# half is the control: the same leg with no waiver is a plain red at the first read.
+# half is the control: the same leg with no waiver is a plain red at the first read. Read through
+# `merge --override`, the one command that hands the gate a waiver: a waived red is merged over
+# (and announced), any other red refuses with exit 1.
+WAIVE_WHY='the ubuntu red is a pidfile race in an unrelated benchmark test'
 test_a_waived_leg_does_not_redden_its_run() {
   local suite
   # The job is joined to its check through the run's check suite, so the same job name in ANOTHER
@@ -1448,14 +1489,18 @@ test_a_waived_leg_does_not_redden_its_run() {
       "$(runs_json "$(jq -cn --argjson s "$suite" '[{name:"ci",status:"completed",conclusion:"failure",check_suite_id:$s}]')")")
     JOBS_JSON=$(jobs_json '[{"name":"ubuntu","conclusion":"failure"},
                             {"name":"macos","conclusion":"success"}]')
-    run_gate 30 waive
-    assert_eq "$GATE_RC" 1 "a waived red is still a red to the gate (run in suite $suite)"
-    assert_contains "$GATE_OUTPUT" "ubuntu (failure — WAIVED" "the waived check is marked (run in suite $suite)"
+    run_merge --wait=30 --override "$WAIVE_WHY"
+    assert_contains "$MERGE_OUTPUT" "ubuntu (failure — WAIVED" "the waived check is marked (run in suite $suite)"
     if [ "$suite" = 11 ]; then
-      assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "the only red is the one waived at the first read"
-      assert_not_contains "$GATE_OUTPUT" "concluded red with no build check" "its run is not a red of its own"
+      assert_eq "$MERGE_RC" 0 "the only red is the waived one, so the override merges ($MERGE_OUTPUT)"
+      assert_contains "$MERGE_OUTPUT" ": RED, WAIVED" "the only red is the one waived at the first read"
+      assert_not_contains "$MERGE_OUTPUT" "concluded red with no build check" "its run is not a red of its own"
+      assert_contains "$MERGE_OUTPUT" "OVERRIDE: merging $REPO#7 over a RED build signal — $WAIVE_WHY" \
+        "and the merge over it is announced"
     else
-      assert_contains "$GATE_OUTPUT" "concluded red with no build check" "another suite's job name explains nothing"
+      assert_eq "$MERGE_RC" 1 "a waived red is still a red, and this run's is not waived ($MERGE_OUTPUT)"
+      assert_contains "$MERGE_OUTPUT" "concluded red with no build check" "another suite's job name explains nothing"
+      assert_eq "$MERGE_CALLS" "" "no merge call is made"
     fi
   done
   # A poll whose check list momentarily lacks the waived row still reads the run's red: it is a
@@ -1468,11 +1513,25 @@ test_a_waived_leg_does_not_redden_its_run() {
     "$(runs_json '[{"name":"ci","status":"completed","conclusion":"failure","check_suite_id":11}]')")
   JOBS_JSON=$(jobs_json '[{"name":"ubuntu","conclusion":"failure"},
                           {"name":"macos","conclusion":"success"}]')
-  run_gate 30 waive
-  assert_eq "$GATE_RC" 1 "the run is still red"
-  assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "a waived red, not a green"
-  assert_contains "$GATE_OUTPUT" "workflow run ci (red through a check above that is WAIVED)" "naming the run"
-  assert_not_contains "$GATE_OUTPUT" ": green" "never a green"
+  run_merge --wait=30 --override "$WAIVE_WHY"
+  assert_eq "$MERGE_RC" 0 "the run's red is the waived one ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" ": RED, WAIVED" "a waived red, not a green"
+  assert_contains "$MERGE_OUTPUT" "workflow run ci (red through a check above that is WAIVED)" "naming the run"
+  assert_not_contains "$MERGE_OUTPUT" ": green" "never a green"
+  assert_contains "$MERGE_OUTPUT" "OVERRIDE: merging" "so the merge goes over a red, and says so"
+  # ...which --require-green, needing a green it READ, refuses.
+  reset_fixture
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u","check_suite":{"id":11}},
+                                        {"name":"macos","conclusion":null,"html_url":"m","check_suite":{"id":11}}]')"
+    "$(check_runs_json '[{"name":"macos","conclusion":"success","html_url":"m","check_suite":{"id":11}}]')")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"in_progress","check_suite_id":11}]')"
+    "$(runs_json '[{"name":"ci","status":"completed","conclusion":"failure","check_suite_id":11}]')")
+  JOBS_JSON=$(jobs_json '[{"name":"ubuntu","conclusion":"failure"},
+                          {"name":"macos","conclusion":"success"}]')
+  run_merge --wait=30 --override "$WAIVE_WHY" --require-green
+  assert_eq "$MERGE_RC" 4 "a waived red is not the green a close-out merge needs ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "the build signal is waived, not green" "and the refusal says so"
+  assert_eq "$MERGE_CALLS" "" "no merge call is made"
   reset_fixture
   CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"ubuntu","conclusion":"failure","html_url":"u"},
                                         {"name":"macos","conclusion":null,"html_url":"m"}]')")
@@ -1489,20 +1548,21 @@ test_a_run_level_red_is_waived_only_from_the_first_read() {
   CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"}]')")
   RUNS_SEQ=("$(runs_json '[{"name":"pages","status":"completed","conclusion":"startup_failure"},
                            {"name":"ci","status":"completed","conclusion":"success"}]')")
-  run_gate 0 waive
-  assert_eq "$GATE_RC" 1 "a waived run-level red is still a red"
-  assert_contains "$GATE_OUTPUT" ": RED, WAIVED" "the waiver covers it"
-  assert_contains "$GATE_OUTPUT" "workflow run pages (no build check behind it — WAIVED" "and names it"
+  run_merge --override "$WAIVE_WHY"
+  assert_eq "$MERGE_RC" 0 "a waived run-level red is merged over ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" ": RED, WAIVED" "the waiver covers it"
+  assert_contains "$MERGE_OUTPUT" "workflow run pages (no build check behind it — WAIVED" "and names it"
   reset_fixture
   CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"success","html_url":"u"}]')")
   RUNS_SEQ=("$(runs_json '[{"name":"pages","status":"completed","conclusion":"startup_failure"},
                            {"name":"ci","status":"in_progress"}]')"
     "$(runs_json '[{"name":"pages","status":"completed","conclusion":"startup_failure"},
                    {"name":"ci","status":"completed","conclusion":"failure"}]')")
-  run_gate 30 waive
-  assert_eq "$GATE_RC" 1 "a run that went red during the wait is a red"
-  assert_contains "$GATE_OUTPUT" ": RED — 1 workflow run(s)" "a plain run-level red, not a waived one"
-  assert_contains "$GATE_OUTPUT" "ci (failure)" "naming the run that was not waived"
+  run_merge --wait=30 --override "$WAIVE_WHY"
+  assert_eq "$MERGE_RC" 1 "a run that went red during the wait is a red ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" ": RED — 1 workflow run(s)" "a plain run-level red, not a waived one"
+  assert_contains "$MERGE_OUTPUT" "ci (failure)" "naming the run that was not waived"
+  assert_eq "$MERGE_CALLS" "" "no merge call is made"
   # The waiver is the INVOCATION's, not its workflow's: a second dispatch of the same workflow and
   # event, running at the first read and red after it, is a run nobody read (review round 2).
   reset_fixture
@@ -1511,9 +1571,10 @@ test_a_run_level_red_is_waived_only_from_the_first_read() {
                            {"id":201,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"}]')"
     "$(runs_json '[{"id":202,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"},
                    {"id":201,"workflow_id":7,"event":"workflow_dispatch","name":"pages","status":"completed","conclusion":"startup_failure"}]')")
-  run_gate 30 waive
-  assert_eq "$GATE_RC" 1 "the later dispatch's red is a red"
-  assert_contains "$GATE_OUTPUT" ": RED — 1 workflow run(s)" "not waived by the earlier dispatch's red"
+  run_merge --wait=30 --override "$WAIVE_WHY"
+  assert_eq "$MERGE_RC" 1 "the later dispatch's red is a red ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" ": RED — 1 workflow run(s)" "not waived by the earlier dispatch's red"
+  assert_eq "$MERGE_CALLS" "" "no merge call is made"
 }
 
 # A red this cannot disprove stands: no jobs at all is the startup_failure shape, and an
@@ -1675,11 +1736,25 @@ test_wait_unchanged_head_turns_green() {
 }
 
 # --- the repository's own advisory list (ludics-lite#530) ---------------------------------------
-# What advisory_policy leaves in BUILD_ADVISORY, and its exit status, read in a subshell because a
-# refusal is `fail`, which exits the shell it runs in.
+# Read through `checks`, black-box: the policy's refusals are the command's exit status and stderr,
+# and the list it settles on is read off what the gate then counts. The PROBE is a head whose check
+# list carries the names a list can tell apart -- `claude` (advisory by default), `macos` (advisory
+# only when a list names it), `claude-nightly` and `macos-extra` (for the anchors) -- each RED, and
+# a green `build` -- over one judged run. Whatever the gate lists as RED is what the list did not
+# name; a head whose only reds were advisory is green.
+advisory_probe() { # [<check names that are red, default: claude macos claude-nightly macos-extra>]
+  local names="${*:-claude macos claude-nightly macos-extra}" rows
+  rows=$(jq -cn --arg n "$names" \
+    '[($n | split(" ")[] | {name: ., conclusion: "failure", html_url: ("u/" + .)}),
+      {name: "build", conclusion: "success", html_url: "u/build"}]')
+  CHECK_RUNS_SEQ=("$(check_runs_json "$rows")")
+  RUNS_SEQ=("$(runs_json '[{"name":"ci","status":"completed","conclusion":"success"}]')")
+}
+
+# `checks` over the probe: ADVISORY_RC its status, ADVISORY_OUT its stdout, ADVISORY_ERR its stderr.
 advisory_read() {
   set +e
-  ADVISORY_OUT=$( (advisory_policy && printf '%s' "$BUILD_ADVISORY") 2>"$TEST_ROOT/advisory.err")
+  ADVISORY_OUT=$(cmd_checks 7 2>"$TEST_ROOT/advisory.err")
   ADVISORY_RC=$?
   set -e
   ADVISORY_ERR=$(cat "$TEST_ROOT/advisory.err")
@@ -1687,16 +1762,18 @@ advisory_read() {
 
 test_no_advisory_file_keeps_the_default_list() {
   reset_fixture
+  advisory_probe claude
   advisory_read
-  assert_eq "$ADVISORY_RC" 0 "a 404 is a repository with no list"
-  assert_eq "$ADVISORY_OUT" "$BUILD_ADVISORY" "the default list stands"
+  assert_eq "$ADVISORY_RC" 0 "a 404 is a repository with no list, and the default list stands ($ADVISORY_OUT)"
+  assert_contains "$ADVISORY_OUT" "green — 1 build checks passed" "so the red claude check is advisory"
   assert_eq "$ADVISORY_ERR" "" "and nothing is said about a file that is not there"
   assert_eq "$(grep -c 'contents/.github$' "$REQUEST_LOG")" 1 "the 404 is confirmed by the listing"
   reset_fixture
+  advisory_probe claude
   ADVISORY_DIR=404
   ADVISORY_ROOT='["README.md"]'
   advisory_read
-  assert_eq "$ADVISORY_RC" 0 "a repository with no .github, by the root listing, has no list"
+  assert_eq "$ADVISORY_RC" 0 "a repository with no .github, by the root listing, has no list ($ADVISORY_OUT)"
 }
 
 # A 404 is also GitHub's answer to a token without Contents access on a private repository, so
@@ -1707,6 +1784,7 @@ test_an_unconfirmed_404_is_not_an_absent_file() {
   advisory_read
   assert_eq "$ADVISORY_RC" 2 "a file the listing shows is not absent, whatever its read said"
   assert_contains "$ADVISORY_ERR" "could not be established" "and says so"
+  assert_eq "$(tail -n 1 <<<"$ADVISORY_OUT")" "checks: verdict=unknown" "and judges nothing"
   reset_fixture
   ADVISORY_DIR=404
   ADVISORY_ROOT=404
@@ -1729,15 +1807,22 @@ test_an_unconfirmed_404_is_not_an_absent_file() {
 
 test_the_advisory_file_replaces_the_list() {
   reset_fixture
+  advisory_probe claude macos
   ADVISORY_BODY=$'# a comment\n\n  # an indented one\n^claude$\r\n^macos$\n\n'
   advisory_read
-  assert_eq "$ADVISORY_RC" 0 "a list file is read"
-  assert_eq "$ADVISORY_OUT" '^claude$|^macos$' \
-    "its lines are the list, joined, comments, blanks and the CR aside"
-  assert_contains "$ADVISORY_ERR" "advisory checks, from $REPO's .github/ship-pr-advisory-checks" \
-    "the log says where the list came from"
+  assert_eq "$ADVISORY_RC" 0 "a list file is read, and it names both reds ($ADVISORY_OUT)"
+  assert_contains "$ADVISORY_ERR" "advisory checks, from $REPO's .github/ship-pr-advisory-checks: ^claude\$|^macos\$" \
+    "its lines are the list, joined, comments, blanks and the CR aside, and the log says where it came from"
   assert_eq "$(grep -c 'contents/.github/ship-pr-advisory-checks$' "$REQUEST_LOG")" 1 \
     "one read, of the default branch (no ref)"
+  # The file REPLACES the default list: a name only the default list carries is no longer advisory.
+  reset_fixture
+  advisory_probe claude macos
+  ADVISORY_BODY=$'^macos$\n'
+  advisory_read
+  assert_eq "$ADVISORY_RC" 1 "claude is not on the file's list ($ADVISORY_OUT)"
+  assert_contains "$ADVISORY_OUT" "  RED      claude (failure)" "so its red counts"
+  assert_not_contains "$ADVISORY_OUT" "RED      macos" "while the file's own name does not"
 }
 
 # End to end through `checks`: the in-flight run whose only unfinished job is `macos` holds under
@@ -1787,32 +1872,40 @@ test_an_advisory_file_that_cannot_be_used_refuses() {
 # for every name (review of #531). The variable's path, which the file's grouping cannot protect.
 test_an_option_shaped_advisory_ere_is_a_pattern() {
   reset_fixture
-  retune BUILD_ADVISORY='--help'
-  if is_advisory "build"; then bail "an option-shaped ERE made 'build' advisory"; fi
-  is_advisory "x--helpy" || bail "the ERE is still matched as a pattern"
+  retune ADVISORY_FROM_ENV=1 BUILD_ADVISORY='--help'
+  advisory_probe build x--helpy
+  CHECK_RUNS_SEQ=("$(check_runs_json '[{"name":"build","conclusion":"failure","html_url":"u/build"},
+                                        {"name":"x--helpy","conclusion":"failure","html_url":"u/x"}]')")
+  advisory_read
+  assert_eq "$ADVISORY_RC" 1 "build is red, so the option-shaped ERE did not make it advisory ($ADVISORY_OUT)"
+  assert_contains "$ADVISORY_OUT" "  RED      build (failure)" "build is listed red"
+  assert_not_contains "$ADVISORY_OUT" "x--helpy" "and the ERE is still matched as a pattern"
 }
 
-# SHIP_PR_ADVISORY_CHECKS set when the script was sourced still wins, without a read.
+# SHIP_PR_ADVISORY_CHECKS set when the script was sourced still wins, without a read: here the
+# variable's list is the default one, so `macos`, which only the file names, stays red.
 test_the_variable_wins_over_the_file() {
   reset_fixture
   retune ADVISORY_FROM_ENV=1
+  advisory_probe claude macos
   ADVISORY_BODY='^(claude|macos)$'
   advisory_read
-  assert_eq "$ADVISORY_RC" 0 "the variable's list is used"
-  assert_eq "$ADVISORY_OUT" "$BUILD_ADVISORY" "unchanged by the file"
+  assert_eq "$ADVISORY_RC" 1 "the variable's list is used, unchanged by the file ($ADVISORY_OUT)"
+  assert_contains "$ADVISORY_OUT" "  RED      macos (failure)" "macos is not on it"
+  assert_not_contains "$ADVISORY_OUT" "RED      claude" "claude is"
+  assert_not_contains "$ADVISORY_ERR" "advisory checks, from" "and nothing says a file was used"
   assert_eq "$(grep -c 'ship-pr-advisory-checks' "$REQUEST_LOG")" 0 "the file is not read at all"
 }
 
 # An anchor binds to its own line: `^claude` still matches a longer name and `macos$` does not.
 test_each_advisory_line_keeps_its_anchors() {
   reset_fixture
+  advisory_probe claude-nightly macos-extra
   ADVISORY_BODY=$'^claude\nmacos$'
   advisory_read
-  printf '%s' "claude-nightly" | grep -Eq "$ADVISORY_OUT" ||
-    bail "the first line's prefix match was lost"
-  if printf '%s' "macos-extra" | grep -Eq "$ADVISORY_OUT"; then
-    bail "the second line's suffix anchor leaked"
-  fi
+  assert_eq "$ADVISORY_RC" 1 "one of the two reds is not advisory ($ADVISORY_OUT)"
+  assert_not_contains "$ADVISORY_OUT" "claude-nightly" "the first line's prefix match was kept"
+  assert_contains "$ADVISORY_OUT" "  RED      macos-extra (failure)" "the second line's suffix anchor did not leak"
 }
 
 test_head_reread_unknown() {
