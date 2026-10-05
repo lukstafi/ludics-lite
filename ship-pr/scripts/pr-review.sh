@@ -3903,42 +3903,11 @@ _🤖 Addressed by an automated coding agent_" --jq .html_url
   esac
 }
 
-# The PR's description, replaced whole from a file. `gh pr edit --body-file` is the obvious tool
-# and it rides GraphQL, where on lukstafi/ocannl-staging it fails outright with the classic
-# Projects deprecation error whatever is being edited (2026-09: an issue-wave worker's PR bodies
-# went through a hand-typed `gh api -X PATCH repos/{o}/{r}/pulls/{n} -F body=@file` instead). The REST
-# endpoint touches nothing but the fields sent, so it is immune, and it takes the pieces this
-# script already resolves. A file and not an argument, because a body is multi-paragraph Markdown
-# full of backticks; and not stdin, because gh reads `@-` once, so a gateway retry would send the
-# empty remainder as the new body. No agent marker: the body is the PR's own text, not a reply.
-#
-# The write policy is the same as every other write's, but an ambiguous failure reads differently:
-# a PATCH SETS the body rather than adding to anything, so repeating it cannot post anything twice.
-cmd_body() {
-  [ $# -eq 2 ] || die "usage: body <pr> <file> — got $# argument(s). The new body is read from" \
-    "the file, whole; write it there first."
-  local pr="$1" file="$2"
-  [ "$file" != - ] || die "body: '-' (stdin) is refused — a retry after a gateway refusal would" \
-    "read stdin again and find it spent. Write the body to a file."
-  [ -f "$file" ] && [ -r "$file" ] || die "body: '$file' is not a readable file"
-  grep -q '[^[:space:]]' "$file" 2>/dev/null ||
-    die "body: '$file' is empty; a PR body is not cleared through this command"
-  pr_arg "$pr"
-  pr="$PR_NUM"
-  gh_retry write api -X PATCH "repos/$REPO/pulls/$pr" -F "body=@$file" --jq .html_url
-  case "$?" in
-  0) return 0 ;;
-  3) fail 3 "body of PR $REPO#$pr was not updated — the API refused it at the gateway on all" \
-    "$API_ATTEMPTS attempts ($(gh_err_line)). Nothing was changed, so retry." ;;
-  *)
-    api_rejection "$(gh_err_line)" &&
-      fail 1 "body of PR $REPO#$pr was REJECTED, not dropped: $(gh_err_line)." \
-        "Retrying prints the same thing — check the PR number, the repo and the token's access."
-    fail 3 "body of PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line). The edit may or may not" \
-      "have landed; it sets the body whole, so repeating the same command is safe."
-    ;;
-  esac
-}
+# `body <pr> <file>`: the PR's description, replaced whole from a file over REST. PORTED to Python
+# (ludics-lite#403): lib/ludics/prreview/body.py, which carries this function's rationale and its
+# exits. main() forwards it before reaching the case below; this stub is for a caller that sources
+# the script and calls the function, as the fixture suites do.
+cmd_body() { py_forward call body "$@"; }
 
 # Threads are addressed by node id, which is only reachable by matching a thread's FIRST comment.
 # Prints "<node-id> <isResolved>" for the thread starting at comment $2, matched by the same id the
@@ -8469,6 +8438,100 @@ cmd_base() {
   return 0
 }
 
+# --- the Python half (ludics-lite#403) -------------------------------------------------------------
+# The v2 rewrite moves this script to type-checked Python one subcommand at a time, behind the same
+# command line: the subcommands named in PY_PORTED are served by lib/ludics/prreview/<name>.py, run
+# through scripts/py (which picks a Python >= 3.12), with the same arguments; every other
+# subcommand is the shell below. main() EXECs a ported one, so the Python's exit status, stdout and
+# stderr are the command's own. A ported cmd_<name> is a one-line `py_forward call <name> "$@"`
+# stub for callers that source this file (the fixture suites): it returns 0 when the Python did
+# and exits with its status otherwise, which is what the shell function did on its `fail` paths.
+#
+# Porting a subcommand: its module in lib/ludics/prreview/, its `case` in that package's
+# __main__.py, its name here, its cmd_<name> reduced to the stub, and every constant it reads in
+# PY_FORWARD_VARS. lib/ludics/README.md says the rest.
+PY_PORTED=" body "
+# The source-time constants the Python side reads, as <shell variable>=<environment name>. The
+# VALUE handed over is the shell's own, not the caller's environment: a suite that `retune`s
+# API_ATTEMPTS, or main's --repo, has changed the variable and not the environment. Name a constant
+# here only when its environment name means "the caller set this" in the Python as well -- a
+# constant whose being SET is itself read (SHIP_PR_ADVISORY_CHECKS, ADVISORY_FROM_ENV) needs its own
+# name for the forward, or the Python would read every default as a caller's choice.
+PY_FORWARD_VARS=(REPO=REPO REVIEWER=REVIEWER ROUND_THRESHOLD=SHIP_PR_ROUND_THRESHOLD
+  ROUND_GAP=SHIP_PR_ROUND_GAP API_ATTEMPTS=SHIP_PR_API_ATTEMPTS API_BACKOFF=SHIP_PR_API_BACKOFF)
+# The commands the Python runs that a sourcing suite may have replaced with a shell FUNCTION (its
+# fixture `gh`). The Python cannot call a function of this shell, so when one of these is a function
+# here the forward hands its definitions over through the shell bridge (lib/ludics/proc.py): a file
+# of this shell's functions and variables that each bridged call sources in a fresh bash, which is
+# what the shell's own `$(gh ...)` subshell saw. In a plain run none is a function, and nothing is
+# written.
+PY_BRIDGE_COMMANDS=(gh git)
+
+py_ported() { case "$PY_PORTED" in *" ${1:-} "*) return 0 ;; esac; return 1; }
+
+# This shell's state for the bridge: every function, every variable bash lets a script assign
+# (its own read-only and dynamic ones are left out; a declaration the source refuses anyway is
+# silenced there), and the two options a command substitution inherits, -u and pipefail. errexit is
+# not one of them: bash clears it inside `$(...)`, where every gh call here ran.
+py_bridge_state() {
+  local __name
+  declare -f
+  for __name in $(compgen -v); do
+    case "$__name" in
+    BASH* | FUNCNAME | GROUPS | DIRSTACK | PIPESTATUS | RANDOM | SRANDOM | SECONDS | LINENO | \
+      HISTCMD | EPOCHREALTIME | EPOCHSECONDS | PPID | UID | EUID | SHELLOPTS | PWD | OLDPWD | \
+      COMP_WORDBREAKS | _ | __name) continue ;;
+    esac
+    declare -p "$__name" 2>/dev/null
+  done
+  case "$-" in *u*) echo 'set -u' ;; esac
+  case ":${SHELLOPTS:-}:" in *:pipefail:*) echo 'set -o pipefail' ;; esac
+}
+
+# A path as the interpreter scripts/py runs will read it: on Git Bash that is a native Windows
+# Python, which knows nothing of /usr/bin or /tmp.
+py_native_path() {
+  case "$(uname -s 2>/dev/null)" in
+  MINGW* | MSYS* | CYGWIN*) command -v cygpath >/dev/null 2>&1 && { cygpath -m "$1"; return; } ;;
+  esac
+  printf '%s\n' "$1"
+}
+
+py_forward() { # <exec|call> <subcommand> <args...>
+  local how="$1" py pair name state rc fn bridged=""
+  local -a env_args=()
+  shift
+  py="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)/scripts/py"
+  [ -x "$py" ] || die "$1 is served by Python since ludics-lite#403, and its runner $py is missing" \
+    "or not executable: this copy of pr-review.sh is not inside a ludics-lite checkout. Run the" \
+    "checkout's ship-pr/scripts/pr-review.sh. Nothing was read or written."
+  for pair in "${PY_FORWARD_VARS[@]}"; do
+    name=${pair%%=*}
+    env_args+=("${pair#*=}=${!name-}")
+  done
+  for fn in "${PY_BRIDGE_COMMANDS[@]}"; do
+    if declare -F "$fn" >/dev/null; then bridged="$bridged $fn"; fi
+  done
+  if [ -z "$bridged" ]; then
+    [ "$how" != exec ] || exec env "${env_args[@]}" "$py" -m ludics.prreview "$@"
+    env "${env_args[@]}" "$py" -m ludics.prreview "$@"
+    rc=$?
+  else
+    # Keyed by the owning pid like every temporary path here (see tmp_sweep_stale), and gone before
+    # this returns.
+    state=$(mktemp "${TMPDIR:-/tmp}/pr-review-bridge.$$.XXXXXX") ||
+      die "could not create the shell bridge's file under ${TMPDIR:-/tmp}; nothing was run"
+    py_bridge_state >"$state"
+    env "${env_args[@]}" LUDICS_BRIDGE_FUNCS="${bridged# }" \
+      LUDICS_BRIDGE_STATE="$(py_native_path "$state")" \
+      LUDICS_BRIDGE_SHELL="$(py_native_path "$BASH")" "$py" -m ludics.prreview "$@"
+    rc=$?
+    rm -f "$state"
+  fi
+  [ "$rc" -eq 0 ] || exit "$rc"
+  return 0
+}
+
 # --repo mirrors gh's own flag, so reaching for it out of gh habit works instead of hitting usage.
 main() {
   GH_REFUSAL_PID=$$
@@ -8477,6 +8540,8 @@ main() {
   --repo) REPO="${2:?--repo owner/name}" && shift 2 ;;
   --repo=*) REPO="${1#--repo=}" && shift ;;
   esac
+  # A subcommand ported to Python is exec'd there; see "the Python half" above.
+  if py_ported "${1:-}"; then py_forward exec "$@"; fi
 
   case "${1:-}" in
   poll) shift && cmd_poll "$@" ;;
