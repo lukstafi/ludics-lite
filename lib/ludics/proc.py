@@ -67,8 +67,10 @@ def run_tool(
     *,
     env: Mapping[str, str] | None = None,
     cwd: str | None = None,
+    stdin: int | None = None,
 ) -> Completed:
-    """Run the tool ``name`` with ``args``, capturing both streams; stdin is inherited.
+    """Run the tool ``name`` with ``args``, capturing both streams; stdin is inherited unless
+    ``stdin`` names another (``subprocess.DEVNULL`` for the shell's ``</dev/null``).
 
     A tool that is not on PATH completes with 127 and the shell's message, as ``gh`` would have
     in the shell implementation, so callers classify it the same way.
@@ -80,7 +82,9 @@ def run_tool(
         if exe is None:
             return Completed(127, "", f"{name}: command not found\n")
         argv = [exe, *args]
-    proc = subprocess.run(argv, capture_output=True, env=environ, cwd=cwd, check=False)
+    proc = subprocess.run(
+        argv, stdin=stdin, capture_output=True, env=environ, cwd=cwd, check=False
+    )
     return Completed(proc.returncode, decode(proc.stdout), decode(proc.stderr))
 
 

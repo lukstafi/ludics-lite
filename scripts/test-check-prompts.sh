@@ -101,6 +101,12 @@ R="$TMP/tree"
 fresh "$R"
 expect "a well-formed tree passes" 0 '6 passed, 0 failed' -- "$CP" "$R"
 expect "a missing root is refused, not passed" 2 'no such directory' -- "$CP" "$TMP/nowhere"
+# A root carrying no prompt at all is a verdict, not a pass over nothing.
+mkdir -p "$TMP/empty"
+expect "a root with no prompt at all is refused, not passed" 1 \
+  "FAIL: .: no */SKILL.md or routines/*/SKILL.md under $TMP/empty" -- "$CP" "$TMP/empty"
+expect "--help prints the usage and succeeds" 0 'usage: check-prompts.sh [root] | --one <dir>' -- "$CP" --help
+expect "an unknown option is a usage error" 2 'check-prompts: unknown option: --bogus' -- "$CP" --bogus
 
 # Single-directory mode shares the grammar but has no repository layout requirements.
 fresh "$R"
@@ -125,6 +131,11 @@ expect "no opening fence" 1 'alpha/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
 
 fresh "$R"; printf -- '---\nname: beta\ndescription: unclosed\n\n# beta\n' > "$R/beta/SKILL.md"
 expect "no closing fence" 1 'beta/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
+# The opening fence is the line `---` exactly: a CRLF line end or a trailing blank is not it.
+fresh "$R"; printf -- '---\r\nname: alpha\r\ndescription: CRLF throughout\r\n---\r\n' > "$R/alpha/SKILL.md"
+expect "a CRLF opening fence is no fence" 1 'alpha/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
+fresh "$R"; printf -- '--- \nname: alpha\ndescription: a blank after the fence\n---\n' > "$R/alpha/SKILL.md"
+expect "...nor is one with a trailing blank" 1 'alpha/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
 
 fresh "$R"; skill "$R" alpha 'description: nameless'
 expect "missing name" 1 "alpha/SKILL.md: frontmatter has no 'name:' line" -- "$CP" "$R"
@@ -469,6 +480,16 @@ fixture_tree
 rm "$R/alpha/scripts/test-python.py"
 # The lookup is one-way, as the prompt register is: stale commands require no table model.
 expect "a removed fixture leaves no membership obligation" 0 '0 failed' -- "$CP" "$R"
+# A suite is a .sh, .py or .ps1 file: another `test-*` file is data, and owes no register line.
+fixture_tree
+touch "$R/alpha/scripts/test-data.json"
+expect "a test-* file that is not a suite carries no obligation" 0 'required CI platforms agree' -- "$CP" "$R"
+# The README's register is its `## Tests` section: the same command line under another heading
+# registers nothing.
+fixture_tree
+sed 's/^## Tests$/## Notes/' "$R/README.md" > "$R/register.tmp" && mv "$R/register.tmp" "$R/README.md"
+expect "a command line outside the README's Tests section is not in the register" 1 \
+  "fixture 'alpha/scripts/test-shell.sh' has no command line" -- "$CP" "$R"
 
 # --- the mac-studio correctness-slot count ----------------------------------------------------
 # The prompts quote a number that lives in one line of fleet-worker.sh (ludics-lite#160), so this
@@ -664,6 +685,11 @@ expect "a count about a box whose name starts with mac-studio is not this one's"
 slots_tree
 slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(twenty six on mac-studio/'
 expect "a numeral phrase is read whole, spaces and all" 1 "native-claude.md: spells the mac-studio slot count 'twenty six'" -- "$CP" "$R"
+# The box name's far boundary may be the end of the text itself: a phrase closing the file, with
+# no newline after it, is read like any other.
+slots_tree
+printf '\n%s on mac-studio' "$STALE" >> "$R/README.md"
+expect "a count phrase ending the file is still read" 1 "README.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
 
 # A file the scan skips before reading it is a file the scan cannot hold, so the one filter that
 # stands before `slot_mentions` is pinned here. A NUL anywhere makes grep call the file binary,
@@ -994,6 +1020,17 @@ the path assigned to a variable|DRIFT_COMMAND=\2
 some other file of the same name|/tmp/sync-routines.sh
 ...and one under a same-named directory elsewhere|/tmp/scripts/sync-routines.sh
 EOF
+
+# `$HOME` names the same path `~` does; and an indented command line is four blanks or more, so
+# one indented less is prose, not the command.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^\( *\)~/\([^ `]*sync-routines\.sh\)$|\1$HOME/\2|'
+expect "the invocation spelled through \$HOME is the same command" 0 \
+  'runs it to read its own drift' -- "$CP" "$R"
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^ *\([^ `]*sync-routines\.sh\)$|   \1|'
+expect "an invocation indented less than four blanks is not the command" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: $DRIFT_WANT" -- "$CP" "$R"
 
 # The path is the README's to state, and the checker reads it from there rather than restating
 # it: a root whose install line is gone cannot be judged, and says so instead of passing.
@@ -1889,6 +1926,26 @@ links_body alpha/SKILL.md 'Prose with \\[note](references/gone.md), where the ba
 expect "...while two backslashes escape each other and leave a real opener" 1 \
   'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
 
+# The `]` of a candidate is read with the same parity: an escaped one closes no label either.
+links_tree
+links_body alpha/SKILL.md 'Prose [with an escaped closer\](references/gone.md) renders as text.'
+expect "an escaped closing bracket closes no label" 0 '0 failed' -- "$CP" "$R"
+# A `+` is one of the path characters the shape admits, so such a target is read and checked.
+links_tree
+links_body alpha/SKILL.md 'See [a plus in the name](references/c++.md).'
+expect "a '+' is a path character, so its target is read" 1 \
+  'resolves to no file: alpha/references/c++.md' -- "$CP" "$R"
+# An ATX heading is one to six hashes followed by a blank or the line end: seven hashes, and a
+# hash run glued to its text, are paragraphs to GFM and contribute no anchor.
+links_tree
+printf '\n####### Seven hashes\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [seven](references/notes.md#seven-hashes).'
+expect "seven hashes open no heading" 1 "GitHub slug is 'seven-hashes'" -- "$CP" "$R"
+links_tree
+printf '\n#tagline\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a tag](references/notes.md#tagline).'
+expect "...nor does a hash run glued to its text" 1 "GitHub slug is 'tagline'" -- "$CP" "$R"
+
 # The raw-HTML forms beyond tags and comments render as markup and contribute no heading text, so
 # the source reading handed `## <?target?>` the anchor `target`, which GitHub does not create
 # (round 11, P2). A processing instruction, a declaration and a CDATA section, each spelled whole.
@@ -2012,6 +2069,131 @@ links_real
 mv "$R/issue-wave/$LINK_FILE" "$R/issue-wave/${LINK_FILE%.md}-renamed.md"
 expect "a renamed reference file is caught the same way" 1 \
   "issue-wave/SKILL.md: link to $LINK_FILE" -- "$CP" "$R"
+
+# --- the shell checker's byte and path readings ------------------------------------------------
+# The checker was a shell script until ludics-lite#403, run on macOS under the platform's own awk,
+# sed and find, and its verdicts are what the port keeps. Each probe below is a reading those
+# tools made that no other probe holds, found by the parity review of the port.
+
+# nul_edit <file> <text> prefix|suffix: puts a NUL before (prefix) or after (suffix) each line of a
+# scratch file that contains <text>, headings left alone. Says so when no line matched, since a
+# probe over an unmutated tree asserts nothing.
+nul_edit() {
+  local f="$R/$1" line hit=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      '#'*) printf '%s\n' "$line" ;;
+      *"$2"*)
+        hit=1
+        if [ "$3" = prefix ]; then printf 'x\000 %s\n' "$line"; else printf '%s\000junk\n' "$line"; fi ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$f" > "$R/nul.tmp"
+  [ "$hit" -eq 1 ] || { ko "nul_edit: no line of $1 contains '$2'"; return 1; }
+  mv "$R/nul.tmp" "$f"
+}
+
+# A NUL ends an awk record's text: the macOS awk reads a line as a C string, so whatever follows a
+# NUL on its line is not there to the index, register, slot, link and heading readers. A count
+# stated only after one is no statement...
+slots_tree
+nul_edit issue-wave/references/executions.md mac-studio prefix
+expect "a slot count stated only after a NUL is no statement" 1 \
+  "FAIL: issue-wave/references/executions.md: states no mac-studio slot count" -- "$CP" "$R"
+# ...a wrong one after a NUL is not held...
+slots_tree
+printf 'note \000 mac-studio=%s\n' "$OTHER" >> "$R/issue-wave/references/executions.md"
+expect "a wrong slot count after a NUL is not read" 0 'mac-studio correctness slots agree' -- "$CP" "$R"
+# ...a heading's text stops at one, and so does a line holding a link.
+links_tree
+printf '\n## Sec\000tail\n\nCut short.\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [it](references/notes.md#sec).'
+expect "a heading's slug stops at a NUL" 0 '(1 checked)' -- "$CP" "$R"
+links_tree
+printf 'x\000 [gone](missing.md)\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [it](references/notes.md).'
+expect "a link after a NUL is not read" 0 '(1 checked)' -- "$CP" "$R"
+fixture_tree
+nul_edit README.md alpha/scripts/test-shell.sh suffix
+expect "a register line reads up to a NUL" 0 'fixture command register and required CI platforms agree' \
+  -- "$CP" "$R"
+# A sed reading keeps the NUL, and the command substitution around it then drops it: the routine
+# names read off LOCAL_ROUTINES are the ones with the NUL taken out.
+drift_tree
+nul_edit scripts/sync-routines.sh 'LOCAL_ROUTINES="' prefix
+sed 's/^x\(.\) LOCAL_ROUTINES="/LOCAL_ROUTINES="\1/' "$R/scripts/sync-routines.sh" > "$R/nul.tmp" \
+  && mv "$R/nul.tmp" "$R/scripts/sync-routines.sh"
+expect "a NUL in LOCAL_ROUTINES is dropped from the names" 0 'runs it to read its own drift' -- "$CP" "$R"
+
+# A count is bash arithmetic's, which wraps at 64 bits: 2^64 + n is n, and 2^64 is zero.
+if [ "${WANT:-0}" -le 83 ]; then
+  WRAPPED=184467440737095516$(printf '%02d' $((16 + 10#0${WANT:-0})))
+  slots_tree
+  slots_edit "$WORKER" "s/mac-studio=$WANT/mac-studio=$WRAPPED/g"
+  expect "a default past 64 bits wraps as bash arithmetic does" 0 \
+    "count say $WANT" -- "$CP" "$R"
+  slots_tree
+  slots_edit "$WORKER" "s/mac-studio=$WANT/mac-studio=18446744073709551616/g"
+  expect "a default of 2^64 is zero" 1 \
+    "SLOTS assignment states mac-studio=0; the worker requires" -- "$CP" "$R"
+else
+  ko "the 64-bit probes spell 2^64 + WANT for a WANT below 84; read '$WANT'"
+fi
+
+# The slot scan walked the root with `find` and cut the root back off each path with an awk `-v`
+# assignment, which is escape-processed: a backslash in the root's path matched no file, so the
+# scan found no statement at all.
+slots_tree
+rm -rf "$TMP/b\\nroot"; cp -R "$R" "$TMP/b\\nroot"
+expect "a root whose path holds a backslash finds no slot statement" 1 \
+  "FAIL: issue-wave/references/executions.md: states no mac-studio slot count" -- "$CP" "$TMP/b\\nroot"
+rm -rf "$TMP/b\\nroot"
+# ...and `find` does not descend into a root that is itself a symbolic link.
+slots_tree
+rm -f "$TMP/linked-root"; ln -s "$R" "$TMP/linked-root"
+expect "a root that is a symbolic link finds no slot statement" 1 \
+  "FAIL: issue-wave/references/executions.md: states no mac-studio slot count" -- "$CP" "$TMP/linked-root"
+rm -f "$TMP/linked-root"
+# The default root is `$HERE/..` named logically, so this checkout reached through a link is one.
+rm -f "$TMP/checkout-link"; ln -s "$SRC" "$TMP/checkout-link"
+expect "this checkout through a symbolic link finds no slot statement" 1 \
+  "FAIL: issue-wave/references/executions.md: states no mac-studio slot count" \
+  -- "$TMP/checkout-link/scripts/check-prompts.sh"
+rm -f "$TMP/checkout-link"
+
+# The root is entered with `cd "$ROOT" && pwd`: the logical path when it is a directory, and the
+# physical one when it is not -- `lnk/../root` through a symbolic link lands where the kernel does.
+rm -rf "$TMP/dotdot"; mkdir -p "$TMP/dotdot/real/x"
+fresh "$TMP/dotdot/real/root"
+ln -s real/x "$TMP/dotdot/lnk"
+expect "a '..' through a symbolic link falls back to the physical directory" 0 '6 passed, 0 failed' \
+  -- bash -c 'cd "$1" && exec "$2" lnk/../root' _ "$TMP/dotdot" "$CP"
+expect "...and so does --one" 0 '1 passed, 0 failed' \
+  -- bash -c 'cd "$1" && exec "$2" --one ../root/alpha' _ "$TMP/dotdot/lnk" "$CP"
+rm -rf "$TMP/dotdot"
+
+# An index that is a regular file but cannot be read is there, and indexes nothing.
+fresh "$R"
+rm -rf "$R/routines/nightly" "$R/routines/weekly"
+chmod 000 "$R/routines/README.md"
+expect "an unreadable index with nothing to index is not missing" 0 \
+  'ok: routines/README.md: no routines/ SKILL.md directory to index' -- "$CP" "$R"
+chmod 644 "$R/routines/README.md"
+
+# The cleanup helper runs with no input, and its usage text is a command substitution's, which
+# drops a NUL.
+cleanup_tree
+{ head -n 1 "$R/$CLEANUP_HELPER"
+  printf '%s\n' 'if [ "$#" -eq 0 ] && read -r _; then echo "usage: stdin was read" >&2; exit 2; fi'
+  tail -n +2 "$R/$CLEANUP_HELPER"; } > "$R/cleanup.tmp" && mv "$R/cleanup.tmp" "$R/$CLEANUP_HELPER"
+expect "the cleanup helper is run with no input" 0 "$CLEANUP_AGREE" \
+  -- bash -c 'printf "x\n" | "$1" "$2"' _ "$CP" "$R"
+cleanup_tree
+{ head -n 1 "$R/$CLEANUP_HELPER"
+  printf '%s\n' "if [ \"\$#\" -eq 0 ]; then printf 'usage: x\\n  --base\\000x <b>\\n' >&2; exit 2; fi"
+  tail -n +2 "$R/$CLEANUP_HELPER"; } > "$R/cleanup.tmp" && mv "$R/cleanup.tmp" "$R/$CLEANUP_HELPER"
+expect "a NUL in the usage text is dropped, joining the name around it" 1 \
+  "names no '--basex'" -- "$CP" "$R"
 
 # --- this checkout ---------------------------------------------------------------------------
 expect "this checkout's prompts pass" 0 '0 failed' -- "$CP"
