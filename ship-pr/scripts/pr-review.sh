@@ -1030,16 +1030,10 @@ snapshot_has() { # <kind> <pr>
   [ "$(cat "$SNAP.$1.pr" 2>/dev/null)" = "$2" ]
 }
 
-# The feeds cmd_poll read this round. The marker last, so a write that fails partway leaves no
-# snapshot at all rather than one missing a feed.
-snapshot_put_feeds() { # <pr> <issue comments json> <reviews json>
-  [ "$SNAPSHOT_ARMED" = 1 ] || return 0
-  rm -f "$SNAP.feeds.pr"
-  printf '%s\n' "$2" >"$SNAP.feeds.comments" 2>/dev/null &&
-    printf '%s\n' "$3" >"$SNAP.feeds.reviews" 2>/dev/null &&
-    printf '%s\n' "$1" >"$SNAP.feeds.pr" 2>/dev/null
-  return 0
-}
+# The feeds poll read this round are written by the Python (`Snapshot.put_feeds` in
+# lib/ludics/prreview/reads.py, ludics-lite#403), in this format: the comments and the reviews as
+# JSON arrays, then the `.feeds.pr` marker LAST, so a write that fails partway leaves no snapshot
+# at all rather than one missing a feed.
 
 # The head read watch_round made AFTER those feeds, with the fields pr_head_read sets. head_err is
 # a whole error line and may contain anything, so each field gets its own file rather than sharing
@@ -1109,350 +1103,24 @@ review_comments() { # <pr> <review id>
   printf '%s\n' "$out"
 }
 
-# The commit each kind of item is ABOUT, as one jq prelude shared by the rendering and the index
-# below, so the two can never disagree about an item. Spliced into a jq program, which is why it
-# carries no apostrophe.
-#
-# An inline comment is bound by `original_commit_id`, NOT `commit_id`: GitHub migrates the latter
-# forward as the head advances for a comment whose lines still exist, so a previous round finding
-# would stamp itself with the CURRENT head and pass any head test put to it. original_commit_id is
-# the commit the reviewer wrote it against, and it does not move. Nothing is lost if that ever
-# proves too strict: every inline finding belongs to a review, poll re-reads each NEW review own
-# comments endpoint (above), and the review row carries the head it was submitted against — so a
-# round of the head is caught by its review even if none of its comments were.
-#
-# A comment has no such field; its only head association is the "**Reviewed commit:** `<sha>`"
-# stamp the connector writes on the comments it delivers a round or a verdict in. The LAST match
-# is the one taken: the connector writes that stamp as a FOOTER, and a findings body can quote
-# another commit above it — a review OF this parsing logic does exactly that — where taking the
-# first would stamp the round with a commit it merely mentions and discard it as an old head.
-# `[capture(...; "g")] | last` and never `capture(...) // ""`, because a capture that does not
-# match produces NO output rather than null, and a zero-output sub-expression inside a string
-# interpolation takes the whole string with it: the comment would not be rendered at all, which
-# on the initialization failure (the one summary that never carries the stamp) is a round
-# silently disappearing from the watch that was waiting for it.
-#
-# `fold_inline` is the last of these: the reviewer posts one finding as several inline threads
-# often enough to matter (round 11 of ludics-lite#66 posted nine threads for four findings,
-# ludics-lite#76), and each duplicate then costs its own composed reply and its own resolve. The
-# fold groups such threads into one entry whose `thread_ids` lists every one of them, anchor first,
-# and the rendering and the index both address it by that list (`id=900+901`) — the token `reply`
-# and `resolve` take, so what poll printed is what the caller pastes back.
-#
-# What folds is a PLACE, not a text. Two threads fold when they are the same anchor — same path,
-# same commit, same author, and identical in every location field the row carries — and the BODY
-# is deliberately not part of that, which is the whole difference between a fold that fires and
-# one that never does. Measured against the round the issue was filed on (#66 head 252e336):
-# grouping by body finds ZERO groups among that PR's 51 findings, while grouping by the anchor
-# finds exactly four, covering nine threads — the issue's own arithmetic — and not one of them
-# mixes unrelated findings. The reviewer duplicates a finding by RE-WRITING it (the three threads
-# at :447 carry bodies of 546, 575 and 570 characters saying the same thing), so a key that
-# demanded equal text would have been a feature that could not fire.
-#
-# Nothing is lost by that, because the entry prints every DISTINCT body, each under the id of the
-# thread carrying it (`body_block`), and only an exact repeat is printed once. So the caller sees
-# every word the reviewer wrote, under one id token, and answers once.
-#
-# The key is a DENY-LIST — the whole row minus the eleven fields that must differ between two
-# posts of one finding (the ids, the urls, the timestamps, the reactions, the links, the review
-# id) and the body. Every other field is identifying by default, present or future, so a field
-# GitHub adds later can only make the fold fire LESS, never more: unfolded is loud (one extra
-# reply) and over-folded is silent (a finding answered by a reply it never got, its id already
-# behind the watermark). That is also why the location fields are not enumerated: `line`,
-# `original_line`, `side`, `start_line`, `start_side`, `original_start_line`, `position`,
-# `original_position` and `subject_type` are all in the key without being named, and so is the
-# next one. Two of these were found the expensive way, one per round: the per-review comments
-# endpoint (the one poll re-reads when the flat feed lags a new review) serves rows with NO `line`
-# and no `original_line` at all, carrying `position`/`original_position` instead — every such row
-# renders `:@<position>`, so an enumerating key collapsed two findings in one file (#86 round 1)
-# — and `side`/`start_line` do the same for a LEFT-vs-RIGHT or multi-line anchor (#86 round 2).
-# The RENDERING names them even so (`item_side`, `item_was` below, #113): the key and the header
-# have different jobs, and a key that must separate on a field nobody has heard of leaves the
-# header owing the reader every separation it CAN explain.
-#
-# `pull_request_review_id` is in the deny-list for a measured reason, not a tidy one: the reviewer
-# posts a separate COMMENTED review per inline comment (46 comments over 36 reviews on #39), so
-# keeping it would have kept every real duplicate apart.
-#
-# The commit stamp is in the key for a second reason: it is what `watch` classifies an item by, and
-# folding across two stamps would force one head verdict onto two different associations.
-# Grouping is by the key's `tojson` — a STRING — because jq's `index` on an array argument searches
-# for a sub-SEQUENCE rather than an element, so a key kept as an array would match its neighbours
-# prefixes. Order is the feed's: `group_by` sorts by key, and `pos` (each group's first member's
-# index) puts the entries back in the order they arrived, so folding does not reshuffle a round.
-POLL_ITEM_DEFS='
-  def short: if (. // "") == "" then "-" else .[0:7] end;
-  def item_stamp($re): ([(.body // "") | capture($re; "g").s] | last) | short;
-  def inline_commit: (.original_commit_id // .commit_id) | short;
-  def review_commit: .commit_id | short;
-  def item_path: .path // "?";
-  # The line half of an anchor: the range when the row carries a start, the line alone otherwise.
-  # A start equal to the end still renders as a range — GitHub refuses `start_line == line`, so
-  # the shape does not arise from the API, and collapsing it to a bare line would print a row the
-  # key separates on identically to one with no start at all.
-  def anchor($s; $l): if $s != null then "\($s)-\($l)" else "\($l)" end;
-  # A row from the per-review comments endpoint (what poll reads while the flat feed lags a new
-  # review) carries no `line` and no `original_line` at all, only `position`/`original_position`.
-  # Rendering that as `0` printed an unknown location in the shape of a known one, and two rows
-  # at different places in one file read as the same place — which is what hid the collapse in
-  # round 1 of #86 from the eye. An unknown line says so (`?`), and a position says which field it is
-  # (`@12`), so nothing downstream reads a location that was never served as a line number.
-  def item_line: (.line // .original_line) as $l
-    | if $l != null then anchor((.start_line // .original_start_line); $l)
-      else ((.position // .original_position) as $p
-            | if $p != null then "@\($p)" else "?" end)
-      end;
-  # The rest of the anchor, in the `k=v` grammar the rest of the header already speaks
-  # (ludics-lite#113). The key above separates on `side`, `start_line`, `start_side` and
-  # `original_start_line` — #86 round 2 put them there because a LEFT-vs-RIGHT or multi-line
-  # anchor was folding two distinct findings into one — while the header named none of them, so a
-  # deletion commented on the left and an addition on the right at line 40 of one file printed two
-  # rows byte-identical apart from the id and correctly did not fold. That reads as the reviewer
-  # posting one finding twice and the fold failing to catch it, which is the mirror of the `:0`
-  # defect of #105 and costs the reader the same round: either the anchors are re-derived from the
-  # API by hand, or the fold stops being trusted, which is what the fold note exists to prevent.
-  #
-  # Only what is NOT the default prints. RIGHT is the side of every row that is not about a
-  # deleted line, and a `side=RIGHT` on every entry would be noise bought at the price of the one
-  # row where the side matters; `start_side` prints when it differs from the side of the end,
-  # the only case where naming one side reads a range wrong. A header cannot be a
-  # total discriminator for a deny-list key — the next field GitHub invents is in the key and not
-  # on this line, which is the direction the key is deliberately wrong in — so what this owes the
-  # reader is every anchor field the row actually carries, not a proof of distinctness.
-  def item_side:
-    (if (.side // "") == "LEFT" then " side=LEFT" else "" end)
-    + (if .start_side != null and .start_side != (.side // "RIGHT") then " start_side=\(.start_side)"
-       else "" end);
-  # Where the finding was WRITTEN, when that is not where it sits now. GitHub migrates `line` and
-  # `start_line` forward as the branch advances while the `original_*` pair stays put, and both
-  # pairs are in the key, so two findings written at different places can sit at one place today
-  # and print one header between them. The same rule as the side fields: it prints only when the
-  # row carries an original that differs from what was rendered.
-  #
-  # In whichever unit the row is anchored by. A row from the per-review endpoint has no line at
-  # all and migrates in `position`/`original_position` instead, both of them in the key, so it
-  # has the same defect one field over and gets the same token (review of #272, round 1). The two
-  # units are never mixed on one line: a position is a second name for a place a row with lines
-  # has already named, and the API computes it from the same diff, so a pair of rows agreeing on
-  # both line fields cannot disagree on it.
-  def item_was: (.line // .original_line) as $l
-    | if $l != null then
-        (.start_line // .original_start_line) as $s
-        | if (.original_line != null and .original_line != $l)
-            or (.original_start_line != null and .original_start_line != $s) then
-            " was=\(anchor(.original_start_line; (.original_line // $l)))"
-          else "" end
-      else
-        (.position // .original_position) as $p
-        | if $p != null and .original_position != null and .original_position != $p then
-            " was=@\(.original_position)"
-          else "" end
-      end;
-  def fold_key: del(.id, .node_id, .url, .html_url, .pull_request_url, .pull_request_review_id,
-                    .created_at, .updated_at, .reactions, ._links, .body);
-  def fold_inline:
-    [to_entries[] | {i: .key, k: (.value | fold_key | tojson), v: .value}]
-    | group_by(.k)
-    | map(sort_by(.i)
-          | {pos: .[0].i, ids: [.[].v.id], v: .[0].v,
-             bodies: (reduce .[] as $x ([];
-                        if (map(.body) | index($x.v.body // "")) then .
-                        else . + [{id: $x.v.id, body: ($x.v.body // "")}] end))})
-    | sort_by(.pos)
-    | map(.v + {thread_ids: .ids, thread_bodies: .bodies});
-  def thread_ids: .thread_ids // [.id];
-  def thread_list: thread_ids | map(tostring) | join("+");
-  def thread_bodies_of: .thread_bodies // [{id: .id, body: (.body // "")}];
-  def body_block: thread_bodies_of as $b
-    | if ($b | length) <= 1 then ($b[0].body)
-      else ([$b[] | "[thread \(.id)]\n\(.body)"] | join("\n")) end;
-  def dupe_note: (thread_ids | length) as $n | (thread_bodies_of | length) as $k
-    | if $n <= 1 then ""
-      elif $k <= 1 then " (\($n) identical threads, one reply answers all)"
-      else " (\($n) threads at one location, \($k) findings as written; one reply answers all)"
-      end;
-  # The connector ends every review body it writes with a fixed "About Codex in GitHub" block
-  # (ludics-lite#358): some fifteen lines of trigger instructions, 18 of the 44 lines one round of
-  # #354 printed. It sits at the TAIL, the part of a long round the Bash display keeps, so it
-  # pushes the findings above it toward the part the display cuts. The rendering folds it into one
-  # line. The boundary is a fail-closed ALLOWLIST of one exact shape, and anything outside it
-  # renders as-is:
-  #   - the opener is the literal bytes `<details> <summary>` U+2139 U+FE0F ` About Codex in
-  #     GitHub</summary>` (the text the connector writes, as served in the reviews of #354), so
-  #     another summary, a missing variation selector or a different spacing is not the block;
-  #   - the block is the text after the LAST such opener, and it must hold exactly one
-  #     `</details>` with nothing but whitespace after it: the block ends the body. An unterminated
-  #     block, a block followed by more text, or a second `</details>` renders as-is, and an
-  #     earlier opener (a finding QUOTING the line) can never swallow the findings after it;
-  #   - the interior is not read, since its wording differs between the variants the connector
-  #     writes.
-  # It is applied to the summary and review bodies only, where the connector writes the block;
-  # an inline finding is never folded. It is RENDERING only: the stamp `item_stamp` reads, the
-  # `items:` line and the watermark all read the raw body or the ids, never this output.
-  def fold_codex_about:
-    "<details> <summary>ℹ️ About Codex in GitHub</summary>" as $open
-    | (. // "") as $body
-    | ($body | split($open)) as $p
-    | if ($p | length) < 2 then $body
-      else ($p[-1] | split("</details>")) as $q
-        | if ($q | length) == 2 and ($q[1] | test("[^[:space:]]") | not) then
-            ($p[:-1] | join($open)) + "[Codex \"About Codex in GitHub\" boilerplate folded]"
-          else $body end
-      end;
-'
-
-# Exits 3, and prints no watermark, when any feed failed to read: an unwritten watermark keeps the
-# caller's old one, so a transient error cannot advance past findings it never saw.
+# --- poll ---------------------------------------------------------------------------------------
+# Served by Python since ludics-lite#403: lib/ludics/prreview/poll.py, whose module keeps the
+# comments that stood here (the commit each item is about, the fold of threads at one anchor, the
+# About-Codex fold, the items line, the per-feed watermark). A watch round still runs it here, in a
+# command substitution: when the round has armed its snapshot, the snapshot's path goes with the
+# call, and the Python writes this round's feeds and review cache into it in the format
+# state_comments, state_reviews and review_comments read (see "the round snapshot" above). Its
+# last gh error comes back the same way, through GH_ERR_FILE, which watch quotes through
+# $(gh_err_line) when a poll did not answer.
 cmd_poll() {
-  local pr="${1:?usage: poll <pr> [watermark]}" mark="${2:-}"
-  pr_arg "$pr"
-  pr="$PR_NUM"
-  local m_inline m_issue m_review
-  m_inline=$(mark_of "$mark" 1)
-  m_issue=$(mark_of "$mark" 2)
-  m_review=$(mark_of "$mark" 3)
-
-  local inline issue reviews bad=""
-  inline=$(api_list "pulls/$pr/comments?per_page=100") || bad="$bad inline"
-  issue=$(api_list "issues/$pr/comments?per_page=100") || bad="$bad summary"
-  reviews=$(api_list "pulls/$pr/reviews?per_page=100") || bad="$bad reviews"
-  if [ -n "$bad" ]; then
-    warn "API error reading PR $pr feed(s):$bad after $API_ATTEMPTS attempts each" \
-      "($(gh_err_line)) — this round is UNKNOWN, not quiet"
-    return 3
+  local err_file
+  err_file=$(py_native_path "$GH_ERR_FILE")
+  if [ "$SNAPSHOT_ARMED" = 1 ] && [ -n "$SNAP" ]; then
+    LUDICS_PR_REVIEW_GH_ERR_FILE="$err_file" \
+      LUDICS_PR_REVIEW_ROUND_SNAPSHOT="$(py_native_path "$SNAP")" py_forward call poll "$@"
+  else
+    LUDICS_PR_REVIEW_GH_ERR_FILE="$err_file" py_forward call poll "$@"
   fi
-  # The one read of these feeds the round makes. status_state takes its comments and reviews from
-  # here instead of reading them again a second later (see "the round snapshot"), so the state a
-  # round is reported beside is computed from the very bytes the round was classified from. The
-  # UNFILTERED feeds: poll's question is "what is new since the watermark" and the state's is "what
-  # has the reviewer ever said", and the second cannot be answered from the first's leftovers.
-  # Nothing is published unless all three answered — the return above is what a failed read owes
-  # the caller, and a snapshot of two feeds would hand the state an empty third.
-  snapshot_put_feeds "$pr" "$issue" "$reviews"
-
-  # A new review's inline comments can lag the flat listing read above (see the header), so every
-  # review this round is about to report gets its own comments endpoint read too, merged by
-  # comment id — the flat feed's copy wins when both exist, since only it carries current line
-  # numbers. A failed per-review read fails the ROUND (unknown, watermark unwritten): the
-  # alternative is printing the review while silently dropping its findings.
-  # The list of reviews to re-read is itself a read that can fail. Unguarded it failed EMPTY —
-  # indistinguishable from "no new reviews this round" — and the round would then render every
-  # review without its own comments and still advance the watermark past them (#89).
-  local rid extra='[]' more new_review_ids
-  new_review_ids=$(jq -r --arg rev "$REVIEWER" --argjson since "$m_review" '
-    map(select((.user.login // "") | startswith($rev)) | select(.id > $since))
-    | .[].id' <<<"$reviews" 2>/dev/null) || {
-    warn "could not read which reviews on PR $pr are new — this round is UNKNOWN, not quiet"
-    return 3
-  }
-  # shellcheck disable=SC2086 # one id per word, and the point is to split them
-  for rid in $new_review_ids; do
-    more=$(review_comments "$pr" "$rid") || {
-      warn "API error reading review $rid's comments on PR $pr after $API_ATTEMPTS attempts" \
-        "($(gh_err_line)) — this round is UNKNOWN, not quiet"
-      return 3
-    }
-    extra=$(printf '%s\n%s\n' "$extra" "$more" | jq -s '.[0] + .[1]') || return 4
-  done
-  inline=$(printf '%s\n%s\n' "$inline" "$extra" | jq -s '
-    (.[0] | map(.id)) as $have
-    | .[0] + (.[1] | map(select(.id as $i | ($have | index($i)) | not)))') || return 4
-
-  # Every rendered item carries the commit it is ABOUT, short, as `commit=<sha7>` — the field
-  # `watch` reads to tell the round it is waiting for from an older one scrolling past
-  # (ludics-lite#72). `-` where the feed carries no association at all, and nothing downstream
-  # may read that as "another commit": a missing stamp is not evidence.
-  #
-  # For an inline comment that is `original_commit_id`, NOT `commit_id`: GitHub migrates
-  # `commit_id` forward as the head advances for a comment whose lines still exist, so a previous
-  # round's finding would stamp itself with the CURRENT head and pass any head test put to it.
-  # `original_commit_id` is the commit the comment was written against — the reviewer's own view
-  # of the code — and it does not move. Nothing is lost if that ever proves too strict: every
-  # inline finding belongs to a review, poll re-reads each NEW review's own comments endpoint
-  # (see above), and the review row itself carries the head it was submitted against — so a round
-  # of the head is caught by its review even if none of its comments were.
-  # Each feed's new items are filtered ONCE, into an array that is then both rendered and indexed
-  # (the `items:` line below), so the index cannot drift from what was printed — and so the fold
-  # of duplicate threads (`fold_inline`, ludics-lite#76) has ONE place to sit: it happens here,
-  # once, and the rendering and the index below read its output. A folded entry is still one
-  # finding for `watch` (it counts entries, not threads) and the watermark is untouched — that is
-  # computed from the UNFILTERED feed below, so every duplicate's id is still advanced past.
-  # `rounds` reads its own feeds and never these, so the round count is untouched too.
-  local new_inline new_issue new_reviews
-  new_inline=$(jq --arg rev "$REVIEWER" --argjson since "$m_inline" "$POLL_ITEM_DEFS"'
-    map(select((.user.login // "") | startswith($rev)) | select(.id > $since)) | fold_inline' \
-    <<<"$inline") || return 4
-  new_issue=$(jq --arg rev "$REVIEWER" --argjson since "$m_issue" \
-    'map(select((.user.login // "") | startswith($rev)) | select(.id > $since)
-         | select((.body // "") | test("codex-pull-request-review-summary") | not))' <<<"$issue") ||
-    return 4
-  new_reviews=$(jq --arg rev "$REVIEWER" --argjson since "$m_review" \
-    'map(select((.user.login // "") | startswith($rev)) | select(.id > $since))' <<<"$reviews") ||
-    return 4
-
-  jq -r "$POLL_ITEM_DEFS"'
-    if length == 0 then "(no new inline comments)"
-    else .[] | "--- inline id=\(thread_list) \(item_path):\(item_line)\(item_side)\(item_was) commit=\(inline_commit) by \(.user.login)\(dupe_note)\n\(body_block)"
-    end' <<<"$new_inline" || return 4
-
-  # The connector's "Review Summary" placeholder is machine-tagged with an HTML comment and posted
-  # the moment a round STARTS ("🔄 Running"); it carries no findings, but its id is above the
-  # watermark, so rendering it made `watch` return 0 with nothing to act on — one wasted wake and
-  # re-arm per PR (observed landing self-improve#10, 2026-08-29, and again on #13 the day the fix
-  # landed). It is dropped from the RENDERING only: the watermark below reads the unfiltered feed,
-  # so its id is advanced past and never replayed. Nothing is lost by hiding it — the comment is
-  # thereafter EDITED in place (same id, invisible to a watermark feed by construction), findings
-  # arrive as reviews and inline comments, and a no-findings verdict arrives as the 👍 or as its
-  # own "Didn't find any major issues" comment, both of which status_state reads live.
-  #
-  # A comment's only head association is the stamp POLL_ITEM_DEFS describes; one carrying none
-  # renders `commit=-`, and nothing downstream may read that as "another commit".
-  jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
-    .[] | "--- summary id=\(.id) commit=\(item_stamp($rc)) by \(.user.login)\n\(.body | fold_codex_about)"' <<<"$new_issue" ||
-    return 4
-
-  jq -r "$POLL_ITEM_DEFS"'
-    .[] | "--- review id=\(.id) state=\(.state) commit=\(review_commit) by \(.user.login)\n\(.body | fold_codex_about)"' <<<"$new_reviews" ||
-    return 4
-
-  # The items above, as one machine-readable line, for a caller that has to decide something about
-  # them — `watch` asks which of them are about the head it is watching. Fields per item:
-  # kind:id:commit:author:state (`-` where there is none), and none of the five can contain a
-  # space or a colon, so the line is safe to split. The id field of a FOLDED inline entry is the
-  # `+`-joined list of its thread ids, anchor first (`inline:900+901:…`) — the same token the
-  # rendering shows and `reply`/`resolve` take; a consumer wanting the anchor alone takes the part
-  # before the first `+`. It stays one field precisely so that this line's arity never depends on
-  # whether the reviewer duplicated a thread. The rendered headers are NOT that line: a
-  # BODY may contain a line that looks exactly like one — a review of this script quoting poll
-  # output does, and this very PR drew one — and a watch that classified by scanning the rendering
-  # would take a quoted header for an item and end the wait on the round it was there to skip.
-  # Read it as the watermark is read, the LAST match: it is emitted after every body, so a body
-  # that quotes one of these lines cannot displace it.
-  #
-  # Each field is built into a variable before the line is echoed, rather than inside the `echo`'s
-  # command substitutions: a jq that failed there contributed an empty field and the line still
-  # printed, so a broken program read downstream as "this round had no items of that kind" — the
-  # same silent defect the state line's arms exist to prevent (#89). A failed render exits 4 with
-  # the watermark unwritten, so the round is retried rather than advanced past.
-  local items_inline items_issue items_review
-  items_inline=$(jq -r "$POLL_ITEM_DEFS"'[.[] | "inline:\(thread_list):\(inline_commit):\(.user.login):-"] | join(" ")' \
-    <<<"$new_inline") || return 4
-  items_issue=$(jq -r --arg rc "$REVIEWED_COMMIT_RE" "$POLL_ITEM_DEFS"'
-      [.[] | "summary:\(.id):\(item_stamp($rc)):\(.user.login):-"] | join(" ")' <<<"$new_issue") || return 4
-  items_review=$(jq -r "$POLL_ITEM_DEFS"'
-      [.[] | "review:\(.id):\(review_commit):\(.user.login):\(.state // "-")"] | join(" ")' \
-    <<<"$new_reviews") || return 4
-  echo "items: $items_inline $items_issue $items_review"
-
-  # Pass this back verbatim next time: per-feed maxima, so replies you post in this round cannot
-  # read back as new findings and a big review id cannot mask a smaller comment id. Same rule as
-  # the items line: an empty field here would be read back as the watermark 0 and replay the
-  # whole feed, so each maximum is taken before the line exists.
-  local mark_inline mark_issue mark_review
-  mark_inline=$(jq -s --argjson m "$m_inline" '[.[][].id // 0, $m] | max' <<<"$inline") || return 4
-  mark_issue=$(jq -s --argjson m "$m_issue" '[.[][].id // 0, $m] | max' <<<"$issue") || return 4
-  mark_review=$(jq -s --argjson m "$m_review" '[.[][].id // 0, $m] | max' <<<"$reviews") || return 4
-  echo "watermark: $mark_inline,$mark_issue,$mark_review"
 }
 
 # --- reviewer state ---------------------------------------------------------------------------
@@ -2707,15 +2375,9 @@ count_token() { # <review_rounds result>
   esac
 }
 
-cmd_rounds() {
-  local r rc
-  pr_arg "${1:?usage: rounds <pr>}"
-  r=$(review_rounds "$PR_NUM")
-  rounds_line "$r"
-  rc=$?
-  echo "rounds: n=$(count_token "$r") threshold=$ROUND_THRESHOLD"
-  return "$rc"
-}
+# Served by Python since ludics-lite#403 (lib/ludics/prreview/rounds.py). review_rounds,
+# rounds_line and count_token above stay for `watch`, which is still shell.
+cmd_rounds() { py_forward call rounds "$@"; }
 
 # --- open review threads under an approval (ludics-lite#289) ----------------------------------
 # An approval is about the head it landed on; an open thread is a finding nobody has closed, and
@@ -2911,23 +2573,10 @@ merge_threads_gate() { # <pr>
     "${named#*|}. $(threads_advice)."
 }
 
-cmd_status() {
-  pr_arg "${1:?usage: status <pr>}"
-  local state
-  # An approval is reported only after the open-thread read (ludics-lite#289): `unresolved` exits
-  # 0 like every other state the reads answered — `merge` is the gate that refuses it.
-  state=$(gated_state "$PR_NUM")
-  status_line "$state"
-  # The round count rides along so the convergence policy is always in view; it never changes
-  # this command's exit code — the merge gate is the state, and an unread count is reported as
-  # such on its own line rather than turning an approval into an "unknown".
-  rounds_line "$(review_rounds "$PR_NUM")" || true
-  # Exit 3 on unknown so a caller gating a merge on `status` cannot read a failed read as a quiet
-  # "not approved yet" — the same collapse api_list refuses to make. 3 rather than 2, because a
-  # usage error (2) is the caller's to fix and this one is the API's to recover from.
-  [ "$(state_tok "$state")" = unknown ] && return 3
-  return 0
-}
+# Served by Python since ludics-lite#403 (lib/ludics/prreview/status.py and state.py).
+# status_state, status_line, gated_state and the thread reads above stay for `watch` and `merge`,
+# which are still shell.
+cmd_status() { py_forward call status "$@"; }
 
 # What `merge` reads last — how far behind its base the branch is, whether the base's advance
 # touched the PR's files, whether the PR conflicts — read at the moment a round lands instead,
@@ -2983,6 +2632,11 @@ watch_round() { # <pr> <watermark>
   snapshot_arm
   POLLED_OUT=$(cmd_poll "$1" "$2")
   POLLED_RC=$?
+  # poll is Python (ludics-lite#403), so a refusal of one of its own gh calls (#471) ends the
+  # Python, which printed the message, with 2 -- inside this substitution. The PR was validated
+  # before the first round, so 2 can mean nothing else here, and it ends the whole command as the
+  # shell's own refusal does.
+  [ "$POLLED_RC" -ne 2 ] || exit 2
   POLLED_MARK="$2"
   POLLED_HEAD=""
   POLLED_ON=""
@@ -7918,7 +7572,7 @@ cmd_base() {
 # Porting a subcommand: its module in lib/ludics/prreview/, its `case` in that package's
 # __main__.py, its name here, its cmd_<name> reduced to the stub, and every constant it reads in
 # PY_FORWARD_VARS. lib/ludics/README.md says the rest.
-PY_PORTED=" body reply resolve comment retry "
+PY_PORTED=" body reply resolve comment retry poll status rounds "
 # The source-time constants the Python side reads, as <shell variable>=<environment name>. The
 # VALUE handed over is the shell's own, not the caller's environment: a suite that `retune`s
 # API_ATTEMPTS, or main's --repo, has changed the variable and not the environment. Name a constant
@@ -7929,7 +7583,9 @@ PY_PORTED=" body reply resolve comment retry "
 PY_FORWARD_VARS=(REPO=REPO REVIEWER=REVIEWER ROUND_THRESHOLD=SHIP_PR_ROUND_THRESHOLD
   ROUND_GAP=SHIP_PR_ROUND_GAP API_ATTEMPTS=SHIP_PR_API_ATTEMPTS API_BACKOFF=SHIP_PR_API_BACKOFF
   CHECKS_INTERVAL=SHIP_PR_CHECKS_INTERVAL CHECKS_WAIT=SHIP_PR_CHECKS_WAIT
-  CHECKS_HEARTBEAT=SHIP_PR_CHECKS_HEARTBEAT THREADS_PAGE_CAP=LUDICS_THREADS_PAGE_CAP)
+  CHECKS_HEARTBEAT=SHIP_PR_CHECKS_HEARTBEAT THREADS_PAGE_CAP=LUDICS_THREADS_PAGE_CAP
+  GRACE=SHIP_PR_REVIEW_GRACE STALL=SHIP_PR_REVIEW_STALL
+  THREADS_PAGE_CAP=LUDICS_PR_REVIEW_THREADS_PAGE_CAP)
 # The commands the Python runs that a sourcing suite may have replaced with a shell FUNCTION (its
 # fixture `gh`). The Python cannot call a function of this shell, so when one of these is a function
 # here the forward hands its definitions over through the shell bridge (lib/ludics/proc.py): a file
@@ -7939,6 +7595,19 @@ PY_FORWARD_VARS=(REPO=REPO REVIEWER=REVIEWER ROUND_THRESHOLD=SHIP_PR_ROUND_THRES
 PY_BRIDGE_COMMANDS=(gh git)
 
 py_ported() { case "$PY_PORTED" in *" ${1:-} "*) return 0 ;; esac; return 1; }
+
+# The usage refusal of a ported reader with no PR, made HERE: bash's own `${1:?}` message names this
+# script, the line and the parameter ("<script>: line N: 1: usage: status <pr>"), which the Python
+# cannot spell. Exit 1, as before the port; any other argument goes to the Python.
+py_usage() { # <subcommand> <its args...>
+  local sub="${1:-}"
+  shift
+  case "$sub" in
+  poll) : "${1:?usage: poll <pr> [watermark]}" ;;
+  status) : "${1:?usage: status <pr>}" ;;
+  rounds) : "${1:?usage: rounds <pr>}" ;;
+  esac
+}
 
 # This shell's state for the bridge: every function, every variable bash lets a script assign
 # (its own read-only and dynamic ones are left out; a declaration the source refuses anyway is
@@ -8015,7 +7684,10 @@ main() {
   --repo=*) REPO="${1#--repo=}" && shift ;;
   esac
   # A subcommand ported to Python is exec'd there; see "the Python half" above.
-  if py_ported "${1:-}"; then py_forward exec "$@"; fi
+  if py_ported "${1:-}"; then
+    py_usage "$@"
+    py_forward exec "$@"
+  fi
 
   case "${1:-}" in
   poll) shift && cmd_poll "$@" ;;

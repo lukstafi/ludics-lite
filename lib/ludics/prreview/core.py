@@ -29,6 +29,7 @@ function through the shell bridge (see ``ludics.proc``).
 """
 
 import json
+import os
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -246,12 +247,21 @@ _Q_SPECIAL = frozenset(" \t\n'\"\\|&;()<>!{}*[]?^$`,")
 
 
 def shell_quote(word: str) -> str:
-    """An approximation of bash's ``printf '%q'``, used only to print a refused call so it can be
-    found in the source: ``''`` for empty, ``$'...'`` when a control or non-ASCII character is in
-    it (bash 3.2's form; bash 5 leaves printable UTF-8 alone), otherwise backslashes before the
-    characters bash quotes. Not a contract: no caller parses it back."""
+    """bash's ``printf '%q'``, for a refused call's message and the paths of the open threads the
+    `unresolved` state names (which the shell's merge gate names with printf %q too). ASCII is
+    quoted here: ``''`` for empty, ``$'...'`` when a control character is in it, otherwise
+    backslashes before the characters bash quotes. A word with non-ASCII in it is quoted by bash
+    itself: what printf %q makes of it depends on the locale and the platform's C library (under
+    a UTF-8 locale on macOS ``naïve`` stays as is and ``€`` turns the word into ``$'...'``), which
+    no table here would track. The bash is the one the forwarding shell ran (the bridge's), else
+    the one on PATH, as pr-review.sh's ``#!/usr/bin/env bash`` finds it; without one, the C
+    locale's form below."""
     if word == "":
         return "''"
+    if any(ord(c) >= 128 for c in word):
+        quoted = _bash_printf_q(word)
+        if quoted is not None:
+            return quoted
     if any(ord(c) < 32 or ord(c) >= 127 for c in word):
         out: list[str] = []
         named = {"\n": "\\n", "\t": "\\t", "\r": "\\r", "\a": "\\a", "\b": "\\b", "\f": "\\f",
@@ -266,6 +276,15 @@ def shell_quote(word: str) -> str:
         return "$'" + "".join(out) + "'"
     quoted = "".join("\\" + c if c in _Q_SPECIAL else c for c in word)
     return "\\" + quoted if quoted.startswith("#") else quoted
+
+
+def _bash_printf_q(word: str) -> str | None:
+    bash = os.environ.get(proc.BRIDGE_SHELL, "") or "bash"
+    try:
+        done = proc.run_tool(bash, ["-c", 'printf %q "$1"', "bash", word])
+    except (OSError, ValueError):  # ValueError: a NUL, which no argv (and no bash word) holds
+        return None
+    return done.stdout if done.rc == 0 and done.stdout else None
 
 
 # --- the gh call ----------------------------------------------------------------------------------
@@ -536,13 +555,52 @@ class ListUnparsed:
 type ListResult = ListOk | GhFailed | GhUnanswered | ListUnparsed
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+_HIGH_SURROGATE = re.compile("[\ud800-\udbff]")
+_REPLACEMENT_CHARACTER = chr(0xFFFD)
+# Where a stream can hold a surrogate after decoding: an escape of one, or one already in the text.
+_SURROGATE_SOURCE = re.compile(r"\\u[dD][89a-fA-F]|[\ud800-\udfff]")
+
+
+class _Unparsed(Exception):
+    pass
+
+
+def _jq_string(s: str) -> str:
+    """A decoded string as jq 1.8 reads the same literal. Python's decoder joins a ``\\uD8xx\\uDCxx``
+    escape pair as jq does, but keeps a lone surrogate as a code point, where jq refuses a high one
+    ("Invalid \\uXXXX\\uXXXX surrogate pair escape", the feed unparsed) and reads a low one as
+    U+FFFD. A high surrogate here can only be an escape: the stream was decoded with
+    surrogateescape, which yields low ones alone (U+DC80..U+DCFF, for bytes that are not UTF-8,
+    which jq also reads as U+FFFD)."""
+    if not _SURROGATE.search(s):
+        return s
+    if _HIGH_SURROGATE.search(s):
+        raise _Unparsed
+    return _SURROGATE.sub(_REPLACEMENT_CHARACTER, s)
+
+
+def _jq_doc(doc: Json) -> Json:
+    match doc:
+        case str():
+            return _jq_string(doc)
+        case list():
+            return [_jq_doc(item) for item in doc]
+        case dict():
+            return {_jq_string(k): _jq_doc(v) for k, v in doc.items()}
+        case _:
+            return doc
+
+
 def json_stream(text: str) -> list[Json] | None:
     """The documents of a concatenated JSON stream (what ``gh --paginate`` prints, one per page),
-    as ``jq -s`` reads them; None when any of it does not parse."""
+    as ``jq -s`` reads them; None when any of it does not parse, a lone high-surrogate escape
+    included (see _jq_string)."""
     decoder = json.JSONDecoder()
     docs: list[Json] = []
     pos = 0
     length = len(text)
+    surrogates = _SURROGATE_SOURCE.search(text) is not None
     while True:
         while pos < length and text[pos] in " \t\n\r":
             pos += 1
@@ -552,7 +610,10 @@ def json_stream(text: str) -> list[Json] | None:
             doc, pos = decoder.raw_decode(text, pos)
         except ValueError:
             return None
-        docs.append(doc)
+        try:
+            docs.append(_jq_doc(doc) if surrogates else doc)
+        except _Unparsed:
+            return None
 
 
 def api_list(session: GhSession, path: str, repo: str) -> ListResult:

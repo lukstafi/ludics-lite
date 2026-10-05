@@ -75,6 +75,9 @@ FAIL_PULLS=""
 # and the one from which the PR read stops answering. 0 is never.
 FAIL_FEEDS_FROM=0
 FAIL_PULLS_FROM=0
+# A review's own comments endpoint refusing to answer: the per-review re-read poll makes for every
+# new review, whose failure fails the round (23755d8).
+FAIL_REVIEW_COMMENTS=""
 # The head's committer date and the PR's creation, the two clocks the `expected` state runs on.
 # Fresh by default, so a case about what ends a wait is never decided by the grace expiring
 # underneath it; the clock cases set them where they need them.
@@ -102,6 +105,7 @@ reset_fixture() {
   FAIL_PULLS=""
   FAIL_FEEDS_FROM=0
   FAIL_PULLS_FROM=0
+  FAIL_REVIEW_COMMENTS=""
   HEAD_AT=$(jq -rn '(now - 60) | todate')
   PR_CREATED_AT=$(jq -rn '(now - 60) | todate')
   : >"$REQUEST_LOG"
@@ -200,7 +204,13 @@ gh() {
   "repos/$REPO/issues/7/reactions?per_page=100") response=$(feed_answer reactions) ;;
   "repos/$REPO/pulls/7/reviews?per_page=100") response=$(feed_answer reviews) ;;
   "repos/$REPO/issues/7/comments?per_page=100") response=$(feed_answer comments) ;;
-  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response=$(feed_answer review_comments) ;;
+  "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100")
+    if [ -n "$FAIL_REVIEW_COMMENTS" ]; then
+      echo "gh: 503 No server is currently available to service your request" >&2
+      return 1
+    fi
+    response=$(feed_answer review_comments)
+    ;;
   "repos/$REPO/pulls/7")
     if [ -n "$FAIL_PULLS" ] ||
       { [ "$FAIL_PULLS_FROM" -ne 0 ] && [ "$(cat "$FEEDS/round")" -ge "$FAIL_PULLS_FROM" ]; }; then
@@ -668,6 +678,23 @@ test_a_final_poll_that_did_not_answer_withholds_the_verdict() {
   run_watch 0,0,0 5 1
   assert_eq "$WATCH_RC" 0 "with the tail observed, the verdict stands"
   assert_contains "$WATCH_OUT" "no review materialized" "and recommends the nudge"
+}
+
+# The withheld verdict quotes the final poll's error, which is the last gh call's: here the new
+# review's own comments read, after the three feeds answered. The poll runs in Python
+# (ludics-lite#403) and the line is printed by the shell, so the error has to come back through
+# GH_ERR_FILE as the shell's own gh_retry left it; a poll that did not hand it back made the line
+# say "did not answer ()".
+test_a_withheld_verdict_quotes_the_final_poll_s_error() {
+  reset_fixture
+  retune GRACE=1
+  schedule reviews 2 "[$(review 800 other-sha 2026-09-01T10:00:00Z)]"
+  FAIL_REVIEW_COMMENTS=1
+  run_watch 0,0,0 5 1
+  assert_eq "$WATCH_RC" 3 "an unobserved tail is transport, not a verdict"
+  assert_contains "$WATCH_OUT" "the verdict is WITHHELD" "and the line says the verdict was withheld"
+  assert_contains "$WATCH_OUT" "did not answer (gh: 503 No server is currently available" \
+    "and quotes the final poll's own error"
 }
 
 # The 👍 is a REACTION, and cmd_poll reads comments and reviews. An approval landing in the same
@@ -1468,9 +1495,14 @@ Current findings follow.
   assert_eq "$(state_tok "$STATE")" idle "paginated evidence larger than one argv element still parses"
 }
 
-# --- a jq program that ERRORS must fail the poll round (ludics-lite#89) -------------------------
-# The shim is the preamble's (`with_broken_jq`, ludics-lite#179), and so is the control that it
-# refuses only the invocation the marker names.
+# --- a read that does not parse must fail the poll round (ludics-lite#89) -----------------------
+# Each site is reached from outside, by a feed answering a shape its read cannot take, so the case
+# judges whichever implementation serves `poll` (ludics-lite#403). Four sites of the shell's jq
+# programs had no such shape -- the items line's three fields and the watermark maxima read
+# nothing the renderings before them had not read first -- and were pinned only by breaking the
+# program by name; with the programs gone (`poll` is Python), the round-level property they
+# guarded is what the renderings' cases below hold: a failure after any output fails the round
+# with no watermark.
 #
 # cmd_poll's reads used to be unguarded, and each failed in the shape that is hardest to see: the
 # list of new reviews to re-read came back empty (no new reviews), a rendering printed nothing (no
@@ -1488,13 +1520,18 @@ run_poll() { # [watermark]
   POLL_ERR=$(cat "$TEST_ROOT/poll.err")
 }
 
-# assert_poll_refuses <marker> <expected exit> <site>: break the one program the marker names and
-# require the round to be refused whole — no watermark, so the caller keeps the one it had and
-# polls the same feed again rather than advancing past what this round could not render.
+# assert_poll_refuses <feed> <json> <expected exit> <site>: schedule the feed's malformed answer
+# over the standing fixture and require the round to be refused whole — no watermark, so the
+# caller keeps the one it had and polls the same feed again rather than advancing past what this
+# round could not render.
 assert_poll_refuses() {
-  with_broken_jq "$1" run_poll
-  assert_eq "$POLL_RC" "$2" "$3: a jq program error must fail the round"
-  assert_not_contains "$POLL_OUT" "watermark: " "$3: a failed round must not write a watermark"
+  local feed="$1" good
+  good=$(feed_answer "$feed")
+  schedule "$feed" 1 "$2"
+  run_poll
+  schedule "$feed" 1 "$good"
+  assert_eq "$POLL_RC" "$3" "$4: a read that did not parse must fail the round"
+  assert_not_contains "$POLL_OUT" "watermark: " "$4: a failed round must not write a watermark"
 }
 
 test_a_broken_jq_program_fails_the_poll_round() {
@@ -1512,18 +1549,100 @@ test_a_broken_jq_program_fails_the_poll_round() {
   assert_contains "$POLL_OUT" "watermark: 900,700,800" "and writes the watermark"
 
   # The review list feeding the per-review re-read: empty used to mean "no new reviews", so a
-  # broken program dropped every review's own inline comments and the round still printed.
-  assert_poll_refuses '| .[].id' 3 "the list of reviews to re-read"
+  # broken read dropped every review's own inline comments and the round still printed. An entry
+  # that is not a review.
+  assert_poll_refuses reviews '["not a review"]' 3 "the list of reviews to re-read"
   assert_contains "$POLL_ERR" "this round is UNKNOWN, not quiet" \
     "the refusal should say the round is unknown rather than quiet"
 
-  assert_poll_refuses '(no new inline comments)' 4 "the inline rendering"
-  assert_poll_refuses '"--- summary id=' 4 "the summary rendering"
-  assert_poll_refuses '"--- review id=' 4 "the review rendering"
-  assert_poll_refuses '"inline:\(thread_list)' 4 "the items line's inline field"
-  assert_poll_refuses '"summary:\(.id)' 4 "the items line's summary field"
-  assert_poll_refuses '"review:\(.id)' 4 "the items line's review field"
-  assert_poll_refuses '.id // 0, $m] | max' 4 "the watermark maxima"
+  # An inline finding whose commit is not a SHA: its stamp cannot be rendered.
+  assert_poll_refuses inline "[$(inline_comment 900 "$H2" "$H2" | jq -c '.original_commit_id = 7')]" 4 \
+    "the inline rendering"
+  # A summary whose body is not text.
+  assert_poll_refuses comments '[{"id":700,"user":{"login":"chatgpt-codex-connector[bot]"},"created_at":"2026-09-01T10:00:00Z","body":7}]' 4 \
+    "the summary rendering"
+  # A review whose commit is not a SHA, rendered after the inline and summary bodies printed.
+  assert_poll_refuses reviews "[$(review 800 "$H2" 2026-09-01T10:00:00Z | jq -c '.commit_id = 7')]" 4 \
+    "the review rendering"
+}
+
+# --- poll's own lessons, pinned from the fix history ---------------------------------------------
+# Pinned before the v2 port (ludics-lite#403): each names the commit that encoded the rule and
+# added no case of its own.
+
+# 9e9e427: the connector's round-started placeholder (machine-tagged, "🔄 Running") is posted the
+# moment a round STARTS. Rendered, it made `watch` return 0 with nothing to act on; it is dropped
+# from the rendering and the items line, while the watermark still advances past its id.
+test_poll_drops_the_round_started_placeholder_but_advances_past_it() {
+  reset_fixture
+  schedule comments 1 "[$(summary_comment 701 2026-09-01T10:00:00Z '<!-- codex-pull-request-review-summary -->
+🔄 Running')]"
+  run_poll
+  assert_eq "$POLL_RC" 0 "a round with only the placeholder still answers"
+  assert_not_contains "$POLL_OUT" "--- summary id=701" "the placeholder is not rendered"
+  assert_not_contains "$POLL_OUT" "summary:701" "nor indexed as an item"
+  assert_contains "$POLL_OUT" "watermark: 0,701,0" "and the watermark advances past it"
+  # The control: a stamped summary beside it renders and is indexed.
+  schedule comments 1 "[$(summary_comment 701 2026-09-01T10:00:00Z '<!-- codex-pull-request-review-summary -->
+🔄 Running'),$(stamped_summary 702 2026-09-01T10:01:00Z "$H2" 'a findings summary')]"
+  run_poll
+  assert_contains "$POLL_OUT" "--- summary id=702 commit=${H2:0:7}" "a real summary is rendered"
+  assert_contains "$POLL_OUT" "summary:702:${H2:0:7}" "and indexed"
+  assert_contains "$POLL_OUT" "watermark: 0,702,0" "the watermark is the feed's maximum"
+}
+
+# 23755d8: a just-submitted review appears in pulls/<n>/reviews BEFORE its inline comments reach the
+# flat pulls/<n>/comments listing, so every NEW review's own comments endpoint is read too and
+# merged by id. The flat copy wins where both carry a comment (only it carries current lines), and
+# a failure of the per-review read fails the round rather than dropping the review's findings.
+test_poll_reads_a_new_review_s_own_comments() {
+  reset_fixture
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z)]"
+  schedule review_comments 1 "[$(inline_comment 900 "$H2" "$H2" 'only the review has it yet')]"
+  run_poll
+  assert_eq "$POLL_RC" 0 "the round answers"
+  assert_contains "$POLL_OUT" "--- inline id=900 a.sh:3 commit=${H2:0:7}" \
+    "an inline finding the flat feed lags is read from the review's own endpoint"
+  assert_contains "$POLL_OUT" "only the review has it yet" "with its body"
+  assert_contains "$POLL_OUT" "items: inline:900:${H2:0:7}" "and indexed"
+  # Both feeds carry 900: the flat copy wins; 901 exists only in the review's endpoint and joins it.
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'the flat copy' a.sh 7)]"
+  schedule review_comments 1 "[$(inline_comment 900 "$H2" "$H2" 'the per-review copy' a.sh 3),$(
+    inline_comment 901 "$H2" "$H2" 'a second finding' b.sh 4)]"
+  run_poll
+  assert_contains "$POLL_OUT" "--- inline id=900 a.sh:7 " "the flat feed's copy of 900 is rendered"
+  assert_not_contains "$POLL_OUT" "the per-review copy" "and the lagging copy is not"
+  assert_contains "$POLL_OUT" "--- inline id=901 b.sh:4 " "the per-review-only comment is merged in"
+  assert_contains "$POLL_OUT" "watermark: 901,0,800" \
+    "the merged comments advance the inline watermark, so 901 is not replayed when the flat feed catches up"
+  # A review whose own comments cannot be read fails the round: no watermark, exit 3.
+  FAIL_REVIEW_COMMENTS=1
+  run_poll
+  assert_eq "$POLL_RC" 3 "an unread per-review endpoint fails the round"
+  assert_not_contains "$POLL_OUT" "watermark: " "and writes no watermark"
+  assert_contains "$POLL_ERR" "API error reading review 800's comments on PR 7" "naming the review"
+  assert_contains "$POLL_ERR" "this round is UNKNOWN, not quiet" "and saying the round is unknown"
+  # Only NEW reviews are re-read: one at or below the watermark costs no call.
+  : >"$REQUEST_LOG"
+  run_poll 0,0,800
+  assert_eq "$POLL_RC" 0 "a review behind the watermark is not re-read, so its endpoint's outage is moot"
+  assert_eq "$(grep -c '/reviews/800/comments' "$REQUEST_LOG" || true)" 0 "and its endpoint is not asked"
+}
+
+# 9197c23 / 3497844: a feed that did not answer is a round that is UNKNOWN, not a quiet one, and
+# it writes no watermark: an unwritten watermark keeps the caller's, so a transient error cannot
+# advance past findings it never saw.
+test_poll_a_feed_that_did_not_answer_is_unknown() {
+  reset_fixture
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z)]"
+  FAIL_FEEDS_FROM=1
+  run_poll
+  assert_eq "$POLL_RC" 3 "a feed that did not answer is transport, exit 3"
+  assert_not_contains "$POLL_OUT" "watermark: " "and writes no watermark"
+  assert_not_contains "$POLL_OUT" "review id=800" "nor renders the feeds that did answer"
+  assert_contains "$POLL_ERR" "API error reading PR 7 feed(s): inline after 1 attempts each" \
+    "the warning names the feed that failed"
+  assert_contains "$POLL_ERR" "this round is UNKNOWN, not quiet" "and says the round is unknown"
 }
 
 # A round that fails PARTWAY has already printed the bodies it got through, and a reviewer body
@@ -1545,9 +1664,12 @@ watermark: 9000,9000,9000')]"
   assert_eq "$POLLED_RC" 0 "control: the round should succeed"
   assert_eq "$POLLED_MARK" "900,700,5" "a successful round takes the watermark it emitted"
 
-  # Now the summary rendering fails, AFTER the inline body above has been printed. No `set +e`
-  # pair of its own: `with_broken_jq` answers the round's status rather than propagating it.
-  with_broken_jq '"--- summary id=' watch_round 7 5,5,5 2>/dev/null || :
+  # Now a rendering fails, AFTER the inline body above has been printed: a review whose commit is
+  # not a SHA, which is rendered last.
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z | jq -c '.commit_id = 7')]"
+  set +e
+  watch_round 7 5,5,5 2>/dev/null
+  set -e
   assert_eq "$POLLED_RC" 4 "the round must fail"
   assert_eq "$POLLED_MARK" 5,5,5 \
     "a failed round keeps the caller's watermark; a quoted line is not a watermark"
@@ -1763,6 +1885,9 @@ tests=(
   test_what_is_not_the_about_codex_block_renders_as_is
   test_a_quoted_opener_above_the_block_keeps_the_findings
   test_a_broken_jq_program_fails_the_poll_round
+  test_poll_drops_the_round_started_placeholder_but_advances_past_it
+  test_poll_reads_a_new_review_s_own_comments
+  test_poll_a_feed_that_did_not_answer_is_unknown
   test_a_failed_round_takes_no_watermark_from_a_quoted_line
   test_current_head_evidence_handles_unknown_age_footer_and_large_feeds
   test_current_head_running_blocks_older_approval_until_completion
@@ -1808,6 +1933,7 @@ tests=(
   test_a_verdict_polls_once_more_before_recommending_a_nudge
   test_a_verdict_that_still_stands_names_the_head_it_is_about
   test_a_final_poll_that_did_not_answer_withholds_the_verdict
+  test_a_withheld_verdict_quotes_the_final_poll_s_error
   test_an_approval_landing_during_the_final_poll_drops_the_verdict
   test_a_state_that_moved_drops_the_verdict_as_quiet
   test_a_state_that_could_not_be_re_read_withholds_the_verdict

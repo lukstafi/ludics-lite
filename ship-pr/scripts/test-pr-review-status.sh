@@ -53,6 +53,8 @@ THREADS_JSON='[]'
 THREADS_FIXTURE_PAGE=""
 THREADS_FIXTURE_TOTAL=""
 FAIL_GRAPHQL=""
+# One of the three state feeds (reactions, comments, reviews) refusing to answer.
+FAIL_FEED=""
 # A comment POST refusing (a watch's re-request of a failed run, #453). What does post is kept in
 # $TEST_ROOT/posted, one comment per line, and served back by the comments read after it.
 FAIL_POST=""
@@ -88,6 +90,7 @@ reset_fixture() {
   THREADS_FIXTURE_PAGE=""
   THREADS_FIXTURE_TOTAL=""
   FAIL_GRAPHQL=""
+  FAIL_FEED=""
   FAIL_POST=""
   THUMBS_ON_REACTIONS_READ=""
   rm -f "$TEST_ROOT/pushed" "$TEST_ROOT/posted" "$TEST_ROOT"/nth.*
@@ -158,6 +161,12 @@ fixture_head() { # <sha>
   [ "$1" = "$HEAD_SHA" ] || [ "$1" = "$PUSHED_HEAD" ]
 }
 
+# Does FAIL_FEED name <feed>? Then the read answers as GitHub does in an outage.
+fixture_feed_down() { # <feed>
+  [ "$FAIL_FEED" = "$1" ] || return 1
+  echo "gh: 503 No server is currently available to service your request" >&2
+}
+
 # Minimal gh fixture transport for every feed `status` and `watch` read. The --jq filter matters
 # here: the PR read asks gh to format its head/mergeability snapshot. --paginate is ignored (one
 # page is the whole feed).
@@ -166,6 +175,7 @@ gh() {
   gh_fixture_parse "$@"
   case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/issues/7/reactions?per_page=100")
+    fixture_feed_down reactions && return 1
     fixture_nth reactions
     response="$REACTIONS_JSON"
     [ -z "$THUMBS_ON_REACTIONS_READ" ] || [ "$FIXTURE_NTH" -lt "$THUMBS_ON_REACTIONS_READ" ] ||
@@ -174,11 +184,13 @@ gh() {
   "repos/$REPO/pulls/7/reviews?per_page=100")
     # The simulated push: gh runs in a subshell, so the "new head" travels through a file that
     # the PR read below consults.
+    fixture_feed_down reviews && return 1
     fixture_nth reviews
     [ "$PUSH_ON_REVIEWS_READ" != "$FIXTURE_NTH" ] || : >"$TEST_ROOT/pushed"
     response="$REVIEWS_JSON"
     ;;
   "repos/$REPO/issues/7/comments?per_page=100")
+    fixture_feed_down comments && return 1
     response="$COMMENTS_JSON"
     [ ! -s "$TEST_ROOT/posted" ] ||
       response=$(jq -c --slurpfile p "$TEST_ROOT/posted" '. + $p' <<<"$response")
@@ -256,8 +268,76 @@ gh() {
   gh_fixture_answer "$response"
 }
 
-# The state line and its rendering, as `status` and `watch` produce them.
+# The state line and its rendering, as `status` produces them. Once `status` is served by Python
+# (ludics-lite#403) that is the Python's own state and rendering, asked through the two entry points
+# of ludics.prreview that pr-review.sh's command line does not route to (`status-state <pr>
+# [<pending-request watermark>]`, `status-line <state line> [<pr number>]`), so every case here
+# judges what `status` runs; the arguments are what the shell functions read from their caller's
+# scope (watch_nudge_after, PR_NUM).
+#
+# The shell's status_state and status_line still serve `watch` until it is ported, and every case
+# here judges them too: the shell is asked first, over the same fixture state, and must answer the
+# line the Python does. Without that a regression in the state watch's verdicts are read from lands
+# green, since the watch suite reaches only a few of the states these cases build. The fixture's
+# own state (the request log, the read counters, the simulated push and posts) is put back between
+# the two, so the Python answers the reads the case set up, and what a case counts afterwards is the
+# Python's reads alone. The age is the one field the two may honestly disagree on: each reads the
+# clock for itself, a moment apart.
 run_status() {
+  if py_ported status; then
+    local saved="$TEST_ROOT/fixture-state" shell_state
+    fixture_state_save "$saved"
+    run_shell_status
+    shell_state=$STATE
+    fixture_state_restore "$saved"
+    STATE=$(py_forward call status-state 7 "${watch_nudge_after:-}")
+    LINE=$(py_forward call status-line "$STATE" "${PR_NUM:-}")
+    same_state_but_age "$shell_state" "$STATE" ||
+      bail "watch's state (the shell's status_state) and status's (the Python's) differ:" \
+        "shell '$shell_state', Python '$STATE'"
+    assert_eq "$(status_line "$STATE")" "$LINE" \
+      "watch's rendering (the shell's status_line) and status's differ on the same state"
+  else
+    run_shell_status
+  fi
+}
+
+# The fixture's files that a read changes, which run_status puts back between its two reads.
+FIXTURE_STATE_FILES=(requests pushed posted posted.keep fixture-calls nth.)
+fixture_state_save() { # <dir>
+  local name f
+  rm -rf "$1" && mkdir "$1" || bail "could not save the fixture state into $1"
+  for name in "${FIXTURE_STATE_FILES[@]}"; do
+    for f in "$TEST_ROOT/$name"*; do
+      [ ! -e "$f" ] || cp -R "$f" "$1/" || bail "could not save $f"
+    done
+  done
+}
+fixture_state_restore() { # <dir>
+  local name f
+  for name in "${FIXTURE_STATE_FILES[@]}"; do
+    rm -rf "$TEST_ROOT/$name"*
+  done
+  for f in "$1"/*; do
+    [ ! -e "$f" ] || cp -R "$f" "$TEST_ROOT/" || bail "could not restore $f"
+  done
+}
+
+# Two state lines that are the same but for an age read a moment later on the second.
+same_state_but_age() { # <first> <second>
+  local age_a age_b
+  [ "$(state_tok "$1")" = "$(state_tok "$2")" ] || return 1
+  [ "${1#*|*|}" = "${2#*|*|}" ] || return 1
+  age_a=$(state_age "$1") age_b=$(state_age "$2")
+  [ "$age_a" != "$age_b" ] || return 0
+  case "$age_a$age_b" in *[!0-9]*) return 1 ;; esac
+  [ $((age_b - age_a)) -ge 0 ] && [ $((age_b - age_a)) -le 2 ]
+}
+
+# The shell's own state, which `watch` reads until it is ported. run_status asks it beside the
+# Python's; the cases that break one of its jq programs by name (with_broken_jq) ask it alone: a
+# program no feed can reach on its own has no black-box form, and no Python counterpart to break.
+run_shell_status() {
   STATE=$(status_state 7)
   LINE=$(status_line "$STATE")
 }
@@ -1010,6 +1090,143 @@ test_a_standing_verdict_survives_a_failed_re_request() {
   assert_contains "$LINE" "reviewer FAILED at initialization" "and the line says so"
 }
 
+# --- the verdict comment and the 👀 clock, pinned from the fix history ----------------------------
+# Lessons the state machine learned in review rounds whose commits added no case of their own,
+# pinned here before the v2 port (ludics-lite#403) so the rewrite cannot quietly drop one. Each
+# names the commit that encoded it.
+VERDICT_HEAD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+# 254facf: the connector can deliver its no-findings verdict as an issue comment instead of the 👍
+# (ocannl-staging#531, where a re-request had cleared the reaction while the comment persisted).
+test_a_verdict_comment_naming_the_head_is_an_approval() {
+  reset_fixture
+  HEAD_SHA="$VERDICT_HEAD"
+  COMMENTS_JSON="[$(verdict_comment 9 aaaaaaa "$PAST")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "a no-findings verdict naming the head approves it with no 👍"
+  assert_contains "$(state_detail "$STATE")" "posted a no-findings verdict for head aaaaaaa at $PAST" \
+    "the approval names the verdict it rests on"
+  # The control: a verdict naming another head approves nothing here.
+  COMMENTS_JSON="[$(verdict_comment 9 bbbbbbb "$PAST")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a verdict for another head is not this head's"
+}
+
+# 0c4580d: a re-request without a push raises a fresh 👀 over a verdict whose SHA still matches; the
+# verdict is the previous round's, and approving on it would open the gate under a running round.
+test_a_verdict_older_than_a_fresh_eyes_is_not_an_approval() {
+  reset_fixture
+  HEAD_SHA="$VERDICT_HEAD"
+  COMMENTS_JSON="[$(verdict_comment 9 aaaaaaa "$PAST")]"
+  REACTIONS_JSON="[$(reaction eyes "$(jq -rn '(now - 60) | todate')")]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" reviewing "a 👀 newer than the verdict is a round still running"
+}
+
+# ac6c498 / 0c4580d: a verdict delivered by EDITING the round-started placeholder carries the edit
+# time in updated_at, which is newer than the round's 👀, so it approves where a leftover would not.
+test_an_edited_placeholder_verdict_approves_over_its_eyes() {
+  reset_fixture
+  HEAD_SHA="$VERDICT_HEAD"
+  REACTIONS_JSON="[$(reaction eyes "$(jq -rn '(now - 120) | todate')")]"
+  COMMENTS_JSON="[$(jq -cn --arg rev "$REVIEWER" --arg c "$PAST" --arg u "$(jq -rn '(now - 30) | todate')" \
+    '{id:9, user:{login:($rev + "[bot]")}, created_at:$c, updated_at:$u,
+      body:"<!-- codex-pull-request-review-summary -->\nCodex Review: Didn'"'"'t find any major issues.\n**Reviewed commit:** `aaaaaaa`"}')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "the edited placeholder's verdict is newer than the 👀 it answers"
+  # The same comment never edited since before the 👀: a leftover, which the 👀 outranks.
+  COMMENTS_JSON=$(jq -c --arg c "$PAST" 'map(.updated_at = $c)' <<<"$COMMENTS_JSON")
+  run_status
+  assert_eq "$(state_tok "$STATE")" reviewing "an unedited verdict older than the 👀 does not approve"
+}
+
+# e17ceac: a re-requested round on the same head that ends WITH findings spends its 👀 through its
+# own review, and a SHA-only check would then approve on the earlier verdict over those findings.
+test_a_verdict_older_than_a_later_findings_review_is_idle() {
+  reset_fixture
+  HEAD_SHA="$VERDICT_HEAD"
+  COMMENTS_JSON="[$(verdict_comment 9 aaaaaaa 2026-09-01T00:00:00Z)]"
+  REACTIONS_JSON="[$(reaction eyes 2026-09-01T00:30:00Z)]"
+  REVIEWS_JSON="[$(review 5 "$VERDICT_HEAD" 2026-09-01T01:00:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" idle "findings after the verdict are the reviewer's newer word"
+}
+
+# 0506b1e: the machine-tagged round-started placeholder lands moments after the 👀; counted as the
+# reviewer's last word it made a LIVE 👀 look spent.
+test_the_round_started_placeholder_does_not_spend_the_eyes() {
+  reset_fixture
+  REACTIONS_JSON="[$(reaction eyes "$(jq -rn '(now - 60) | todate')")]"
+  COMMENTS_JSON="[$(plain_comment 9 "$(jq -rn '(now - 30) | todate')" '<!-- codex-pull-request-review-summary -->
+🔄 Running')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" reviewing "the placeholder is an announcement, not the reviewer speaking"
+  # The control: an untagged comment at the same moment IS the reviewer speaking, and spends it.
+  COMMENTS_JSON="[$(plain_comment 9 "$(jq -rn '(now - 30) | todate')" 'Codex Review: a finding')]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a comment after the 👀 spends it"
+}
+
+# b6b09ee: a reaction is a LEVEL, not an event, and the app does not always take its 👀 back
+# (#364: three windows of "reviewing — wait it out" over a PR nothing was reading).
+test_a_spent_eyes_is_not_a_running_round() {
+  reset_fixture
+  REACTIONS_JSON="[$(reaction eyes 2026-09-01T00:10:00Z)]"
+  REVIEWS_JSON="[$(review 5 other-sha 2026-09-01T00:20:00Z)]"
+  run_status
+  assert_eq "$(state_tok "$STATE")" expected "a 👀 older than the reviewer's last review is spent"
+  assert_not_contains "$LINE" "wait it out" "and nothing is waited out on it"
+  # The same 👀 with nothing posted since, long past any round: stalled, never reviewing.
+  REVIEWS_JSON='[]'
+  run_status
+  assert_eq "$(state_tok "$STATE")" stalled "a 👀 older than any round takes, with nothing since, is a stall"
+  assert_contains "$(state_detail "$STATE")" "with nothing posted since" "and says so"
+}
+
+# 9197c23 / 3497844: an API failure and a genuinely empty feed both render as `[]`, so a read that
+# failed reports UNKNOWN and exits 3 — never "no approval yet", the silent false negative on the
+# merge gate that fired during the 2026-08-17 outage on an approved PR.
+test_a_feed_that_did_not_answer_is_unknown_not_a_fact() {
+  local feed
+  for feed in reactions comments reviews; do
+    idle_fixture
+    FAIL_FEED="$feed"
+    run_status
+    assert_eq "$(state_tok "$STATE")" unknown "$feed: a feed that did not answer is unknown"
+    assert_contains "$(state_detail "$STATE")" "the $feed API did not answer (gh: 503 No server" \
+      "$feed: the detail names the read and quotes its error"
+    assert_contains "$LINE" "this is NOT 'not approved', retry" "$feed: the line refuses rather than reports"
+    run_cmd_status
+    assert_eq "$CMD_RC" 3 "$feed: status exits 3 on a feed that did not answer"
+  done
+  # Under a 👍 the reactions feed alone decides, so a comments or reviews outage cannot hide it.
+  approved_fixture
+  FAIL_FEED=comments
+  run_status
+  assert_eq "$(state_tok "$STATE")" approved "a 👍 stands over a comments read that did not answer"
+}
+
+# A feed jq refuses to parse is a read that did not answer, whatever another JSON parser makes of
+# it. jq 1.8 refuses a lone high-surrogate escape ("Invalid \uXXXX\uXXXX surrogate pair escape");
+# Python's json reads one as a code point, which once gave a definite state, exit 0, where the
+# shell's api_list (and so `watch`) says UNKNOWN, exit 3.
+test_a_feed_jq_cannot_parse_is_unknown_not_a_fact() {
+  local feed
+  for feed in comments reviews; do
+    idle_fixture
+    case "$feed" in
+    comments) COMMENTS_JSON='[{"id":3,"user":{"login":"someone"},"created_at":"2026-09-01T00:00:00Z","body":"\ud83d"}]' ;;
+    reviews) REVIEWS_JSON='[{"id":5,"user":{"login":"someone"},"state":"COMMENTED","commit_id":"head-sha","submitted_at":"2026-09-01T00:00:00Z","body":"x\ud83dy"}]' ;;
+    esac
+    run_status
+    assert_eq "$(state_tok "$STATE")" unknown "$feed: a feed jq cannot parse is unknown"
+    assert_contains "$(state_detail "$STATE")" "the $feed API did not answer" \
+      "$feed: the detail names the read"
+    run_cmd_status
+    assert_eq "$CMD_RC" 3 "$feed: status exits 3 on a feed jq cannot parse"
+  done
+}
+
 test_empty_reviews_need_their_own_findings() {
   reset_fixture
   REVIEWS_JSON="[$(review 88 "$HEAD_SHA" "$PAST" | jq '.body=" \n\t"')]"
@@ -1040,22 +1257,35 @@ test_empty_reviews_need_their_own_findings() {
   assert_eq "$(state_tok "$STATE")" stalled "newer empty envelope cannot supersede current-head Running row"
 }
 
-# --- a jq program that ERRORS must not render as a fact (ludics-lite#89) ------------------------
-# Every jq program status_state runs is a literal inside pr-review.sh, so the way to make ONE of
-# them fail without touching the tracked script is to shim `jq` itself. The shim and its
-# `with_broken_jq <marker> <cmd>...` helper are the preamble's (ludics-lite#179), and so is the
-# control that it breaks only the invocation the marker names.
+# --- a read that does not parse must not render as a fact (ludics-lite#89) ----------------------
+# Each site is reached from OUTSIDE: a feed answering a shape its read cannot take (an entry that is
+# not an object, a body that is not text), so the case judges whichever implementation serves
+# `status` (ludics-lite#403). Where no feed can reach a site on its own -- an earlier read of the
+# same feed takes every shape it would -- the site is a jq program of the SHELL's status_state,
+# which `watch` still reads: those cases break it by name with the preamble's `with_broken_jq`
+# shim (ludics-lite#179) and run it through run_shell_status.
 
-# assert_unknown_when_broken <marker> <detail fragment> <site>: break the one program the marker
-# names, on whatever fixture the caller has standing, and require the state to refuse rather than
-# answer. Each case pairs this with a control run on the same fixture, so an `unknown` the shim
+# assert_unknown_state <detail fragment> <site>: the state standing after a run refuses rather than
+# answers. Each case pairs it with a control run on the same fixture, so an `unknown` the fixture
 # itself produced could not pass for the site's own refusal.
-assert_unknown_when_broken() {
-  with_broken_jq "$1" run_status
-  assert_eq "$(state_tok "$STATE")" unknown "$3: a jq program error must not render as a value"
-  assert_contains "$(state_detail "$STATE")" "$2" "$3: the detail should name the read that did not answer"
+assert_unknown_state() {
+  assert_eq "$(state_tok "$STATE")" unknown "$2: a read that did not parse must not render as a value"
+  assert_contains "$(state_detail "$STATE")" "$1" "$2: the detail should name the read that did not answer"
   assert_contains "$LINE" "this is NOT 'not approved', retry" \
-    "$3: the rendered line should refuse, not report"
+    "$2: the rendered line should refuse, not report"
+}
+
+# assert_unknown_when_broken <marker> <detail fragment> <site>: break the one shell program the
+# marker names and require the shell's state to refuse.
+assert_unknown_when_broken() {
+  with_broken_jq "$1" run_shell_status
+  assert_unknown_state "$2" "$3"
+}
+
+# A reviewer's comment whose body is not text: the shape that reaches a comment read past the
+# reviewer filter every one of them applies first.
+reviewer_entry_with_a_number_body() {
+  jq -cn --arg rev "$REVIEWER" '{id:41, user:{login:($rev + "[bot]")}, created_at:"2026-09-01T00:00:00Z", body:7}'
 }
 
 test_a_broken_jq_program_is_unknown_not_a_value() {
@@ -1065,12 +1295,21 @@ test_a_broken_jq_program_is_unknown_not_a_value() {
   run_status
   assert_eq "$(state_tok "$STATE")" idle "the ordinary reading of this fixture"
 
-  assert_unknown_when_broken 'any(.[]; .content == "+1")' \
-    "the reactions feed did not parse" "the reactions feed"
+  # An entry of the reactions feed that is not an object.
+  REACTIONS_JSON='["not a reaction"]'
+  run_status
+  assert_unknown_state "the reactions feed did not parse" "the reactions feed"
+  REACTIONS_JSON='[]'
+  # A reviewer's comment whose body is not text: the first read of the comments takes it.
+  COMMENTS_JSON="[$(reviewer_entry_with_a_number_body)]"
+  run_status
+  assert_unknown_state "the comments feed did not parse" "the reviewer's last comment"
+  COMMENTS_JSON='[]'
+  # The rest read the same feeds after a read that takes every shape they would: shell-only.
+  run_shell_status
+  assert_eq "$(state_tok "$STATE")" idle "control: the shell's own reading of this fixture"
   assert_unknown_when_broken 'sort_by(.submitted_at) | last' \
     "the reviews feed did not parse" "the reviews feed"
-  assert_unknown_when_broken '.created_at] | max // ""' \
-    "the comments feed did not parse" "the reviewer's last comment"
   # These two used to default to "|" — no verdict comment, no initialization failure — which is
   # a plausible fact about the PR and is the shape ludics-lite#89 was filed on.
   assert_unknown_when_broken 'sort_by(.at) | last' \
@@ -1084,7 +1323,7 @@ test_a_broken_jq_program_is_unknown_not_a_value() {
 
 test_a_broken_jq_program_is_unknown_on_the_failed_head_read() {
   failed_fixture "$FAILED_HEAD"
-  run_status
+  run_shell_status
   assert_eq "$(state_tok "$STATE")" failed "control: this fixture reaches the failed-head read"
   # It used to default to "", which reads as "no review of this head" — the very question this
   # arm is asking, answered by a read that did not happen.
@@ -1099,8 +1338,11 @@ test_a_broken_jq_program_is_unknown_on_the_pending_request_read() {
   local watch_nudge_after=0
   run_status
   assert_eq "$(state_tok "$STATE")" idle "control: the pending-request read changes nothing here"
-  assert_unknown_when_broken '^@codex review' \
-    "the pending-request comments feed did not parse" "the pending-request read"
+  # The pending-request read is the first to take the comments, and reads every author's: a
+  # comment above the watermark whose body is not text.
+  COMMENTS_JSON='[{"id":42,"user":{"login":"me"},"created_at":"2026-09-01T00:00:00Z","body":7}]'
+  run_status
+  assert_unknown_state "the pending-request comments feed did not parse" "the pending-request read"
 }
 
 test_a_broken_jq_program_is_unknown_on_the_current_head_evidence() {
@@ -1108,8 +1350,10 @@ test_a_broken_jq_program_is_unknown_on_the_current_head_evidence() {
   REACTIONS_JSON="[$(reaction +1 "$PAST")]"
   run_status
   assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the evidence scan"
-  assert_unknown_when_broken '$running | map(select(. == null))' \
-    "the current-head review evidence did not parse" "the current-head evidence scan"
+  # Under a 👍 the evidence scan is the first read of the comments: a reviewer's body not text.
+  COMMENTS_JSON="[$(reviewer_entry_with_a_number_body)]"
+  run_status
+  assert_unknown_state "the current-head review evidence did not parse" "the current-head evidence scan"
 }
 
 # The other half of ludics-lite#89: a `capture` that never errors, it just stops producing. The
@@ -1243,10 +1487,11 @@ test_a_thread_path_is_shell_quoted() {
 test_a_broken_jq_program_is_unknown_on_the_thread_read() {
   approved_fixture
   THREADS_JSON="[$(review_thread 77 false)]"
-  set +e
-  CMD_OUT=$(with_broken_jq 'select(.isResolved != true)' cmd_status 7 2>&1)
-  CMD_RC=$?
-  set -e
+  run_cmd_status
+  assert_contains "$CMD_OUT" "BUT 1 review thread(s) still UNRESOLVED" "control: this fixture reads the threads"
+  # A thread node that is not an object, inside a connection that is whole.
+  THREADS_JSON='["not a thread"]'
+  run_cmd_status
   assert_eq "$CMD_RC" 3 "open threads that did not parse are not 'none are open'"
   assert_contains "$CMD_OUT" "threads that did not parse" "the site says so"
 }
@@ -1511,7 +1756,7 @@ test_a_completed_row_approval_passes_the_thread_gate() {
 
 test_a_broken_jq_program_is_unknown_on_the_completed_row_read() {
   completed_fixture
-  run_status
+  run_shell_status
   assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the Completed-row read"
   assert_unknown_when_broken 'max_by(.at | instant) | ([.row' \
     "the summary comments feed did not parse" "the Completed-row read"
@@ -1706,8 +1951,11 @@ test_a_broken_jq_program_is_unknown_on_the_request_read() {
   failed_run_fixture
   run_status
   assert_eq "$(state_tok "$STATE")" failed "control: this fixture reaches the request read"
-  assert_unknown_when_broken '@codex[[:space:]]+review' \
-    "the review-request comments feed did not parse" "the request read"
+  # The request read is the one that reads OTHER authors' comment bodies: one that is not text.
+  COMMENTS_JSON="[$(failed_run_summary 1 "$FAILED_RUN_ROW"),$(jq -cn \
+    '{id:2, user:{login:"me"}, created_at:"2026-09-04T22:50:00Z", updated_at:"2026-09-04T22:50:00Z", body:7}')]"
+  run_status
+  assert_unknown_state "the review-request comments feed did not parse" "the request read"
 }
 
 test_watch_re_requests_a_failed_run_once() {
@@ -1821,6 +2069,14 @@ tests=(
   test_the_missing_environment_is_attributed_by_the_clock
   test_a_quoted_missing_environment_is_not_a_failure
   test_a_standing_verdict_survives_a_failed_re_request
+  test_a_verdict_comment_naming_the_head_is_an_approval
+  test_a_verdict_older_than_a_fresh_eyes_is_not_an_approval
+  test_an_edited_placeholder_verdict_approves_over_its_eyes
+  test_a_verdict_older_than_a_later_findings_review_is_idle
+  test_the_round_started_placeholder_does_not_spend_the_eyes
+  test_a_spent_eyes_is_not_a_running_round
+  test_a_feed_that_did_not_answer_is_unknown_not_a_fact
+  test_a_feed_jq_cannot_parse_is_unknown_not_a_fact
   test_a_broken_jq_program_is_unknown_not_a_value
   test_a_broken_jq_program_is_unknown_on_the_failed_head_read
   test_a_broken_jq_program_is_unknown_on_the_pending_request_read

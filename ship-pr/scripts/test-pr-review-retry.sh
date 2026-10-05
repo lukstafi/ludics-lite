@@ -669,8 +669,11 @@ printf '%s\n' 'Unknown JSON field: "status"' 'Available fields:' '  attempt' >&2
 exit 1
 STUB
   chmod +x "$stub/gh"
+  # poll, status and rounds pinned before their v2 port (ludics-lite#403): #471's stop is an
+  # exception reaching main there, and each must still make exactly one call and say it once.
   for spec in 'watch example/repo#7' 'merge example/repo#7' 'retry run watch example/repo#4242' \
-    'checks example/repo#7 --wait'; do
+    'checks example/repo#7 --wait' 'poll example/repo#7' 'status example/repo#7' \
+    'rounds example/repo#7'; do
     read -r -a cmd <<<"$spec"
     : >"$CALL_LOG"
     set +e
