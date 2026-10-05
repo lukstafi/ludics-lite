@@ -15,7 +15,7 @@ import sys
 from ludics import cli
 from ludics.prreview.core import PROG, GhSession, die, load_config
 
-PORTED = ("body",)
+PORTED = ("body", "base")
 
 
 def dispatch(argv: list[str]) -> int:
@@ -37,6 +37,10 @@ def dispatch(argv: list[str]) -> int:
             from ludics.prreview import body
 
             return body.run(session, rest)
+        case "base":
+            from ludics.prreview import base
+
+            return base.run(session, rest)
         case _:
             die(
                 f"'{sub}' is not a subcommand ported to Python (ported: {' '.join(PORTED)});",
