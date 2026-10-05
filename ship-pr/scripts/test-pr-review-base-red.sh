@@ -12,8 +12,9 @@
 # fails may not soften the red, and may not quietly report "no failing job" either; and none of it
 # may cost a call on a green base, which is the common case every worker pays for at session start.
 #
-# The window itself is the newest ten push runs per workflow, which is what `base` fetches; the
-# suite's fixtures are sized against that, not against a repository's whole history.
+# The window itself is the newest ten push runs per workflow, which is what `base` fetches, or a
+# hundred behind a page of ten that judged nothing (ludics-lite#535); the suite's fixtures are sized
+# against that, not against a repository's whole history.
 #
 # The fixture transport is test-pr-review-base-lib.sh, shared with the settle and verdict suites
 # (ludics-lite#179); what this file holds is the red report's own cases. The one that crosses
@@ -87,6 +88,37 @@ test_a_window_of_only_reds_does_not_name_a_first_red_commit() {
     "there is no such run: the bounded claim must not be printed here"
   assert_not_contains "$BASE_OUTPUT" "red since" \
     "'red since' names a first red commit, which this window cannot support"
+}
+
+# A burst's cancelled rows can fill the page of ten: the newest JUDGED run is then below it, and a red
+# there is the base's verdict, not "no verdict" (ludics-lite#535). The fold reads that workflow a
+# hundred deep, and the streak walk reads the same rows, so the red's first commit and its floor
+# are both named from below the page. A page that judged something is never read again.
+test_a_red_behind_a_page_of_cancelled_runs_is_red() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" --arg z "$SHA_0" \
+    '[range(3112; 3100; -1) | {conclusion: "cancelled", head_sha: $c, id: .}] +
+     [{conclusion: "failure", head_sha: $b, id: 3099},
+      {conclusion: "failure", head_sha: $a, id: 3098},
+      {conclusion: "success", head_sha: $z, id: 3097}]')")
+  JOBS_3099=$(jobs_json '[{"name":"bash 3.2 suites (macos)","conclusion":"failure"}]')
+  run_base
+  assert_eq "$BASE_RC" 1 "a red under twelve cancelled runs is red"
+  assert_contains "$BASE_OUTPUT" "RED      ci — failure at ${SHA_B:0:8}" "naming the judged run below the page"
+  assert_contains "$BASE_OUTPUT" "red since ${SHA_A:0:8} (run created" "the streak walk reads the same deeper rows"
+  assert_contains "$BASE_OUTPUT" "2 run(s) back; the judged run before it was not red" "and finds its floor there"
+  assert_contains "$BASE_OUTPUT" "failed job(s): bash 3.2 suites (macos) (failure)" "with the job that failed"
+  assert_contains "$BASE_OUTPUT" "(newest completed run: cancelled at ${SHA_C:0:8}, stopped not judged" \
+    "the cancelled run on top stays visible as context"
+  assert_contains "$(cat "$REQUEST_LOG")" "event=push&per_page=100" "found by the deeper read"
+  # The same red inside the page: one read of ten, as before.
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
+    '[range(3209; 3200; -1) | {conclusion: "cancelled", head_sha: $c, id: .}] +
+     [{conclusion: "failure", head_sha: $b, id: 3199}]')")
+  run_base
+  assert_eq "$BASE_RC" 1 "a red on the page is red"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "event=push&per_page=100" "no deeper read for a page that judged"
 }
 
 # Nothing that was not JUDGED ends a streak: a cancelled run and a run still going both say
@@ -247,6 +279,7 @@ test_a_wait_that_runs_out_over_an_older_red_has_no_verdict() {
 tests=(
   test_red_names_the_failing_job_and_the_first_red_commit
   test_a_window_of_only_reds_does_not_name_a_first_red_commit
+  test_a_red_behind_a_page_of_cancelled_runs_is_red
   test_an_unjudged_run_inside_the_streak_does_not_end_it
   test_an_unreadable_jobs_read_is_unknown_not_a_clean_bill
   test_a_red_run_with_no_red_job_says_so

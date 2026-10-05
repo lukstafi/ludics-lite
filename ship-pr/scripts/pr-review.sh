@@ -6611,6 +6611,24 @@ encode_ref() {
 # the branch, which is judging a tree the tip contains — waiting for it does better than settling,
 # since its commit becomes the verdict the tip then trails. A red breaks the wait immediately: it
 # is a verdict.
+
+# The projection cmd_base reads a workflow's push runs through, one row per run: workflow id, name,
+# status, conclusion, head sha, created_at, url, run id. One string for both of its reads (the page
+# of ten and, behind a page that judged nothing, the page of a hundred), so the two cannot drift.
+# shellcheck disable=SC2016 # jq source, not shell
+BASE_RUN_ROWS='.workflow_runs[] | [(.workflow_id | tostring), .name, .status,
+  (.conclusion // "pending"), .head_sha, .created_at, (.html_url // "-"),
+  (.id | tostring)] | @tsv'
+
+# base_page_judged: exit 0 when the rows on stdin (BASE_RUN_ROWS) hold a run that JUDGED the
+# branch: completed, with a conclusion conclusion_class calls red or green, the same set the fold's
+# newest-judged column keeps. Spelled out rather than asked of conclusion_class, which would fork
+# once per row of a hundred-row page, every round of a --wait.
+base_page_judged() {
+  awk -F'\t' '$3 == "completed" && ($4 == "failure" || $4 == "timed_out" || $4 == "startup_failure" ||
+    $4 == "success" || $4 == "skipped" || $4 == "neutral") { found = 1; exit } END { exit !found }'
+}
+
 # The red runs whose jobs have already been read, one "<run id><TAB><the line>" record per line.
 # `base --wait` re-folds every round, so without this a standing red would spend one jobs call per
 # round — per red workflow — to print the line it printed last time. A LIST rather than one slot
@@ -6635,6 +6653,7 @@ BASE_JOBS_CACHE=""
 # every record it added to the cache would die with it — the cache would read empty on every
 # round and the call it exists to save would be made anyway (review round 1).
 BASE_RED_DETAIL=""
+
 base_red_detail() {
   local wfid="$1" rows="$2" indent='           '
   local cached line
@@ -7681,6 +7700,7 @@ cmd_base() {
   local trig_note interim="" fly tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0
   local interim_green="" interim_name="" interim_why="" pushless_name="" norun_ids=() rerounds=0
   local hold_why moved want rid rstatus pushless_wids older_fly fly_status fly_n snap_at
+  local exhausted="" exhausted_wids=" "
   while [ $# -gt 0 ]; do
     case "$1" in
     # Opt in to an INTERIM verdict for a tip whose own push run is still in flight (ludics-lite
@@ -7764,6 +7784,7 @@ cmd_base() {
     red=0 pend=0 out="" inflight=0 uncovered=0 red_at_tip=0 nogo_at_tip=0 norun=0
     tip_unjudged=0 unrun_rows="" pushless="" pushless_ids=() src_pending=0 src_none=0 pushless_wids=" "
     tipfly=0 tipfly_ids=() tipfly_names="" uncov_nofly=0 pend_fly=0 interim_green="" norun_ids=()
+    exhausted="" exhausted_wids=" "
     # Tip re-read every round: the wait's covered-ness is against wherever the branch is NOW, so
     # a further push during the wait moves the goal with it (its run includes the older merges).
     tip=$(gh_retry read api "repos/$REPO/commits/$ebranch" --jq .sha) || tip=""
@@ -7806,12 +7827,32 @@ cmd_base() {
       # too, with an event alongside for a feed that spans every event at one head.
       part=$(gh_retry read api \
         "repos/$REPO/actions/workflows/$wid/runs?branch=$ebranch&event=push&per_page=10" \
-        --jq '.workflow_runs[] | [(.workflow_id | tostring), .name, .status,
-              (.conclusion // "pending"), .head_sha, .created_at, (.html_url // "-"),
-              (.id | tostring)] | @tsv')
+        --jq "$BASE_RUN_ROWS")
       rc=$?
       [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's '$wname' runs on $branch" \
         "($(gh_err_line)); the base's health is UNKNOWN, which is NOT 'green'."
+      # A FULL page of ten with no judged run in it does not say the branch was never judged: the
+      # newest judged run may sit just below it, behind a burst's cancelled or pending rows, and a
+      # red there would read as "no verdict" (ludics-lite#535). So that page, and only that one, is
+      # read again a hundred deep, and the deeper rows REPLACE it — the fold and base_red_detail's
+      # streak walk below then read the same rows, as they always have. A page that judged
+      # something, or a short page (the branch's whole push history), is not re-read: the common
+      # read stays one call of ten rows. A hundred rows with still no judged run is the bound, and
+      # is reported as exactly that below — never green.
+      # Boundary: what decides the re-read is the page's own rows, classed as the fold classes
+      # them (base_page_judged), and their count; a page of fewer than ten rows is read as the
+      # branch's whole push history, as it always was. Nothing past the hundredth row is read.
+      if [ -n "$part" ] && [ "$(grep -c . <<<"$part")" -ge 10 ] && ! base_page_judged <<<"$part"; then
+        part=$(gh_retry read api \
+          "repos/$REPO/actions/workflows/$wid/runs?branch=$ebranch&event=push&per_page=100" \
+          --jq "$BASE_RUN_ROWS")
+        rc=$?
+        [ "$rc" -eq 0 ] || fail 3 "could not read $REPO's '$wname' runs on $branch past its newest ten," \
+          "none of which judged it ($(gh_err_line)); the base's health is UNKNOWN, which is NOT 'green'."
+        if [ "$(grep -c . <<<"$part")" -ge 100 ] && ! base_page_judged <<<"$part"; then
+          exhausted_wids="$exhausted_wids$wid "
+        fi
+      fi
       if [ -n "$part" ]; then
         # This workflow's rows are ordered before either reader below sees them (see
         # newest_first): the fold's newest / newest-completed / newest-judged columns, and
@@ -7819,7 +7860,7 @@ cmd_base() {
         # same-second tie they see first. Two pushes to this branch inside one second is rarer
         # than the two dispatches ludics-lite#83 was about, but the verdict is decided by luck
         # just the same. The page's own newest-first order stays load-bearing ABOVE the sort, and
-        # the contract still pins it: WHICH ten rows a `per_page=10` page holds depends on it.
+        # the contract still pins it: WHICH rows a `per_page=10` (or 100) page holds depends on it.
         # Sorting each workflow's page on its own, rather than the assembled rows, leaves the
         # report's per-workflow lines in the order the workflow list gave them.
         part=$(newest_first 6 8 <<<"$part")
@@ -7987,6 +8028,13 @@ cmd_base() {
           ;;
         esac
         out="${out}${stopped_note}${trig_note}"
+        # Named here rather than at the read, so a retired workflow (set aside above) is never
+        # counted: its verdict comes from a named source, not from its push rows.
+        case "$exhausted_wids" in *" $wfid "*)
+          exhausted="${exhausted:+$exhausted, }$name"
+          out="${out}           ($name: none of its newest 100 push runs on $branch judged it, and this read stops there — a judged run further back, a red included, is not seen: no verdict, never green)"$'\n'
+          ;;
+        esac
         # A run whose head is behind the tip is normal here (ci carries paths-ignore: docs/**),
         # but it means the verdict is about an older tree than the one you are about to branch
         # from.
@@ -8078,7 +8126,8 @@ cmd_base() {
       older_fly=$(awk -F'\t' -v t="$tip" -v skip="$pushless_wids" \
         '$1 != "" && $3 != "completed" && $5 != t && index(skip, " " $1 " ") == 0 { n++ } END { print n + 0 }' <<<"$allruns")
     fi
-    # The rows above are ten per workflow, and a burst in a push group that does not cancel a
+    # The rows above are ten per workflow (a hundred only behind a page of ten that judged
+    # nothing, ludics-lite#535), and a burst in a push group that does not cancel a
     # running run stacks one `cancelled` row per replaced merge above the older merge's run: past
     # nine merges, that run is off the page, whether it is still going or has finished (red
     # included), and the fold above never saw it (ludics-lite#533). So before an interim, each
@@ -8087,6 +8136,12 @@ cmd_base() {
     # JUDGED run there (newest by creation, then id, as newest_first orders) that is red (none in
     # reach is #308's window of stopped runs). Boundary: a hundred push runs, far past one
     # run length of merges; a read that fails holds the interim with a note.
+    # A workflow whose hundred newest push runs judged nothing (ludics-lite#535) holds the interim
+    # too: below the bound is where a red would be, and nothing past it was read.
+    if [ -n "$interim" ] && [ "$tipfly" -gt 0 ] && [ "$older_fly" -eq 0 ] && [ -n "$exhausted" ]; then
+      older_fly=1
+      out="${out}           (no interim verdict: none of the newest 100 push runs of $exhausted judged the branch, and nothing past them was read)"$'\n'
+    fi
     if [ -n "$interim" ] && [ "$tipfly" -gt 0 ] && [ "$older_fly" -eq 0 ]; then
       for want in "${tipfly_ids[@]}"; do
         if ! fly_n=$(gh_retry read api \
@@ -8339,6 +8394,13 @@ cmd_base() {
   fi
   if [ -z "$out" ]; then
     echo "$REPO $branch: no build workflow has run on it (nothing to read, not a green light)"
+    return 4
+  fi
+  # The bound reached (ludics-lite#535): said as such, before the pending headlines below, which
+  # would call it "never judged" or a window of stopped runs. Exit 4 as they do — not green.
+  if [ -n "$exhausted" ]; then
+    echo "$REPO $branch: NO VERDICT${tip:+ (tip ${tip:0:8})} — none of the newest 100 push runs of $exhausted judged the branch, and the read stops there; a red further back is not seen; not green, not red"
+    printf '%s' "$out"
     return 4
   fi
   if [ "$src_none" -gt 0 ] || [ "$src_pending" -gt 0 ]; then
