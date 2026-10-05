@@ -5,6 +5,5 @@
   "typeCheckingMode": "strict",
   "reportMatchNotExhaustive": true,
   "reportUnnecessaryTypeIgnoreComment": true,
-  "reportImplicitOverride": true,
   "executionEnvironments": [{ "root": "lib" }]
 }
