@@ -920,7 +920,9 @@ checks leave nothing to wait for (green as well as absent), the gate reads
   sample, and `--require-green`, which refuses `ABSENT` outright, is the hatch for a merge that
   must have READ a green. The head SHA, the base SHA and the head ref are all re-read before the
   verdict is accepted: a retarget, or a base that advances, moves the evidence all of this rests on
-  without moving the head, and `--match-head-commit` binds only the head. Anything less than certain — an unparseable workflow, a pattern the
+  without moving the head, and `--match-head-commit` binds only the head — so `merge` re-reads the
+  base last before each merge call and, if it moved since the `absent` read, gates the head again
+  without waiting and refuses unless that read passes (ludics-lite#523). Anything less than certain — an unparseable workflow, a pattern the
   translation does not carry, a trigger with no filter, a list longer than its page on any read, a
   range past the cap, a base-side edit to the workflow, a second provider — refuses and costs the
   grace, exactly as `base --wait` does. **The `push` refusal is most of that**: a repository whose

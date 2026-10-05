@@ -808,7 +808,12 @@ directory listing confirms counts as no file, since a token without Contents acc
 repository gets a 404 too. A read or listing that did not answer is exit 3. A refusal, an
 unconfirmed 404, a file with no ERE line, a line grep refuses and a line with a backreference
 (which the join would renumber) are each exit 2, and a set `SHIP_PR_ADVISORY_CHECKS` skips the
-read.
+read. Two cases run `merge` over the recognition (ludics-lite#523): an absent head whose base
+advances between the gate's read and the merge call, adding a workflow whose `paths:` cover the
+head's diff, is gated again on the new base and refused (exit 4, no merge call), and a base that
+moved without touching what the recognition reads merges after that second read;
+`test-pr-review-merge.sh` holds the merge loop's other outcomes of the re-read (no read for a
+green, an unread base, a head that moved with the base).
 `test-pr-review-merge.sh` pins that `merge` reads the list too, and does not merge when the read
 did not answer.
 
