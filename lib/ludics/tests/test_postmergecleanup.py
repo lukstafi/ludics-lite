@@ -360,5 +360,55 @@ class EntryPoint(unittest.TestCase):
             shutil.rmtree(scratch, ignore_errors=True)
 
 
+class Interrupted(unittest.TestCase):
+    """A run stopped by SIGTERM releases what it reserved, as the shell's EXIT trap did."""
+
+    def setUp(self) -> None:
+        self.dir = os.path.realpath(tempfile.mkdtemp(prefix="ludics-pmc-term."))
+        self.main = f"{self.dir}/main"
+        self.session = f"{self.dir}/session"
+        remote = f"{self.dir}/remote.git"
+        ident = ["-c", "user.name=t", "-c", "user.email=t@e.invalid"]
+        self.git("init", "-q", "--bare", remote)
+        self.git("init", "-q", "-b", "master", self.main)
+        self.git("-C", self.main, *ident, "commit", "-q", "--allow-empty", "-m", "base")
+        self.git("-C", self.main, "remote", "add", "origin", remote)
+        self.git("-C", self.main, "push", "-q", "origin", "master")
+        self.git("-C", self.main, "worktree", "add", "-q", "-b", "topic", self.session)
+        self.git("-C", self.session, *ident, "commit", "-q", "--allow-empty", "-m", "topic")
+        self.git("-C", self.main, "checkout", "-q", "--detach")
+        self.bin = f"{self.dir}/bin"
+        os.mkdir(self.bin)
+        with open(f"{self.bin}/git", "w", encoding="utf-8") as f:
+            f.write(
+                "#!/bin/sh\n"
+                'case " $* " in *" fetch --no-tags origin "*) kill -TERM "$PPID"; sleep 2 ;; esac\n'
+                f'exec {shutil.which("git")} "$@"\n'
+            )
+        os.chmod(f"{self.bin}/git", 0o755)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+
+    def test_sigterm_releases_every_reservation(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX signals")
+        done = subprocess.run(
+            ["bash", HELPER, self.main, self.session, "topic"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "TMPDIR": self.dir},
+            check=False,
+        )
+        self.assertEqual(done.returncode, -15, done.stderr)
+        self.assertEqual(self.git("-C", self.main, "for-each-ref", "refs/ship-pr"), "")
+        self.assertEqual([n for n in os.listdir(self.dir) if "ship-pr" in n], [])
+        self.assertNotIn("\nlocked", self.git("-C", self.main, "worktree", "list", "--porcelain"))
+        self.assertTrue(os.path.isdir(self.session))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -71,10 +71,11 @@ def main() -> int:
     try:
         return cli.main_guard(PROG, run, sys.argv[1:])
     except (Signalled, KeyboardInterrupt) as stop:
-        signum = stop.signum if isinstance(stop, Signalled) else signal.SIGINT
-        # Die of the signal, as the shell did once its trap had run.
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
+        signum = stop.signum if isinstance(stop, Signalled) else int(signal.SIGINT)
+        if os.name != "nt":
+            # Die of the signal, as the shell did once its trap had run.
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
         return 128 + signum
 
 

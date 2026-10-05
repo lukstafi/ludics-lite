@@ -1262,8 +1262,8 @@ exist anywhere. Its interactive `update-ref --stdin` transactions reach Git thro
 anonymous pipe and a regular response file rather than a pair of FIFOs, for the same platform: a
 native Git for Windows reads nothing from an MSYS2 FIFO and exits 0 having done nothing.
 
-The helper requires Git's transactional `update-ref` symbolic-ref commands, Perl for an atomic
-filesystem rename, the exact session-worktree root, a clean and unlocked session, and one shared
+The helper requires Git's transactional `update-ref` symbolic-ref commands, a Python 3.12 or newer
+(it runs through `scripts/py` since ludics-lite#403), the exact session-worktree root, a clean and unlocked session, and one shared
 fetch/push endpoint for `origin`. The session must also carry no ignored local data, since cleanup
 archives the session by renaming it: two classes are exempt because archiving them loses nothing —
 harness-owned state under a top-level `.claude/` directory, which the agent harness writes into
