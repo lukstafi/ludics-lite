@@ -17,10 +17,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from ludics import proc
-from ludics.prreview import closekw, shtext, workflows
+from ludics.prreview import clock, closekw, shtext, workflows
 from ludics.prreview.core import Config, GhSession, Json
 from ludics.prreview.drift import compare_file_set, compare_hunks
-from ludics.prreview.gate import Clock, Gate, advisory_parse, conclusion_class, load_gate_config, newest_first
+from ludics.prreview.checkruns import conclusion_class, newest_first_lines
+from ludics.prreview.clock import FuncClock
+from ludics.prreview.gate import Gate, advisory_parse, load_gate_config
 
 
 def grep_refuses_in(locale: str, pattern: str) -> bool:
@@ -104,11 +106,11 @@ class ShellReadings(unittest.TestCase):
         def now() -> float:
             return 1767225600.0 + 90  # 2026-01-01T00:01:30Z
 
-        self.assertEqual(shtext.age_of("2026-01-01T00:00:00Z", now), 90)
-        self.assertIsNone(shtext.age_of("2026-01-01T00:05:00Z", now), "a future stamp is no age")
-        self.assertIsNone(shtext.age_of("yesterday", now))
-        self.assertEqual(shtext.freshest_age("2026-01-01T00:05:00Z", "2026-01-01T00:00:30Z", now=now), 60)
-        self.assertEqual((shtext.fmt_age(59), shtext.fmt_age(61), shtext.fmt_age(None)), ("59s", "1m", "an unknown time"))
+        self.assertEqual(clock.age_of("2026-01-01T00:00:00Z", now()), 90)
+        self.assertIsNone(clock.age_of("2026-01-01T00:05:00Z", now()), "a future stamp is no age")
+        self.assertIsNone(clock.age_of("yesterday", now()))
+        self.assertEqual(clock.freshest_age("2026-01-01T00:05:00Z", "2026-01-01T00:00:30Z", now=now()), 60)
+        self.assertEqual((clock.fmt_age(59), clock.fmt_age(61), clock.fmt_age(None)), ("59s", "1m", "an unknown time"))
 
     def test_jq_compact(self) -> None:
         self.assertEqual(shtext.jq_compact(["dir/a\tb.txt", "x\x01", "é"]), '["dir/a\\tb.txt","x\\u0001","é"]')
@@ -227,7 +229,7 @@ class Fold(unittest.TestCase):
 
     def test_newest_first_breaks_a_same_second_tie_on_the_id(self) -> None:
         rows = "2026-01-01T00:00:00Z\t5\ta\n2026-01-01T00:00:01Z\t3\tb\n2026-01-01T00:00:00Z\t12\tc\n-\t99\td"
-        self.assertEqual([r.split("\t")[2] for r in newest_first(rows, 1, 2).split("\n")], ["b", "c", "a", "d"])
+        self.assertEqual([r.split("\t")[2] for r in newest_first_lines(rows, 1, 2).split("\n")], ["b", "c", "a", "d"])
 
     def test_the_advisory_file(self) -> None:
         self.assertEqual(advisory_parse("# c\n\n  # i\n^claude$\r\n^macos$\n", "f"), "^claude$|^macos$")
@@ -283,7 +285,7 @@ def make_gate(gh: FakeGh, clock: FakeClock, **env: str) -> Gate:
     config = Config(repo="o/r", reviewer="r", round_threshold=None, round_gap=0, api_attempts=1, api_backoff=0)
     session = GhSession(config, run=gh, sleep=lambda _s: None)
     gate_config = load_gate_config({"SHIP_PR_CHECKS_INTERVAL": "60", **env})
-    return Gate(session, "o/r", gate_config, Clock(now=clock.now, sleep=clock.sleep))
+    return Gate(session, "o/r", gate_config, FuncClock(time=clock.now, sleep=clock.sleep))
 
 
 class GateLoop(unittest.TestCase):

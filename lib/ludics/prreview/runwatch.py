@@ -27,12 +27,13 @@ flag, or a run/repo pair the API rejects); 3 the API did not answer, so the run'
 
 import os
 import re
-import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import Literal, assert_never
+from collections.abc import Mapping
+from typing import assert_never
 
 from ludics import cli
+from ludics.prreview import knobs
+from ludics.prreview.checkruns import conclusion_class
+from ludics.prreview.clock import Clock, clock_from_env
 from ludics.prreview.core import (
     GhFailed,
     GhOk,
@@ -46,60 +47,13 @@ from ludics.prreview.core import (
 )
 
 _WHOLE = re.compile(r"[0-9]+")
-# The largest integer bash's `test` reads; one digit more is an error there, not a number.
-_INTMAX = 2**63 - 1
+_INTMAX = knobs.INTMAX
+Timing = knobs.Timing
 
 
-@dataclass(frozen=True)
-class Timing:
-    """The checks cadence: the poll interval, the deadline and the heartbeat, in whole seconds."""
-
-    interval: int
-    wait: int
-    heartbeat: int
-
-
-def _env(env: Mapping[str, str], name: str, default: str) -> str:
-    value = env.get(name, "")
-    return value if value else default
-
-
-# SHARED-CANDIDATE: CHECKS_INTERVAL CHECKS_WAIT CHECKS_HEARTBEAT (pr-review.sh's source-time block)
 def load_timing(env: Mapping[str, str]) -> Timing:
-    """The shell's source-time constants and their validation: whole seconds, fed to deadlines and
-    sleep caps, where a fraction does not degrade gracefully; a zero interval would busy-loop."""
-    interval = _env(env, "SHIP_PR_CHECKS_INTERVAL", "60")
-    if not _WHOLE.fullmatch(interval):
-        die(f"SHIP_PR_CHECKS_INTERVAL must be whole seconds, got '{interval}'")
-    if not 0 < int(interval) <= _INTMAX:
-        die(f"SHIP_PR_CHECKS_INTERVAL must be at least 1 second, got '{interval}'")
-    wait = _env(env, "SHIP_PR_CHECKS_WAIT", "7200")
-    if not _WHOLE.fullmatch(wait):
-        die(f"SHIP_PR_CHECKS_WAIT must be whole seconds, got '{wait}'")
-    heartbeat = _env(env, "SHIP_PR_CHECKS_HEARTBEAT", "600")
-    if not _WHOLE.fullmatch(heartbeat):
-        die(f"SHIP_PR_CHECKS_HEARTBEAT must be whole seconds, got '{heartbeat}'")
-    return Timing(int(interval), int(wait), int(heartbeat))
-
-
-type ConclusionClass = Literal["red", "green", "pending", "nogo"]
-
-
-# SHARED-CANDIDATE: conclusion_class
-def conclusion_class(conclusion: str) -> ConclusionClass:
-    """``conclusion_class``: failure, timed_out and startup_failure are a verdict and it is no;
-    success, skipped and neutral are green (a path-filtered job that did not run has not failed);
-    no conclusion yet is pending; anything else (cancelled, stale, action_required) was stopped,
-    not judged -- never counted as red and never as a pass."""
-    match conclusion:
-        case "failure" | "timed_out" | "startup_failure":
-            return "red"
-        case "success" | "skipped" | "neutral":
-            return "green"
-        case "" | "null" | "pending":
-            return "pending"
-        case _:
-            return "nogo"
+    """CHECKS_INTERVAL, CHECKS_WAIT, CHECKS_HEARTBEAT (knobs.checks_timing)."""
+    return knobs.checks_timing(env)
 
 
 def _tsv_pair(line: str) -> tuple[str, str]:
@@ -123,10 +77,12 @@ def run(
     args: list[str],
     *,
     env: Mapping[str, str] | None = None,
-    clock: Callable[[], float] = time.time,
-    sleep: Callable[[float], None] = time.sleep,
+    clock: Clock | None = None,
 ) -> int:
-    timing = load_timing(os.environ if env is None else env)
+    e = os.environ if env is None else env
+    timing = load_timing(e)
+    # SHIP_PR_TEST_CLOCK's file when it is named, as the shell's clock_now/clock_sleep read it.
+    clk = clock_from_env(e) if clock is None else clock
     run_ref = ""
     flag_repo = ""
     interval_text = str(timing.interval)
@@ -192,7 +148,7 @@ def run(
             "start in the checkout, and guessing turned a wrong-target read into a FAILED run",
             "(ludics-lite#74).",
         )
-    started = int(clock())
+    started = clk.now()
     deadline = started + timing.wait
     beat = started
     while True:
@@ -233,7 +189,7 @@ def run(
         status, conclusion = _tsv_pair(line)
         if status == "completed":
             break
-        now = int(clock())
+        now = clk.now()
         if now >= deadline:
             fail(
                 4,
@@ -247,7 +203,7 @@ def run(
                 f"{(now - started) // 60} min",
             )
             beat = now
-        sleep(min(interval, deadline - now))
+        clk.sleep(min(interval, deadline - now))
     verdict = conclusion_class(conclusion)
     match verdict:
         case "green":

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Literal, assert_never
 
 from ludics import cli
+from ludics.prreview import knobs
 from ludics.prreview.core import (
     GhFailed,
     GhOk,
@@ -52,16 +53,12 @@ THREADS_QUERY = """query($owner:String!, $name:String!, $pr:Int!, $after:String)
       nodes { id isResolved path
         comments(first:1) { nodes { fullDatabaseId databaseId author { login } } } } } } } }"""
 
-# The shell's THREADS_PAGE_CAP is a constant no caller's environment sets; the forwarder hands the
-# shell's value over under this private name, so a suite that retunes it reaches the Python too.
-PAGE_CAP_ENV = "LUDICS_THREADS_PAGE_CAP"
-PAGE_CAP_DEFAULT = 50
+# THREADS_PAGE_CAP, as the forward hands it over (knobs.threads_page_cap).
+PAGE_CAP_ENV = knobs.ENV_THREADS_PAGE_CAP
 
 
-# SHARED-CANDIDATE: THREADS_PAGE_CAP
 def page_cap(env: Mapping[str, str]) -> int:
-    text = env.get(PAGE_CAP_ENV, "")
-    return int(text) if re.fullmatch(r"[0-9]+", text) else PAGE_CAP_DEFAULT
+    return knobs.threads_page_cap(env)
 
 
 @dataclass(frozen=True)

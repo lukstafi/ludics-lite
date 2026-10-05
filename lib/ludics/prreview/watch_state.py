@@ -16,8 +16,9 @@ import os
 from dataclasses import dataclass
 from typing import Literal, assert_never
 
+from ludics.prreview import knobs
 from ludics.prreview.core import GhFailed, GhOk, GhUnanswered, Json, shell_quote
-from ludics.prreview.watch_clock import age_of, age_text, fmt_age, freshest_age, newest
+from ludics.prreview.clock import age_of, age_text, fmt_age, freshest_age, newest
 from ludics.prreview.watch_feeds import (
     Ctx,
     Head,
@@ -221,7 +222,7 @@ def status_state(ctx: Ctx, pr: str) -> State:
             return unknown("-", "the pending-request comments feed did not parse")
         if latest is not None:
             nudge_id, nudge_at = jstr(latest[0]), jstr(latest[1])
-        if age_of(nudge_at, ctx.clock) is None:
+        if age_of(nudge_at, ctx.clock.time()) is None:
             nudge_at = ""
 
     if plus and _after_nudge(plus_at, nudge_at):
@@ -254,14 +255,14 @@ def status_state(ctx: Ctx, pr: str) -> State:
             )
         if ev_at and ev_at > plus_at:
             if kind == "running":
-                age = age_of(ev_at, ctx.clock)
+                age = age_of(ev_at, ctx.clock.time())
                 detail = f"{rev} Code Review Running for head {_short(head.sha)} at {ev_at}"
                 if age is not None and age >= grace_stall:
                     return State("stalled", age, mstate, detail)
                 return State("reviewing", age, mstate, detail)
             if kind == "findings":
                 return State(
-                    "idle", age_of(ev_at, ctx.clock), mstate,
+                    "idle", age_of(ev_at, ctx.clock.time()), mstate,
                     f"{rev} posted findings for head {_short(head.sha)} at {ev_at}",
                 )
         if head.sha:
@@ -271,7 +272,7 @@ def status_state(ctx: Ctx, pr: str) -> State:
             else:
                 head_at = _commit_read(ctx, head.sha)
                 head_at_read = True
-                if age_of(head_at, ctx.clock) is not None and plus_at < head_at:
+                if age_of(head_at, ctx.clock.time()) is not None and plus_at < head_at:
                     stale_note = (
                         f"the 👍 at {plus_at} predates head {_short(head.sha)}'s commit date {head_at}"
                     )
@@ -372,7 +373,7 @@ def status_state(ctx: Ctx, pr: str) -> State:
 
     if (
         done_kind == "failed" and done_sha and head_sha and not plus
-        and age_of(done_at, ctx.clock) is not None
+        and age_of(done_at, ctx.clock.time()) is not None
         and _after_nudge(done_at, nudge_at) and (not eyes_at or eyes_at < done_at)
     ):
         if head_sha.startswith(done_sha):
@@ -396,8 +397,8 @@ def status_state(ctx: Ctx, pr: str) -> State:
         if not head_at_read:
             head_at = _commit_read(ctx, head_sha)
             head_at_read = True
-        floor = head_at if age_of(head_at, ctx.clock) is not None else ""
-        if head.created and age_of(head.created, ctx.clock) is not None:
+        floor = head_at if age_of(head_at, ctx.clock.time()) is not None else ""
+        if head.created and age_of(head.created, ctx.clock.time()) is not None:
             floor = newest(floor, head.created)
         try:
             asked = [
@@ -410,7 +411,7 @@ def status_state(ctx: Ctx, pr: str) -> State:
         except JqError:
             return unknown(mstate, "the review-request comments feed did not parse")
         if not req_after:
-            age = age_of(done_at, ctx.clock)
+            age = age_of(done_at, ctx.clock.time())
             if req_before:
                 return State(
                     "failed", age, mstate,
@@ -426,7 +427,7 @@ def status_state(ctx: Ctx, pr: str) -> State:
             )
 
     if eyes_at and eyes_at > last_spoke:
-        age = age_of(eyes_at, ctx.clock)
+        age = age_of(eyes_at, ctx.clock.time())
         if age is not None and age >= grace_stall:
             return State("stalled", age, mstate, f"👀 from {rev} at {eyes_at} with nothing posted since")
         since = f" ({last_spoke})" if last_spoke else ""
@@ -444,8 +445,8 @@ def status_state(ctx: Ctx, pr: str) -> State:
             head_at = _commit_read(ctx, head_sha)
             head_at_read = True
         if (
-            age_of(head_at, ctx.clock) is not None and fail_at > head_at
-            and (not head.created or (age_of(head.created, ctx.clock) is not None and fail_at > head.created))
+            age_of(head_at, ctx.clock.time()) is not None and fail_at > head_at
+            and (not head.created or (age_of(head.created, ctx.clock.time()) is not None and fail_at > head.created))
         ):
             fail_head = f"after head {_short(head_sha)}'s commit date {head_at}"
     if fail_head:
@@ -455,7 +456,7 @@ def status_state(ctx: Ctx, pr: str) -> State:
             return unknown(mstate, "the reviews feed did not parse for the failed head")
         if not rev_head_at or fail_at > rev_head_at:
             return State(
-                "failed", age_of(fail_at, ctx.clock), mstate,
+                "failed", age_of(fail_at, ctx.clock.time()), mstate,
                 f"{_short(head_sha)}|{fail_kind}|{rev} reported an initialization failure at"
                 f" {fail_at} {fail_head}",
             )
@@ -468,20 +469,20 @@ def status_state(ctx: Ctx, pr: str) -> State:
 
     if rev_sha == head_sha:
         return State(
-            "idle", age_of(last_spoke, ctx.clock), mstate, f"{rev} reviewed head {_short(head_sha)} at {rev_at}"
+            "idle", age_of(last_spoke, ctx.clock.time()), mstate, f"{rev} reviewed head {_short(head_sha)} at {rev_at}"
         )
 
     if not head_at_read:
         head_at = _commit_read(ctx, head_sha)
     if nudge_at:
         return State(
-            "nudged", freshest_age(ctx.clock, nudge_at, head_at, head.created), mstate,
+            "nudged", freshest_age(nudge_at, head_at, head.created, now=ctx.clock.time()), mstate,
             f"{nudge_id}|fresh review nudge; waiting for pickup",
         )
     last = f"; {rev} last reviewed {_short(rev_sha)} at {rev_at}" if rev_sha else ""
     stale = f"; {stale_note}" if stale_note else ""
     return State(
-        "expected", freshest_age(ctx.clock, head_at, head.created, last_spoke, eyes_at, nudge_at), mstate,
+        "expected", freshest_age(head_at, head.created, last_spoke, eyes_at, nudge_at, now=ctx.clock.time()), mstate,
         f"no 👀 in flight and no review of head {_short(head_sha)}{last}{stale}",
     )
 
@@ -706,15 +707,11 @@ def status_line(state: State, repo: str, pr: str) -> str:
 
 # --- open review threads under an approval (ludics-lite#289) -----------------------------------------
 
-# pr-review.sh's THREADS_PAGE_CAP, which is no environment knob there: the forwarder hands the
-# shell's value over under a private name, so a suite that retunes it moves this one too.
-THREADS_PAGE_CAP = 50
-THREADS_PAGE_CAP_ENV = "LUDICS_THREADS_PAGE_CAP"
-
-
 def threads_page_cap() -> int:
-    text = os.environ.get(THREADS_PAGE_CAP_ENV, "")
-    return int(text) if text.isdigit() and text.isascii() else THREADS_PAGE_CAP
+    """THREADS_PAGE_CAP (knobs.threads_page_cap)."""
+    return knobs.threads_page_cap(os.environ)
+
+
 THREADS_QUERY = """query($owner:String!, $name:String!, $pr:Int!, $after:String) {
   repository(owner:$owner, name:$name) { pullRequest(number:$pr) {
     reviewThreads(first:100, after:$after) {

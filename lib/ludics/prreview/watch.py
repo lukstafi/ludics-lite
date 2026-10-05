@@ -30,6 +30,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import assert_never
 
+from ludics.prreview import knobs
 from ludics.prreview.core import (
     GhOk,
     GhSession,
@@ -38,7 +39,7 @@ from ludics.prreview.core import (
     pr_arg,
     warn,
 )
-from ludics.prreview.watch_clock import Clock, clock_from_env, fmt_age
+from ludics.prreview.clock import Clock, clock_from_env, fmt_age
 from ludics.prreview.watch_drift import warn_base_drift
 from ludics.prreview.watch_feeds import Ctx, pr_head_read
 from ludics.prreview.watch_poll import poll
@@ -76,18 +77,9 @@ def _number(env: Mapping[str, str], name: str, default: str, what: str) -> int:
     return int(text)
 
 
-# SHARED-CANDIDATE: (pr-review.sh's source-time GRACE, STALL, STALE_BASE)
 def load_watch_config(env: Mapping[str, str]) -> WatchConfig:
-    grace = _number(env, "SHIP_PR_REVIEW_GRACE", "1200", "a number of seconds")
-    stall = _number(env, "SHIP_PR_REVIEW_STALL", str(grace * 2), "a number of seconds")
-    stale_text = env.get("SHIP_PR_STALE_BASE", "") or "20"
-    if stale_text == "off":
-        stale_base: int | None = None
-    elif _NUMBER.fullmatch(stale_text):
-        stale_base = int(stale_text)
-    else:
-        die(f"SHIP_PR_STALE_BASE must be a number of commits or 'off', got '{stale_text}'")
-    return WatchConfig(grace, stall, stale_base)
+    grace, stall = knobs.review_clocks(env)
+    return WatchConfig(grace, stall, knobs.stale_base(env))
 
 
 def with_window(cfg: WatchConfig, env: Mapping[str, str]) -> WatchConfig:

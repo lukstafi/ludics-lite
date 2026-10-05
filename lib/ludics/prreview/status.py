@@ -14,41 +14,26 @@ rendering; pr-review.sh's command line routes to neither:
 """
 
 import os
-import re
 from collections.abc import Mapping
 
 from ludics import cli
+from ludics.prreview import knobs
 from ludics.prreview.core import GhSession, die, pr_arg
 from ludics.prreview.rounds import review_rounds, rounds_line
 from ludics.prreview.state import (
-    THREADS_PAGE_CAP,
     approval_gate,
     state_tok,
     status_line,
     status_state,
 )
 
-# THREADS_PAGE_CAP as the shell holds it, which a suite's `retune` moves; private to the forward.
-THREADS_PAGE_CAP_ENV = "LUDICS_PR_REVIEW_THREADS_PAGE_CAP"
-
-_DIGITS = re.compile(r"[0-9]+")
-
-
 def stall_seconds(env: Mapping[str, str]) -> int:
-    """GRACE and STALL as the shell resolves them: ``SHIP_PR_REVIEW_GRACE`` (1200) and
-    ``SHIP_PR_REVIEW_STALL`` (twice the grace), each a whole number of seconds."""
-    grace = env.get("SHIP_PR_REVIEW_GRACE", "") or "1200"
-    if not _DIGITS.fullmatch(grace):
-        die(f"SHIP_PR_REVIEW_GRACE must be a number of seconds, got '{grace}'")
-    stall = env.get("SHIP_PR_REVIEW_STALL", "") or str(int(grace) * 2)
-    if not _DIGITS.fullmatch(stall):
-        die(f"SHIP_PR_REVIEW_STALL must be a number of seconds, got '{stall}'")
-    return int(stall)
+    """STALL as the shell resolves it (knobs.review_clocks)."""
+    return knobs.review_clocks(env)[1]
 
 
 def threads_cap(env: Mapping[str, str]) -> int:
-    cap = env.get(THREADS_PAGE_CAP_ENV, "")
-    return int(cap) if _DIGITS.fullmatch(cap) else THREADS_PAGE_CAP
+    return knobs.threads_page_cap(env)
 
 
 def run(session: GhSession, args: list[str]) -> int:
@@ -77,7 +62,7 @@ def run_state(session: GhSession, args: list[str]) -> int:
         die("usage: status-state <pr> [<issue-comment watermark>]")
     target = pr_arg(args[0], session.config.repo)
     after = args[1] if len(args) > 1 else ""
-    if after and not _DIGITS.fullmatch(after):
+    if after and not knobs.is_digits(after):
         die(f"status-state: the watermark must be a whole number, got '{after}'")
     cli.say(
         status_state(

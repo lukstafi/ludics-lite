@@ -39,7 +39,8 @@ from ludics.prreview.core import (
     warn,
 )
 from ludics.prreview.drift import warn_base_drift
-from ludics.prreview.gate import Clock, Gate, GateConfig, load_gate_config
+from ludics.prreview.clock import Clock, FuncClock
+from ludics.prreview.gate import Gate, GateConfig, load_gate_config
 from ludics.prreview.threads import merge_threads_gate
 
 USAGE = "usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]"
@@ -480,4 +481,4 @@ def run(session: GhSession, args: list[str]) -> int:
     config = load_gate_config(os.environ)
     opts = parse(args, config)
     target = pr_arg(opts.pr, session.config.repo)
-    return Merge(session, target.repo, target.num, config, Clock(), opts).run()
+    return Merge(session, target.repo, target.num, config, FuncClock(), opts).run()

@@ -16,52 +16,23 @@ and its TSV is read the way the shell's ``IFS=$'\\t' read`` read it (``shtext.ta
 the column-shifting that read does on an empty field is part of what the placeholders guard.
 """
 
-import functools
 import re
 import sys
-import time
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal, assert_never
 
 from ludics import cli
 from ludics.prreview import ere
-from ludics.prreview.core import GhFailed, GhOk, GhSession, GhUnanswered, die, warn
-from ludics.prreview.shtext import (
-    age_of,
-    fmt_age,
-    freshest_age,
-    herestring_lines,
-    is_digits,
-    newest,
-    placeholder,
-    tab_fields,
-)
+from ludics.prreview import knobs
+from ludics.prreview.core import GhFailed, GhOk, GhSession, GhUnanswered, warn
+from ludics.prreview.checkruns import conclusion_class, newest_first_lines
+from ludics.prreview.clock import Clock, FuncClock, age_of, fmt_age, freshest_age, newest
+from ludics.prreview.shtext import herestring_lines, is_digits, placeholder, tab_fields
 from ludics.prreview.workflows import RecognitionLimits, Reads, head_within_paths_ignore
 
-DEFAULT_ADVISORY = "^(claude|Claude Code|github pages docs)$"
+DEFAULT_ADVISORY = knobs.DEFAULT_ADVISORY
 ADVISORY_FILE = ".github/ship-pr-advisory-checks"
-
-# The forward's private names (pr-review.sh's PY_FORWARD_VARS): a constant whose being SET is read
-# (SHIP_PR_ADVISORY_CHECKS) travels under a name of its own, so a default is never read as a
-# caller's choice; and the constants no environment variable configures, which a suite's `retune`
-# can still move.
-ENV_BUILD_ADVISORY = "LUDICS_PR_BUILD_ADVISORY"
-ENV_ADVISORY_FROM_ENV = "LUDICS_PR_ADVISORY_FROM_ENV"
-ENV_ADVISORY_SETTLE = "LUDICS_PR_ADVISORY_SETTLE"
-ENV_CONTENTS_DIR_CAP = "LUDICS_PR_CONTENTS_DIR_CAP"
-ENV_IGNORE_MAX_COMMITS = "LUDICS_PR_IGNORE_MAX_COMMITS"
-ENV_THREADS_PAGE_CAP = "LUDICS_PR_THREADS_PAGE_CAP"
-
-
-def _env(env: Mapping[str, str], name: str, default: str) -> str:
-    value = env.get(name, "")
-    return value if value else default
-
-
-def _private_int(env: Mapping[str, str], name: str, default: int) -> int:
-    value = env.get(name, "")
-    return int(value) if is_digits(value) else default
 
 
 @dataclass(frozen=True)
@@ -81,92 +52,28 @@ class GateConfig:
 
 
 def load_gate_config(env: Mapping[str, str]) -> GateConfig:
-    grace = _env(env, "SHIP_PR_BASE_ABSENT_GRACE", "300")
-    if not is_digits(grace):
-        die(f"SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '{grace}'")
-    interval = _env(env, "SHIP_PR_CHECKS_INTERVAL", "60")
-    if not is_digits(interval):
-        die(f"SHIP_PR_CHECKS_INTERVAL must be whole seconds, got '{interval}'")
-    if int(interval) <= 0:
-        die(f"SHIP_PR_CHECKS_INTERVAL must be at least 1 second, got '{interval}'")
-    wait = _env(env, "SHIP_PR_CHECKS_WAIT", "7200")
-    if not is_digits(wait):
-        die(f"SHIP_PR_CHECKS_WAIT must be whole seconds, got '{wait}'")
-    heartbeat = _env(env, "SHIP_PR_CHECKS_HEARTBEAT", "600")
-    if not is_digits(heartbeat):
-        die(f"SHIP_PR_CHECKS_HEARTBEAT must be whole seconds, got '{heartbeat}'")
-    stale = _env(env, "SHIP_PR_STALE_BASE", "20")
-    if stale != "off" and not is_digits(stale):
-        die(f"SHIP_PR_STALE_BASE must be a number of commits or 'off', got '{stale}'")
-    from_var = env.get("SHIP_PR_ADVISORY_CHECKS", "")
-    advisory = env[ENV_BUILD_ADVISORY] if ENV_BUILD_ADVISORY in env else (from_var or DEFAULT_ADVISORY)
-    from_env = bool(env[ENV_ADVISORY_FROM_ENV]) if ENV_ADVISORY_FROM_ENV in env else bool(from_var)
+    """The gate's and merge's source-time constants (knobs.py), in the shell's order."""
+    grace = knobs.absent_grace(env)
+    timing = knobs.checks_timing(env)
+    stale = knobs.stale_base(env)
     return GateConfig(
-        checks_interval=int(interval),
-        checks_wait=int(wait),
-        checks_heartbeat=int(heartbeat),
-        absent_grace=int(grace),
-        advisory=advisory,
-        advisory_from_env=from_env,
-        advisory_settle=_private_int(env, ENV_ADVISORY_SETTLE, 60),
-        stale_base=None if stale == "off" else int(stale),
-        threads_page_cap=_private_int(env, ENV_THREADS_PAGE_CAP, 50),
+        checks_interval=timing.interval,
+        checks_wait=timing.wait,
+        checks_heartbeat=timing.heartbeat,
+        absent_grace=grace,
+        advisory=knobs.build_advisory(env),
+        advisory_from_env=knobs.advisory_from_env(env),
+        advisory_settle=knobs.private_int(env, knobs.ENV_ADVISORY_SETTLE, knobs.ADVISORY_SETTLE),
+        stale_base=stale,
+        threads_page_cap=knobs.threads_page_cap(env),
         limits=RecognitionLimits(
-            contents_dir_cap=_private_int(env, ENV_CONTENTS_DIR_CAP, 1000),
-            ignore_max_commits=_private_int(env, ENV_IGNORE_MAX_COMMITS, 20),
+            contents_dir_cap=knobs.private_int(env, knobs.ENV_CONTENTS_DIR_CAP, knobs.CONTENTS_DIR_CAP),
+            ignore_max_commits=knobs.private_int(env, knobs.ENV_IGNORE_MAX_COMMITS, knobs.IGNORE_MAX_COMMITS),
         ),
     )
 
 
 # --- small readings ---------------------------------------------------------------------------------
-
-type ConclusionClass = Literal["red", "green", "pending", "nogo"]
-
-
-# SHARED-CANDIDATE: conclusion_class
-def conclusion_class(conclusion: str) -> ConclusionClass:
-    """``conclusion_class``: a verdict (red, green), no verdict yet (pending), or stopped (nogo)."""
-    if conclusion in ("failure", "timed_out", "startup_failure"):
-        return "red"
-    if conclusion in ("success", "skipped", "neutral"):
-        return "green"
-    if conclusion in ("", "null", "pending"):
-        return "pending"
-    return "nogo"
-
-
-def _sort_number(text: str) -> float:
-    m = re.match(r"[ \t]*(-?[0-9]*(\.[0-9]*)?)", text)
-    try:
-        return float(m.group(1)) if m and m.group(1) not in ("", "-", ".", "-.") else 0.0
-    except ValueError:
-        return 0.0
-
-
-# SHARED-CANDIDATE: newest_first
-def newest_first(text: str, created_col: int, id_col: int) -> str:
-    """``newest_first``: ``LC_ALL=C sort -t$'\\t' -k<c>,<c>r -k<i>,<i>nr`` over the lines -- newest
-    created_at first, a same-second tie to the higher id, the whole line (bytes, ascending) as
-    sort's last resort."""
-
-    def col(line: str, n: int) -> str:
-        cols = line.split("\t")
-        return cols[n - 1] if len(cols) >= n else ""
-
-    def cmp(a: str, b: str) -> int:
-        ka = col(a, created_col).encode("utf-8", "surrogateescape")
-        kb = col(b, created_col).encode("utf-8", "surrogateescape")
-        if ka != kb:
-            return -1 if ka > kb else 1
-        na, nb = _sort_number(col(a, id_col)), _sort_number(col(b, id_col))
-        if na != nb:
-            return -1 if na > nb else 1
-        ba, bb = a.encode("utf-8", "surrogateescape"), b.encode("utf-8", "surrogateescape")
-        return (ba > bb) - (ba < bb)
-
-    lines = text.split("\n")
-    return "\n".join(sorted(lines, key=functools.cmp_to_key(cmp)))
-
 
 def _before_space(text: str) -> str:
     return text.split(" ", 1)[0]
@@ -197,17 +104,6 @@ class RunSignal:
     reason: str
 
 
-@dataclass
-class Clock:
-    """The gate's clock and sleep, injectable: whole seconds, as ``date +%s`` gave them."""
-
-    now: Callable[[], float] = time.time
-    sleep: Callable[[float], None] = time.sleep
-
-    def seconds(self) -> int:
-        return int(self.now())
-
-
 # SHARED-CANDIDATE: gate_checks (with build_checks, summarize_checks, run_signal, apply_waiver):
 # `base`'s tip_pr_head_verdict judges a merged PR's head through the same gate.
 @dataclass
@@ -219,7 +115,7 @@ class Gate:
     session: GhSession
     repo: str
     config: GateConfig
-    clock: Clock = field(default_factory=Clock)
+    clock: Clock = field(default_factory=FuncClock)
     advisory: str = ""
     verdict: Verdict = ""
     check_sha: str = ""
@@ -503,7 +399,7 @@ class Gate:
                 return False
         if unfinished == 0:
             return False
-        age = age_of(last, self.clock.now)
+        age = age_of(last, self.clock.time())
         return age is not None and age >= self.config.advisory_settle
 
     def run_signal(self, sha: str, pr_at: str, checks: int, base_sha: str, head_ref: str, pr: str) -> RunSignal:
@@ -529,7 +425,7 @@ class Gate:
             return RunSignal(
                 3, 0, waived_runs, f"the workflow runs for this head could not be read ({self.session.err_line()})"
             )
-        raw = newest_first(result.stdout, 1, 2)
+        raw = newest_first_lines(result.stdout, 1, 2)
         seen: set[str] = set()
         red_rows: list[str] = []
         inflight_ids: list[str] = []
@@ -619,7 +515,7 @@ class Gate:
             return RunSignal(0, 0, waived_runs, reason)
         pushed = self.session.retry("read", ["api", f"repos/{repo}/commits/{sha}", "--jq", ".commit.committer.date"])
         pushed_at = pushed.stdout if isinstance(pushed, GhOk) else ""
-        age = freshest_age(pushed_at, pr_at, now=self.clock.now)
+        age = freshest_age(pushed_at, pr_at, now=self.clock.time())
         if age is None:
             return RunSignal(
                 3,
@@ -700,7 +596,7 @@ class Gate:
             )
             return 3
         self.check_sha = sha
-        started = self.clock.seconds()
+        started = self.clock.now()
         deadline = started + wait_for
         beat = started
         run_why = ""
@@ -771,7 +667,7 @@ class Gate:
                     " re-run for the new head"
                 )
                 return 5
-            now = self.clock.seconds()
+            now = self.clock.now()
             if self.verdict not in ("pending", "unjudged"):
                 break
             if now >= deadline:

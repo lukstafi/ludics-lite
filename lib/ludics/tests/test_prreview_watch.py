@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from ludics import proc
 from ludics.prreview.core import GhSession, Json, load_config
 from ludics.prreview.watch import _cut_f12, item_about_head, tmp_sweep_stale  # pyright: ignore[reportPrivateUsage]
-from ludics.prreview.watch_clock import FileClock, age_of, fmt_age, freshest_age
+from ludics.prreview.clock import FileClock, age_of, fmt_age, freshest_age
 from ludics.prreview.watch_jq import (
     JqError,
     cmp,
@@ -42,7 +42,7 @@ from ludics.prreview.watch_poll import (
     poll,
     short,
 )
-from ludics.prreview.run_watch import conclusion_class
+from ludics.prreview.checkruns import conclusion_class
 
 LIB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 ROOT = os.path.dirname(LIB)
@@ -98,11 +98,11 @@ class Clock(unittest.TestCase):
         self.assertEqual(self.clock.now(), 1788562045 + 1200)
 
     def test_an_age_is_none_rather_than_zero_when_there_is_nothing_to_measure(self) -> None:
-        self.assertEqual(age_of("2026-09-04T22:46:25Z", self.clock), 60)
-        self.assertIsNone(age_of("2026-09-04T22:48:25Z", self.clock), "the future has no age")
-        self.assertIsNone(age_of("", self.clock))
-        self.assertIsNone(age_of("garbage", self.clock))
-        self.assertEqual(freshest_age(self.clock, "2099-01-01T00:00:00Z", "", "2026-09-04T22:37:25Z"), 600,
+        self.assertEqual(age_of("2026-09-04T22:46:25Z", self.clock.time()), 60)
+        self.assertIsNone(age_of("2026-09-04T22:48:25Z", self.clock.time()), "the future has no age")
+        self.assertIsNone(age_of("", self.clock.time()))
+        self.assertIsNone(age_of("garbage", self.clock.time()))
+        self.assertEqual(freshest_age("2099-01-01T00:00:00Z", "", "2026-09-04T22:37:25Z", now=self.clock.time()), 600,
                          "each clock is validated on its own before the freshest wins")
         self.assertEqual((fmt_age(None), fmt_age(59), fmt_age(1203)), ("an unknown time", "59s", "20m"))
 

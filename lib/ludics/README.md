@@ -73,7 +73,7 @@ shell's own `$(gh ...)` subshell saw, so a fixture that keeps its counters in fi
 for that reason) behaves the same. In production nothing is a function and `gh` is the binary.
 
 Not bridged: a suite's stub of a **time** command (`sleep`, `date`, SECONDS). The clock is an
-environment interface instead, `SHIP_PR_TEST_CLOCK` (the `watch` port, `prreview/watch_clock.py`):
+environment interface instead, `SHIP_PR_TEST_CLOCK` (`prreview/clock.py`, shared by every port):
 a file holding an epoch second that IS the clock -- every age and deadline is read from it -- and
 that a sleep advances instead of waiting. The shell's `clock_now` reads the same file, so a suite
 that exports it drives either implementation; test-pr-review-watch.sh runs every case on it.

@@ -12,22 +12,16 @@ watch passes one stderr writer for both.
 
 import json
 import re
-import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import assert_never
 
 from ludics.prreview.core import GhFailed, GhOk, GhUnanswered, Json
+from ludics.prreview.shtext import encode_ref
 from ludics.prreview.watch_feeds import Ctx, ifs_read
 from ludics.prreview.watch_jq import JqError, as_list, idx, member, tojson, type_name, unique
 
 _HUNK = re.compile(r"^@@ -(?P<s>[0-9]+)(,(?P<n>[0-9]+))? \+[0-9]+(,(?P<m>[0-9]+))? @@")
-
-
-# SHARED-CANDIDATE: encode_ref
-def encode_ref(ref: str) -> str:
-    """``encode_ref``: every byte outside ``[a-zA-Z0-9._~/-]`` as ``%XX``."""
-    return urllib.parse.quote(ref.encode("utf-8", "surrogateescape"), safe="._~/-")
 
 
 @dataclass(frozen=True)

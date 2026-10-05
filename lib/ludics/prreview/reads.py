@@ -18,13 +18,12 @@ the snapshot's path (``ROUND_SNAPSHOT``). The watch porter replaces this with an
 same reason a poll hands its last gh error back through the shell's GH_ERR_FILE (``GH_ERR_FILE``).
 """
 
-import math
 import os
 import re
-import time
 from dataclasses import dataclass
 from typing import assert_never
 
+from ludics.prreview import clock
 from ludics.prreview import jqsem as jq
 from ludics.prreview.core import (
     GhFailed,
@@ -103,53 +102,27 @@ def by_reviewer(item: Json, reviewer: str) -> bool:
 # --- clocks --------------------------------------------------------------------------------------
 
 
-# SHARED-CANDIDATE: newest
-def newest(*stamps: str) -> str:
-    """``newest``: the greatest nonempty ISO stamp, compared as a string."""
-    best = ""
-    for ts in stamps:
-        if ts and (not best or ts > best):
-            best = ts
-    return best
+# The prelude's clocks are lib/ludics/prreview/clock.py's; these keep the state line's spelling of
+# an age (the digits, or "-") and read the clock SHIP_PR_TEST_CLOCK names, as the shell's did.
+newest = clock.newest
 
 
 def _digits(s: str) -> bool:
     return s != "" and all("0" <= c <= "9" for c in s)
 
 
-# SHARED-CANDIDATE: age_of
 def age_of(stamp: str, now: float | None = None) -> str:
-    """``age_of``: whole seconds since the stamp, or ``-`` when there is none, it does not parse,
-    or it lies in the future."""
-    if not stamp:
-        return "-"
-    try:
-        then = jq.fromdateiso8601(stamp)
-    except jq.JqError:
-        return "-"
-    age = str(math.floor((time.time() if now is None else now) - then))
-    return age if _digits(age) else "-"
+    """``age_of``: whole seconds since the stamp, or ``-`` (see ``clock.age_of``)."""
+    return clock.age_text(clock.age_of(stamp, clock.clock_from_env().time() if now is None else now))
 
 
-# SHARED-CANDIDATE: freshest_age
 def freshest_age(*stamps: str) -> str:
     """``freshest_age``: the smallest usable age among the stamps, each validated on its own."""
-    best = ""
-    for ts in stamps:
-        age = age_of(ts)
-        if not _digits(age):
-            continue
-        if not best or int(best) > int(age):
-            best = age
-    return best or "-"
+    return clock.age_text(clock.freshest_age(*stamps, now=clock.clock_from_env().time()))
 
 
-# SHARED-CANDIDATE: fmt_age
 def fmt_age(age: str) -> str:
-    if not _digits(age):
-        return "an unknown time"
-    n = int(age)
-    return f"{n // 60}m" if n >= 60 else f"{n}s"
+    return clock.fmt_age(int(age) if _digits(age) else None)
 
 
 def is_digits(s: str) -> bool:

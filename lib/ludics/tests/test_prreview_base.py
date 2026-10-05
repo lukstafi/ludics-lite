@@ -21,6 +21,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from ludics import cli, proc
 from ludics.prreview import base
 from ludics.prreview.base_yaml import glob_ere, paths_ignore_covers, workflow_filter, workflow_keys
+from ludics.prreview.checkruns import newest_first
+from ludics.prreview.shtext import encode_ref
+from ludics.prreview.clock import FuncClock
 from ludics.prreview.core import Config, GhRefusedOwn, GhSession
 
 LIB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
@@ -62,9 +65,9 @@ jobs:
 
 class Readers(unittest.TestCase):
     def test_encode_ref_keeps_the_unreserved_set_and_slashes(self) -> None:
-        self.assertEqual(base.encode_ref("claude/topic-1.x_~"), "claude/topic-1.x_~")
-        self.assertEqual(base.encode_ref("rel#1&x"), "rel%231%26x")
-        self.assertEqual(base.encode_ref("a b+é"), "a%20b%2B%C3%A9")
+        self.assertEqual(encode_ref("claude/topic-1.x_~"), "claude/topic-1.x_~")
+        self.assertEqual(encode_ref("rel#1&x"), "rel%231%26x")
+        self.assertEqual(encode_ref("a b+é"), "a%20b%2B%C3%A9")
 
     def test_the_filter_reader_reads_both_sequence_forms_and_refuses_the_rest(self) -> None:
         self.assertEqual(workflow_filter(DOCS_IGNORED, "push", "paths-ignore"), ["docs/**", "**.md"])
@@ -144,7 +147,7 @@ class Folding(unittest.TestCase):
     def test_newest_first_breaks_a_same_second_tie_on_the_higher_id(self) -> None:
         rows = [row("1", "success", C, "71"), row("1", "failure", C, "72"),
                 row("1", "success", A, "70", "2026-09-09T00:00:00Z")]
-        ordered = base.newest_first(rows, lambda r: r.created_at, lambda r: r.run_id, lambda r: r.line())
+        ordered = newest_first(rows, lambda r: r.created_at, lambda r: r.run_id, lambda r: r.line())
         self.assertEqual([r.run_id for r in ordered], ["72", "71", "70"])
 
     def test_the_fold_keeps_newest_completed_and_newest_judged_apart(self) -> None:
@@ -204,7 +207,7 @@ class Endpoints:
         return proc.Completed(rc, "", err)
 
 
-class FakeClock(base.Clock):
+class FakeClock(FuncClock):
     def __init__(self, start: float = 1_800_000_000.0) -> None:
         self.t = start
         self.slept: list[float] = []

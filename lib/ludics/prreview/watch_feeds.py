@@ -25,7 +25,7 @@ from ludics.prreview.core import (
     ListUnparsed,
     api_list,
 )
-from ludics.prreview.watch_clock import Clock
+from ludics.prreview.clock import Clock
 from ludics.prreview.watch_jq import (
     JqError,
     as_list,

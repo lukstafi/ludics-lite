@@ -6,15 +6,11 @@ shell's reading of them has corners a port must keep: ``IFS=$'\\t' read`` collap
 (the reason every projection carries a ``-`` placeholder), ``${x#*$'\\n'}`` leaves a string with no
 newline whole, ``grep -c .`` counts non-empty lines. These helpers are those readings, named.
 
-Also here, ported from the prelude's time helpers: ``newest``, ``age_of``, ``freshest_age``,
-``fmt_age``; and jq's compact JSON printing, which the drift and thread lines print.
+Also here: jq's compact JSON printing, which the drift and thread lines print. (The prelude's time
+helpers are clock.py's.)
 """
 
-import datetime
-import math
 import re
-import time
-from collections.abc import Callable
 from typing import cast
 
 from ludics.prreview.core import Json
@@ -93,68 +89,6 @@ def encode_ref(ref: str) -> str:
         else:
             out.append(f"%{byte:02X}")
     return "".join(out)
-
-
-# --- clocks -----------------------------------------------------------------------------------------
-
-_ISO = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z")
-
-
-# SHARED-CANDIDATE: newest
-def newest(*stamps: str) -> str:
-    """``newest``: the greatest of the nonempty ISO stamps as strings (UTC ISO 8601 sorts as text)."""
-    best = ""
-    for ts in stamps:
-        if ts and (not best or ts > best):
-            best = ts
-    return best
-
-
-def parse_iso(ts: str) -> float | None:
-    """jq's ``fromdateiso8601``: ``YYYY-MM-DDTHH:MM:SSZ`` to epoch seconds, None for anything else."""
-    m = _ISO.fullmatch(ts)
-    if m is None:
-        return None
-    y, mo, d, h, mi, sec = (int(g) for g in m.groups())
-    try:
-        stamp = datetime.datetime(y, mo, d, h, mi, sec, tzinfo=datetime.UTC)
-    except ValueError:
-        return None
-    return stamp.timestamp()
-
-
-# SHARED-CANDIDATE: age_of
-def age_of(ts: str, now: Callable[[], float] = time.time) -> int | None:
-    """``age_of``: whole seconds since ``ts``; None ("-") when there is nothing to measure from --
-    no stamp, one that does not parse, or one in the FUTURE (a negative age is never 0)."""
-    if not ts:
-        return None
-    then = parse_iso(ts)
-    if then is None:
-        return None
-    age = math.floor(now() - then)
-    return age if age >= 0 else None
-
-
-# SHARED-CANDIDATE: freshest_age
-def freshest_age(*stamps: str, now: Callable[[], float] = time.time) -> int | None:
-    """``freshest_age``: each clock validated on its own, then the smallest age that survives."""
-    best: int | None = None
-    for ts in stamps:
-        age = age_of(ts, now)
-        if age is None:
-            continue
-        if best is None or age < best:
-            best = age
-    return best
-
-
-# SHARED-CANDIDATE: fmt_age
-def fmt_age(seconds: int | None) -> str:
-    """``fmt_age``: "20m" for a human skimming, "45s" under a minute, "an unknown time" for none."""
-    if seconds is None:
-        return "an unknown time"
-    return f"{seconds // 60}m" if seconds >= 60 else f"{seconds}s"
 
 
 # --- jq's printing ----------------------------------------------------------------------------------

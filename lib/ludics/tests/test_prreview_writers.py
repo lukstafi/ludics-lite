@@ -22,6 +22,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from ludics import cli
 from ludics.proc import Completed
 from ludics.prreview import comment, reply, resolve, retry, runwatch, space
+from ludics.prreview.clock import FuncClock
 from ludics.prreview.core import Config, GhSession, Json
 from ludics.tests.fake import Answer, FakeTool
 
@@ -358,7 +359,7 @@ class RunWatch(unittest.TestCase):
         gh = Gh(answer)
         c = clock or Clock()
         result = invoke(lambda: runwatch.run(
-            session(gh, repo=repo), args, env=env or {}, clock=c.time, sleep=c.sleep))
+            session(gh, repo=repo), args, env=env or {}, clock=FuncClock(time=c.time, sleep=c.sleep)))
         return (*result, gh)
 
     def test_the_sleep_is_capped_at_the_deadline_and_the_heartbeat_is_said(self) -> None:

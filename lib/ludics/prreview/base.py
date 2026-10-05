@@ -41,14 +41,17 @@ import os
 import re
 import sys
 import tempfile
-import time as _time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, assert_never
 
 from ludics import cli, proc
+from ludics.prreview import ere, jqsem
+from ludics.prreview import knobs
+from ludics.prreview.checkruns import conclusion_class, newest_first
+from ludics.prreview.clock import FuncClock, age_of
+from ludics.prreview.shtext import encode_ref
 from ludics.prreview.base_yaml import paths_ignore_covers, workflow_filter, workflow_keys
 from ludics.prreview.core import (
     GhFailed,
@@ -90,126 +93,29 @@ class Knobs:
     advisory: str
 
 
-def _env(env: Mapping[str, str], name: str, default: str) -> str:
-    value = env.get(name, "")
-    return value if value else default
-
-
 def load_knobs(env: Mapping[str, str]) -> Knobs:
-    """The shell's validation, in its order and its words (it ran at source time, so a forwarded
-    call has passed it already; a direct run gets it here)."""
-    grace = _env(env, "SHIP_PR_BASE_ABSENT_GRACE", "300")
-    if not _DIGITS.fullmatch(grace):
-        die(f"SHIP_PR_BASE_ABSENT_GRACE must be a number of seconds, got '{grace}'")
-    interval = _env(env, "SHIP_PR_CHECKS_INTERVAL", "60")
-    if not _DIGITS.fullmatch(interval):
-        die(f"SHIP_PR_CHECKS_INTERVAL must be whole seconds, got '{interval}'")
-    if int(interval) <= 0:
-        die(f"SHIP_PR_CHECKS_INTERVAL must be at least 1 second, got '{interval}'")
-    wait = _env(env, "SHIP_PR_CHECKS_WAIT", "7200")
-    if not _DIGITS.fullmatch(wait):
-        die(f"SHIP_PR_CHECKS_WAIT must be whole seconds, got '{wait}'")
-    beat = _env(env, "SHIP_PR_CHECKS_HEARTBEAT", "600")
-    if not _DIGITS.fullmatch(beat):
-        die(f"SHIP_PR_CHECKS_HEARTBEAT must be whole seconds, got '{beat}'")
-    # The forwarder hands over the shell's resolved list under a private name, because whether
-    # SHIP_PR_ADVISORY_CHECKS was SET is meaningful elsewhere; a direct run resolves it here.
-    if "LUDICS_BUILD_ADVISORY" in env:
-        advisory = env["LUDICS_BUILD_ADVISORY"]
-    else:
-        advisory = _env(env, "SHIP_PR_ADVISORY_CHECKS", _DEFAULT_ADVISORY)
-    return Knobs(int(grace), int(interval), int(wait), int(beat), advisory)
+    """The shell's source-time constants ``base`` reads (knobs.py), in the shell's order."""
+    grace = knobs.absent_grace(env)
+    timing = knobs.checks_timing(env)
+    return Knobs(grace, timing.interval, timing.wait, timing.heartbeat, knobs.build_advisory(env))
 
 
-# --- POSIX ERE, for the advisory list -------------------------------------------------------------
-
-_POSIX_CLASSES = {
-    "alpha": "A-Za-z",
-    "digit": "0-9",
-    "alnum": "A-Za-z0-9",
-    "upper": "A-Z",
-    "lower": "a-z",
-    "space": " \\t\\n\\r\\f\\v",
-    "blank": " \\t",
-    "punct": "!-/:-@\\[-`{-~",
-    "xdigit": "0-9A-Fa-f",
-    "cntrl": "\\x00-\\x1f\\x7f",
-    "print": " -~",
-    "graph": "!-~",
-}
-
-
-_WORD_ANCHORS = {"\\<": "\\b(?=\\w)", "\\>": "\\b(?<=\\w)"}
-
-
-def ere_to_python(ere: str) -> re.Pattern[str] | None:
-    """A POSIX extended regular expression as Python's ``re``, or None when it does not compile
-    (grep's exit 2, which matched nothing). Only bracket expressions differ in what this list
-    uses: POSIX classes, a literal backslash, and a leading ``]`` are rewritten there. Outside
-    them, grep's word anchors ``\\<`` and ``\\>`` (both BSD and GNU grep -E honour them) become
-    lookarounds; Python would read them as a literal ``<`` and ``>``."""
-    out: list[str] = []
-    i = 0
-    n = len(ere)
-    while i < n:
-        c = ere[i]
-        if c == "\\" and i + 1 < n:
-            pair = ere[i : i + 2]
-            out.append(_WORD_ANCHORS.get(pair, pair))
-            i += 2
-            continue
-        if c != "[":
-            out.append(c)
-            i += 1
-            continue
-        j = i + 1
-        body: list[str] = ["["]
-        if j < n and ere[j] == "^":
-            body.append("^")
-            j += 1
-        first = True
-        closed = False
-        while j < n:
-            d = ere[j]
-            if d == "]" and not first:
-                closed = True
-                j += 1
-                break
-            if d == "[" and ere[j : j + 2] == "[:":
-                end = ere.find(":]", j + 2)
-                if end < 0:
-                    return None
-                name = ere[j + 2 : end]
-                if name not in _POSIX_CLASSES:
-                    return None
-                body.append(_POSIX_CLASSES[name])
-                j = end + 2
-            elif d in "\\[]":
-                body.append("\\" + d)
-                j += 1
-            else:
-                body.append(d)
-                j += 1
-            first = False
-        if not closed:
-            return None
-        out.append("".join(body) + "]")
-        i = j
-    try:
-        return re.compile("".join(out))
-    except re.error:
-        return None
+# --- the advisory list ------------------------------------------------------------------------------
 
 
 class Advisory:
-    """``is_advisory``: a name the list says carries no build verdict."""
+    """``is_advisory``: a name the list says carries no build verdict -- asked of ``grep -E`` itself,
+    as the shell asked it (ere.py says why a translation to ``re`` is not the same gate). One
+    process's answers are kept: the wait asks the same names every round."""
 
-    def __init__(self, ere: str) -> None:
-        self._pattern = ere_to_python(ere)
+    def __init__(self, pattern: str) -> None:
+        self._pattern = pattern
+        self._seen: dict[str, bool] = {}
 
-    # SHARED-CANDIDATE: is_advisory
     def __call__(self, name: str) -> bool:
-        return self._pattern is not None and self._pattern.search(name) is not None
+        if name not in self._seen:
+            self._seen[name] = ere.matches(self._pattern, name)
+        return self._seen[name]
 
 
 # --- jq's renderings, which the shell's projections fixed -------------------------------------------
@@ -271,64 +177,16 @@ def _items(value: Json) -> list[Json] | None:
     return value if isinstance(value, list) else None
 
 
-# SHARED-CANDIDATE: conclusion_class
-def conclusion_class(concl: str) -> Literal["red", "green", "pending", "nogo"]:
-    """``conclusion_class``: a verdict, no verdict yet, or stopped without one."""
-    if concl in ("failure", "timed_out", "startup_failure"):
-        return "red"
-    if concl in ("success", "skipped", "neutral"):
-        return "green"
-    if concl in ("", "null", "pending"):
-        return "pending"
-    return "nogo"
-
-
+# The conclusions that are a verdict (conclusion_class red or green).
 _JUDGED = frozenset(("failure", "timed_out", "startup_failure", "success", "skipped", "neutral"))
 
 
-def _sort_num(text: str) -> float:
-    """``sort -n``'s reading of a field: its leading number, 0 when there is none."""
-    m = re.match(r"\s*(-?[0-9]+(?:\.[0-9]*)?)", text)
-    return float(m.group(1)) if m else 0.0
-
-
-# SHARED-CANDIDATE: newest_first
-def newest_first[T](rows: Sequence[T], created: Callable[[T], str], rid: Callable[[T], str],
-                    line: Callable[[T], str]) -> list[T]:
-    """``newest_first``: ``LC_ALL=C sort -k<created>r -k<id>nr`` -- created_at descending as bytes,
-    then the id descending as a number, then sort's last resort, the whole line ascending."""
-    out = sorted(rows, key=lambda r: line(r).encode("utf-8", "surrogateescape"))
-    out.sort(key=lambda r: _sort_num(rid(r)), reverse=True)
-    out.sort(key=lambda r: created(r).encode("utf-8", "surrogateescape"), reverse=True)
-    return out
-
-
 def iso_seconds(text: str) -> float | None:
-    """jq's ``fromdateiso8601``: a UTC ``YYYY-MM-DDTHH:MM:SSZ`` as epoch seconds, else None (jq 1.8
-    refuses fractional seconds too)."""
-    m = re.fullmatch(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z", text)
-    if not m:
-        return None
+    """jq's ``fromdateiso8601`` (jqsem's), as epoch seconds, else None."""
     try:
-        when = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)),
-                        int(m.group(5)), int(m.group(6)), tzinfo=timezone.utc)
-    except ValueError:
+        return float(jqsem.fromdateiso8601(text))
+    except jqsem.JqError:
         return None
-    return when.timestamp()
-
-
-# SHARED-CANDIDATE: encode_ref
-def encode_ref(ref: str) -> str:
-    """``encode_ref``: a branch name for a REST path or query, every byte outside the unreserved
-    set percent-encoded and ``/`` kept literal (slashed branch names are the common case)."""
-    out: list[str] = []
-    for byte in ref.encode("utf-8", "surrogateescape"):
-        ch = chr(byte)
-        if byte < 128 and (ch.isascii() and (ch.isalnum() or ch in "._~/-")):
-            out.append(ch)
-        else:
-            out.append(f"%{byte:02X}")
-    return "".join(out)
 
 
 # --- the rows ---------------------------------------------------------------------------------------
@@ -557,19 +415,6 @@ type Want = tuple[str, str]  # (workflow id, display name)
 # --- the clock --------------------------------------------------------------------------------------
 
 
-@dataclass
-class Clock:
-    """The wall clock the wait runs on: ``date +%s`` (whole seconds), jq's ``now`` (a float, for an
-    age) and ``sleep``. The suites run on real time (their delays are real sleeps in the fixture),
-    so production and the suites share this; the unit tests inject a fake."""
-
-    time: Callable[[], float] = _time.time
-    sleep: Callable[[float], None] = _time.sleep
-
-    def now(self) -> int:
-        return int(self.time())
-
-
 # --- one `base` invocation --------------------------------------------------------------------------
 
 
@@ -625,14 +470,14 @@ class Base:
         knobs: Knobs,
         repo: str,
         *,
-        clock: Clock | None = None,
+        clock: FuncClock | None = None,
         shell: ShellRunner | None = None,
         records: Sequence[Record] = (),
     ) -> None:
         self.session = session
         self.knobs = knobs
         self.repo = repo
-        self.clock = clock if clock is not None else Clock()
+        self.clock = clock if clock is not None else FuncClock()
         self._shell: ShellRunner = shell if shell is not None else proc.run_tool
         self.records = list(records)
         self.is_advisory = Advisory(knobs.advisory)
@@ -1185,7 +1030,7 @@ def parse_args(args: Sequence[str], repo: str, knobs: Knobs) -> Args:
     return Args(repo, branch, int(wait_text), interim, records)
 
 
-def run(session: GhSession, args: list[str], *, clock: Clock | None = None,
+def run(session: GhSession, args: list[str], *, clock: FuncClock | None = None,
         shell: ShellRunner | None = None, env: Mapping[str, str] | None = None) -> int:
     knobs = load_knobs(os.environ if env is None else env)
     parsed = parse_args(args, session.config.repo, knobs)
@@ -1308,7 +1153,7 @@ class Wait:
                     for f in rnd.folded:
                         if f.csha == tip and f.cwhen > seen:
                             seen = f.cwhen
-                    age = _age_of(seen, b.clock.time())
+                    age = age_of(seen, b.clock.time())
                     if age is not None and age < grace:
                         hold = True
                 if not hold and self.tip_read() == tip:
@@ -1685,16 +1530,3 @@ class Wait:
             cli.say(f"{repo} {branch}: green{at_tip}")
         sys.stdout.write(out)
         return 0
-
-
-# SHARED-CANDIDATE: age_of
-def _age_of(stamp: str, now: float) -> int | None:
-    """``age_of``: whole seconds since an ISO timestamp, or None (the shell's "-") when there is
-    nothing to measure from -- including a stamp in the future."""
-    if not stamp:
-        return None
-    at = iso_seconds(stamp)
-    if at is None:
-        return None
-    age = math.floor(now - at)
-    return age if age >= 0 else None
