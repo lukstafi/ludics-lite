@@ -1199,7 +1199,7 @@ named in its `PY_PORTED` (today: `body`). The shell suites above are the conform
 port, unchanged. The package's own checks are `npx --yes pyright@1.1.414` (strict, `pythonVersion`
 3.12, from `pyrightconfig.json`) and `scripts/py -m unittest discover -s lib -t lib -p 'test_*.py'`,
 both run by CI's `python` job. Where a port's code goes, how forwarding and the suites' shell
-bridge work, and the rule for helpers shared across subcommands: [lib/ludics/README.md](lib/ludics/README.md).
+bridge work, and the rule for helpers shared across subcommands: `lib/ludics/README.md`.
 
 ## Why symlinks, not copies
 
