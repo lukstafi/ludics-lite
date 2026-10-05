@@ -129,6 +129,9 @@ class Gate:
     check_total: int = 0
     check_green: int = 0
     check_lines: str = ""
+    # The round's workflow runs, "<id> <status> <conclusion>" each, what the budget's pause keys
+    # on beside the check counts (ludics-lite#551): a run moves before any check row exists.
+    run_state: str = ""
     waive_mode: Literal["", "record", "apply"] = ""
     waived: set[str] = field(default_factory=lambda: set[str]())
     _advisory: ere.Advisory | None = None
@@ -424,6 +427,9 @@ class Gate:
                 3, 0, waived_runs, f"the workflow runs for this head could not be read ({self.session.err_line()})"
             )
         raw = newest_first_lines(result.stdout, 1, 2)
+        self.run_state = " ".join(
+            f"{f[1]}:{f[5]}:{f[6]}" for f in (tab_fields(line, 8) for line in herestring_lines(raw)) if f[1]
+        )
         seen: set[str] = set()
         red_rows: list[str] = []
         inflight_ids: list[str] = []
@@ -613,6 +619,7 @@ class Gate:
         while True:
             if budget is not None:
                 budget.waited = False
+            self.run_state = ""
             rows = self.build_checks(sha)
             if rows is None:
                 self.verdict = "unknown"
@@ -698,9 +705,13 @@ class Gate:
                 beat = now
             # The budget's pause: back to the interval after a read that saw the signal move,
             # doubling toward the build cap while a queue sits still, and capped at the remaining
-            # deadline. The signal's state alone: run_why is prose for a person, and it carries the
-            # head's age during the run-creation grace, which moves on every read.
-            sig = f"{self.verdict}|{self.check_pending}|{self.check_green}|{self.check_total}"
+            # deadline. The signal's state alone, with its runs' (ludics-lite#551): run_why is prose
+            # for a person, and it carries the head's age during the run-creation grace, which moves
+            # on every read.
+            sig = (
+                f"{self.verdict}|{self.check_pending}|{self.check_green}|{self.check_total}"
+                f"|{self.run_state}"
+            )
             cap = budget.build_cap if budget is not None else self.config.checks_interval
             sleep_for = pause(self.config.checks_interval, cap, last_pause, sig != last_sig)
             last_sig = sig

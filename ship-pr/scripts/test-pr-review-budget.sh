@@ -92,9 +92,11 @@ next_check() {
   [ "$idx" -lt "${#CHECKS_SEQ[@]}" ] || idx=$((${#CHECKS_SEQ[@]} - 1))
   printf '%s' "${CHECKS_SEQ[$idx]}"
 }
-# The state the gate reads, one word per read: pending, green or red.
+# The state the gate reads, one word per read: pending, green or red; or queued and running, a
+# head with no check row yet whose workflow run is queued or in progress.
 check_runs() {
   case "$1" in
+  queued | running) printf '{"check_runs":[]}' ;;
   pending) printf '{"check_runs":[{"name":"build","status":"in_progress","conclusion":null,"html_url":"u","check_suite":{"id":1}}]}' ;;
   green) printf '{"check_runs":[{"name":"build","status":"completed","conclusion":"success","html_url":"u","check_suite":{"id":1}}]}' ;;
   red) printf '{"check_runs":[{"name":"build","status":"completed","conclusion":"failure","html_url":"u","check_suite":{"id":1}}]}' ;;
@@ -103,7 +105,8 @@ check_runs() {
 workflow_runs() {
   local status=completed conclusion=success
   case "$1" in
-  pending) status=in_progress conclusion=null ;;
+  pending | running) status=in_progress conclusion=null ;;
+  queued) status=queued conclusion=null ;;
   red) conclusion=failure ;;
   esac
   jq -cn --arg s "$status" --arg c "$conclusion" --arg sha "$HEAD_SHA" \
@@ -927,6 +930,17 @@ test_an_unrecordable_first_hold_is_a_state_directory_error() {
   assert_contains "$(err wait)" "could not be recorded" "as the hold that could not be recorded"
 }
 
+# The build pause keys on the workflow runs too: a run that moves before any check row exists
+# (queued, then in progress) is movement, and the pause goes back to the interval (ludics-lite#551).
+test_a_moving_run_before_any_check_resets_the_pause() {
+  reset_fixture
+  CHECKS_SEQ=(queued queued running running green)
+  run wait cmd_checks "$REPO#7" --wait
+  assert_eq "$(rc wait)" 0 "the green is the verdict ($(err wait))"
+  assert_eq "$(tr '\n' ' ' <"$SLEEP_LOG")" "60 120 60 120 " \
+    "the run's own status moving resets the pause, with no check row to show it"
+}
+
 run_tests \
   test_a_quota_refusal_is_unknown_and_holds_every_caller \
   test_a_transport_failure_is_unknown_and_never_merges \
@@ -965,6 +979,7 @@ run_tests \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
   test_an_unrecordable_first_hold_is_a_state_directory_error \
+  test_a_moving_run_before_any_check_resets_the_pause \
   -- "$@"
 exit "$?"
 }
