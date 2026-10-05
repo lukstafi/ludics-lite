@@ -826,7 +826,8 @@ gh_err_line() {
 # again whole (gate_checks), and nothing after `merge`'s gate waits a hold out at all; `watch`
 # rounds are not re-read (an approval it reports still goes through that gate). The hold
 # is per state directory, not per account: another host learns of the quota from its own first
-# refusal. Every gh call passes the hold's gate: gh_retry's, and repo_from_cwd's `gh repo view`.
+# refusal. And one state directory serves ONE credential: the hold is that token's quota, so a
+# second token on the same host (a GH_TOKEN of its own) sets a SHIP_PR_STATE_DIR of its own. Every gh call passes the hold's gate: gh_retry's, and repo_from_cwd's `gh repo view`.
 # An observer counts as live while `kill -0` reaches its pid, so a pid the OS has reused reads as
 # live until that process ends. The refusal names the pid. Two processes replacing one dead lock
 # at the same moment are kept apart by lock_reap; a third arriving in that same window can still
@@ -933,6 +934,7 @@ budget_endpoint() {
     # gh reads GH_REPO when no -R names one (`gh help environment`).
     [ -n "$repo" ] || repo="${GH_REPO:-}"
     [ -n "$repo" ] || return 0
+    repo="${repo#github.com/}"
     # `--job <id>` reads that job (the run id is optional then), so it is the endpoint.
     if [ -n "$job" ]; then
       printf 'repos/%s/actions/jobs/%s' "$repo" "$job"
@@ -946,7 +948,8 @@ budget_endpoint() {
 }
 
 # budget_scope: status 0 when the call in hand is in the budget: one of this script's OWN calls
-# (BUDGET_CALLER unset: `retry` alone sets it, around a caller's call), to github.com. The merge
+# to github.com (BUDGET_OUT unset: `retry` sets it around a caller's call, and the run await for a
+# repository its -R qualifies with another host). The merge
 # call is the script's own even with a caller's `gh pr merge` flags forwarded. A `retry` caller's arguments can name
 # any host, repository or command form gh accepts, and reading each of those right is not this
 # file's business: such a call is neither gated nor held, and its quota refusal is still exit 3.
@@ -954,7 +957,7 @@ budget_endpoint() {
 # and a GH_HOST naming another server (an Enterprise one, with a quota of its own) puts every
 # call outside the budget.
 budget_scope() {
-  [ -z "${BUDGET_CALLER:-}" ] && [ "${GH_HOST:-github.com}" = github.com ]
+  [ -z "${BUDGET_OUT:-}" ] && [ "${GH_HOST:-github.com}" = github.com ]
 }
 
 # budget_probe <endpoint>: one request to the endpoint with its headers (`gh api -i`), not through
@@ -4728,8 +4731,13 @@ cmd_run_watch() {
   started=$(date +%s)
   deadline=$((started + CHECKS_WAIT))
   beat=$started
-  # An observer of the run, which may wait a quota hold out within its ceiling.
+  # An observer of the run, which may wait a quota hold out within its ceiling. A repository named
+  # as HOST/OWNER/REPO on another host (gh run view's -R form) is that server's, with its own
+  # quota, and outside the budget.
   BUDGET_WAIT_UNTIL="$deadline"
+  case "$repo" in
+  */*/*) [ "${repo%%/*}" = github.com ] || BUDGET_OUT=1 ;;
+  esac
   while :; do
     line=$(gh_retry read run view "$run_id" --repo "$repo" --json status,conclusion \
       --jq '[.status, (.conclusion // "pending")] | @tsv')
@@ -4806,7 +4814,7 @@ cmd_retry() {
   fi
   local caller_args=unlisted
   gh_api_only_command "$@" && caller_args=listed
-  BUDGET_CALLER=1 GH_RETRY_CALLER_ARGS="$caller_args" gh_retry "$mode" "$@"
+  BUDGET_OUT=1 GH_RETRY_CALLER_ARGS="$caller_args" gh_retry "$mode" "$@"
   case "$?" in
   0) return 0 ;;
   2) die "gh $1 refused its own arguments and sent nothing: $(gh_err_line). That is a usage" \

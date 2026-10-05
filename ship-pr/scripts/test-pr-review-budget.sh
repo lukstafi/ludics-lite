@@ -690,6 +690,18 @@ test_an_out_of_scope_refusal_is_not_retried() {
   assert_eq "$(requests)" "read repos/$REPO/pulls/7 quota" "after one request"
 }
 
+# The run await's -R can name another host (HOST/OWNER/REPO): that server's quota is its own, so
+# its refusal sets no github.com hold. A github.com/OWNER/REPO name is github.com's.
+test_a_host_qualified_run_await_is_scoped_by_its_host() {
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 600))
+  run ghe cmd_retry run watch 55 -R ghe.example.com/o/r
+  assert_eq "$(rc ghe)" 3 "its refusal is UNKNOWN ($(err ghe))"
+  assert_eq "$(standing)" "" "and sets no hold"
+  assert_eq "$(budget_endpoint run view 55 --repo github.com/o/r)" "repos/o/r/actions/runs/55" \
+    "a github.com-qualified repository is probed at its own endpoint"
+}
+
 test_a_lock_that_cannot_be_made_is_an_error() {
   local rc=0
   reset_fixture
@@ -733,14 +745,14 @@ test_a_reap_keeps_a_lock_retaken_meanwhile() {
 test_a_callers_call_is_outside_the_budget() {
   reset_fixture
   QUOTA_UNTIL=$((T0 + 600))
-  run caller eval 'BUDGET_CALLER=1 GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
+  run caller eval 'BUDGET_OUT=1 GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
   assert_eq "$(rc caller)" 3 "a caller's quota refusal is still UNKNOWN ($(err caller))"
   assert_eq "$(standing)" "" "but sets no hold"
   assert_not_contains "$(requests)" "probe" "and probes nothing"
   QUOTA_UNTIL=0
   : >"$CALL_LOG"
   plant_hold "$((T0 + 600))" graphql 600
-  run caller2 eval 'BUDGET_CALLER=1 GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
+  run caller2 eval 'BUDGET_OUT=1 GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
   assert_eq "$(rc caller2)" 0 "a hold does not stop it ($(err caller2))"
 }
 
@@ -818,6 +830,7 @@ run_tests \
   test_a_forwarded_merge_is_still_gated \
   test_a_wait_behind_a_probe_marks_the_round \
   test_an_out_of_scope_refusal_is_not_retried \
+  test_a_host_qualified_run_await_is_scoped_by_its_host \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
