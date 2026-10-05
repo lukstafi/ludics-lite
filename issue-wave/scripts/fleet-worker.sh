@@ -126,7 +126,7 @@
 #                                                     # test-run.sh record on the reserved box
 #   fleet-worker.sh execution conclude --from-bg-run <run-dir> --request <id> --sha <sha>
 #                          [--box <box>] [--checkout <text>] [--evidence <text>]   # verdict and log
-#                          # read from a bg-run.sh directory (see conclude_from_bg_run for the mapping)
+#                          # read from a bg-run.sh directory (the mapping: lib/ludics/fleetworker/execution.py)
 #   fleet-worker.sh prs <owner/repo> [--wave <id>] [--flag-at <n>]   # open PRs with review rounds,
 #                          # CI state and head age; flags <n> (5) or more rounds (read-only)
 #   fleet-worker.sh halt <reason> | resume-launches | halted
@@ -155,10 +155,10 @@
 #   FLEET_LAB_HOST: box that runs wake-lab.sh and the lab's sweep, whose lock directory holds the
 #     lab's lane locks; mac-studio. A measurement on a lab box is refused, naming both, unless it is
 #     FLEET_ANCHOR (`local` in either reads as FLEET_LOCAL_BOX), since the registry reads the lane
-#     lock in the anchor's own lock directory (ludics-lite#454; fleet-execution.py's header).
+#     lock in the anchor's own lock directory (ludics-lite#454; the header of lib/ludics/fleetworker/registry.py).
 #   FLEET_BOXES: whole fleet; "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux". `ls` sweeps it minus local.
 #     One entry per physical box: the registry refuses a reservation under a roster naming two
-#     aliases of one box, read from wake-lab.sh's endpoint map (ludics-lite#395; endpoint_map).
+#     aliases of one box, read from wake-lab.sh's endpoint map (ludics-lite#395; endpoint_map in lib/ludics/fleetworker/execution.py).
 #   FLEET_BOX_CORRECTNESS_SLOTS: `<box>=<n>` pairs, how many correctness executions may share a
 #     box (ludics-lite#157); an unnamed box has one. "mac-studio=6" whenever the roster is the
 #     default one, beside "rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3" in the same
@@ -234,6 +234,34 @@ set -uo pipefail
 # two at the foot. scripts/check-parse-guards.sh holds the shape (ALSO_GUARDED), and
 # scripts/test-check-parse-guards.sh rewrites the file in place under a running copy.
 {
+
+# THE PORTED VERBS (ludics-lite#403) are served by Python: the coordinator lease (claim, release,
+# coordinator), the halt (halt, resume-launches, halted), the native gate, and every `execution`
+# action, `slot` and `hold` included -- lib/ludics/fleetworker, run through scripts/py (the first
+# Python >= 3.12) with this script's path as its first argument, so it finds the checkout as the
+# CHECKOUT line below does. Forwarded before any configuration is read here: the Python reads the
+# same environment itself. An `execution slot` keeps its pid through every hop (each is an exec),
+# so the pid a caller holds is still the batch's own.
+# The caller's PYTHONPATH rides along in LUDICS_FW_PYTHONPATH (`=<value>` when set, empty when
+# unset): scripts/py replaces PYTHONPATH with the checkout's lib/, and the Python puts the caller's
+# back before it runs anything, so a batch under `execution slot`/`hold` sees the environment it was
+# given -- a wrapper must not change a batch's verdict, nor hand it the `ludics` package.
+# One exception stays in this shell: `execution slot --probe` is answered below, before any
+# interpreter is looked for (THE PROBE WITHOUT PYTHON, at cmd_execution_slot_probe).
+case "${1:-}" in
+  gate | execution | halt | resume-launches | halted | claim | release | coordinator)
+    fw_probe=""
+    if [ "$1" = execution ] && [ "${2:-}" = slot ]; then
+      for fw_arg in "$@"; do
+        case "$fw_arg" in --probe) fw_probe=1 ;; --) break ;; esac
+      done
+    fi
+    if [ -z "$fw_probe" ]; then
+      if [ -n "${PYTHONPATH+set}" ]; then LUDICS_FW_PYTHONPATH="=$PYTHONPATH"; else LUDICS_FW_PYTHONPATH=""; fi
+      export LUDICS_FW_PYTHONPATH
+      exec "$(CDPATH='' cd -P "$(dirname "$0")/../.." 2>/dev/null && pwd -P)/scripts/py" -m ludics.fleetworker "$0" "$@"
+    fi ;;
+esac
 
 # Which fleet box this is, from the hostname unless FLEET_LOCAL_BOX says so; an unrecognized
 # host is local to nothing but the literal `local`, so every named box is reached over ssh.
@@ -1310,7 +1338,7 @@ base_checker() (
 # Exit 1 when the registry could not be read.
 integration_records() {
   local listing
-  listing=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py") || return 1
+  listing=$(execution_listing) || return 1
   jq -r --arg repo "$1" '.[]
     | select(.state == "concluded" and (.verdict == "pass" or .verdict == "fail")
              and .request.integration == true and .request.transport == "coordinator"
@@ -1396,27 +1424,6 @@ base_gate() {
     }
   fi
   return 0
-}
-
-cmd_gate() {
-  local force=0 target="" branch="" reason=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --allow-red-base)
-        [ "$#" -ge 2 ] && [[ "$2" =~ [^[:space:]] ]] || die "base gate: --allow-red-base requires a triage reason"
-        reason="$2"; shift ;;
-      --force) force=1 ;;
-      --target-repo|--base-branch)
-        [ "$#" -ge 2 ] && [ -n "$2" ] || die "gate: expected value for $1"
-        if [ "$1" = --target-repo ]; then target="$2"; else branch="$2"; fi
-        shift ;;
-      *) die "gate: expected --target-repo <owner/repo> [--base-branch <branch>] [--force]" ;;
-    esac
-    shift
-  done
-  anchor_gate GATE native-worker "$force" || return $?
-  base_gate "$target" "$branch" "$force" "$reason" || return $?
-  anchor_gate GATE native-worker "$force"
 }
 
 cmd_launch() {
@@ -2285,7 +2292,7 @@ cmd_prs() {
   helper="$CHECKOUT/ship-pr/scripts/pr-review.sh"
   [ -x "$helper" ] || { echo "PRS REFUSED: ship-pr's pr-review.sh missing: $helper"; exit 1; }
   if [ -n "$wave" ]; then
-    list=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"); rc=$?
+    list=$(execution_listing); rc=$?
     if unreachable "$rc"; then echo "PRS UNREACHABLE $ANCHOR: the registry naming wave $wave's issues did not answer"; exit 4; fi
     [ "$rc" -eq 0 ] || { printf '%s\n' "$list"; echo "PRS REFUSED: the anchor's registry could not be read"; exit 1; }
     issues=$(jq -c --arg w "$wave" '[.[] | select(.request.wave == $w) | .request.issue] | unique' <<<"$list") ||
@@ -2351,214 +2358,15 @@ cmd_prs() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Far-side: take the lease lock (shared with claim --take and release), verify the caller
-# still holds the lease, then run the mutation. Args: verb token lockwait, then the action's.
-lease_mutation_prelude() {
-  cat <<'EOF'
-verb="$1" token="$2" lockwait="$3"; shift 3
-mkdir -p "$ANCHOR_STATE" 2>/dev/null; lease="$ANCHOR_STATE/COORDINATOR"; lock="$lease.lock"
-msg=$(take_lock "$lock" "$lockwait" "$verb FAILED: lease lock on $BOX") || { echo "$msg"; exit 1; }
-trap 'release_lock "$lock"' EXIT
-held=$(sed -n 's/^token=//p' "$lease" 2>/dev/null); hhost=$(sed -n 's/^host=//p' "$lease" 2>/dev/null)
-[ -n "$token" ] && [ "$held" = "$token" ] || { echo "$verb REFUSED fleet: coordinator lease held by ${hhost:-nobody} -- not you (adopted since your gate?)"; exit 1; }
-EOF
-}
-
-# JSON payloads travel as quoted positional arguments. The helper executes on the anchor
-# while the existing lease lock fences both adoption and concurrent reservations.
-# Far side of `conclude --from-run`, on the execution box: read a finished test-run.sh record
-# (OCANNL's `tools/test-run.sh`: `exit`, `log`, `wt` and `cmd` under the run directory) and
-# the checkout's head, and refuse anything short of a published verdict with no process left.
-# Since ocannl-staging#808 the record also names the source it ran, as launch-time facts: `head`
-# (the checkout's HEAD commit) and `dirty` (its `git status --porcelain=v1
-# --untracked-files=normal`, empty when clean), `dirty` written first, so the writer leaves both
-# or neither (ludics-lite#438). Both present: `head` must be the reported sha (a record of another
-# revision is refused, naming both) and `dirty` empty (a run over uncommitted edits is evidence
-# for no commit, so it is refused with their count). Neither: an older record or a run outside a
-# checkout, concluded on the reported sha alone, as before, and said so (`record=none`). One
-# without the other, or a `head` that is not one hex object ID, is malformed and refused.
-# Args: run-dir, reported sha. Prints `exit=`, `wt=`, `head=`, `record=` lines, or one FROM-RUN
-# REFUSED line.
-from_run_script() {
-  cat <<'EOF'
-dir="$1" sha="$2"
-refuse() { echo "FROM-RUN REFUSED: $*"; exit 1; }
-[ -d "$dir" ] || refuse "no run directory $dir on $BOX"
-for f in exit log wt cmd; do
-  [ -f "$dir/$f" ] || refuse "$dir has no $f (the run is unfinished, died without a verdict, or is not a test-run.sh record)"
-done
-code=$(head -n1 "$dir/exit"); case "$code" in ''|*[!0-9]*) refuse "$dir/exit holds '$code', not a status" ;; esac
-wt=$(head -n1 "$dir/wt"); [ -d "$wt" ] || refuse "recorded worktree $wt is gone"
-# The project's runner is the authority on "published and no process remains" (exit 0; 3 still
-# running, 1 died); without it, the supervisor pid must be gone.
-if [ -x "$wt/tools/test-run.sh" ]; then
-  (cd "$wt" && tools/test-run.sh status "$dir" >/dev/null 2>&1); st=$?
-  [ "$st" -eq 0 ] || refuse "tools/test-run.sh status $dir exit $st: not a finished run"
-elif [ -s "$dir/pid" ] && kill -0 "$(head -n1 "$dir/pid")" 2>/dev/null; then
-  refuse "supervisor pid $(head -n1 "$dir/pid") of $dir is still alive"
-fi
-if [ -e "$dir/head" ] && [ -e "$dir/dirty" ]; then
-  [ -f "$dir/head" ] && [ -f "$dir/dirty" ] || refuse "$dir/head or $dir/dirty is not a regular file: a malformed record"
-  rhead=$(cat "$dir/head")
-  case "$rhead" in ''|*[!0-9a-f]*) refuse "$dir/head holds '$rhead', not one commit ID: a malformed record" ;; esac
-  [ "$rhead" = "$sha" ] || refuse "$dir/head records $rhead as the revision launched, but the reported revision is $sha: this run is evidence for $rhead, not $sha"
-  if [ -s "$dir/dirty" ]; then
-    n=$(grep -c '' "$dir/dirty")
-    refuse "$dir/dirty lists $n uncommitted path(s) at launch: the run tested $sha plus those edits, so it is not evidence for $sha; conclude it with a JSON payload whose evidence says so"
-  fi
-  record=launch
-elif [ -e "$dir/head" ]; then
-  refuse "$dir has a head but no dirty: a malformed record (test-run.sh writes dirty first, so both or neither)"
-elif [ -e "$dir/dirty" ]; then
-  refuse "$dir has a dirty but no head: a malformed record (test-run.sh writes head after dirty, so both or neither)"
-else
-  record=none
-fi
-head=$(git -C "$wt" rev-parse --verify HEAD^{commit} 2>/dev/null) || refuse "cannot read HEAD of $wt"
-# With no launch record the revision that ran is the coordinator's to name (--sha, from the
-# worker's result line). Either way the checkout has to KNOW that commit, and its head now is
-# reported so a conclusion over a moved checkout says so in its evidence.
-git -C "$wt" cat-file -e "$sha^{commit}" 2>/dev/null || refuse "$wt does not contain the reported revision $sha"
-printf 'exit=%s\nwt=%s\nhead=%s\nrecord=%s\n' "$code" "$wt" "$head" "$record"
-EOF
-}
-
-# execution_listing <helper>: the anchor's whole registry as JSON on stdout. `list` takes no
-# lease and mutates nothing, so a worker with no coordinator identity may read it.
+# execution_listing: the anchor's whole registry as JSON on stdout, read through the ported
+# `execution list` (lib/ludics/fleetworker), which ships the registry to the anchor. Its exit
+# status is the far side's, as run_on gave it, so callers keep reading 255 as an anchor that never
+# answered: the Python says that with exit 4 and a line of its own, which is mapped back here.
 execution_listing() {
-  { prelude "$ANCHOR"; printf 'shift 3\n'
-    cat <<'EXECUTION_COMMAND'
-python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
-EXECUTION_COMMAND
-    cat "$1"; printf '\nFLEET_EXECUTION_PY\n'
-  } | run_on "$ANCHOR" EXECUTION x x list x x '{}' "$BOXES" "$SLOTS"
-}
-
-# execution_host_of <helper> <request-id>: the reserved execution host of an outstanding record,
-# from the anchor's registry (empty when unknown; the conclusion then fails on the request id).
-execution_host_of() {
-  local listing
-  listing=$(execution_listing "$1") || return 1
-  jq -r --arg id "$2" '.[] | select(.request_id == $id) | .request.execution_host' <<<"$listing"
-}
-
-# conclude_from_run <run-dir> <request-id> <box> <sha> <evidence>: the conclude payload (JSON on
-# stdout) read off a finished run record on the box, or a refusal line on stdout and exit 1/4.
-# The box is the reservation's execution host: the payload names it and the registry checks it,
-# so a record read on the wrong machine cannot conclude another box's assignment.
-conclude_from_run() {
-  local dir="$1" request="$2" box="$3" sha="$4" evidence="$5" facts rc code wt head record verdict
-  facts=$({ prelude "$box"; from_run_script; } | run_on "$box" "$dir" "$sha"); rc=$?
-  if unreachable "$rc"; then echo "FROM-RUN UNREACHABLE $box: nothing concluded"; return 4; fi
-  [ "$rc" -eq 0 ] || { printf '%s\n' "$facts"; return 1; }
-  code=$(sed -n 's/^exit=//p' <<<"$facts"); wt=$(sed -n 's/^wt=//p' <<<"$facts"); head=$(sed -n 's/^head=//p' <<<"$facts")
-  record=$(sed -n 's/^record=//p' <<<"$facts")
-  [[ "$head" =~ ^[0-9a-f]{40}$ ]] && [ -n "$code" ] && [ -n "$wt" ] && { [ "$record" = launch ] || [ "$record" = none ]; } ||
-    { echo "FROM-RUN REFUSED: unreadable record facts from $box: $facts"; return 1; }
-  # test-run.sh's exit vocabulary: 142 the cap, 129/130/137/143 a signal; every other nonzero
-  # (dune's own 1, a refused invocation, 126/127 toolchain) is a failed run.
-  case "$code" in 0) verdict=pass ;; 142) verdict=timeout ;; 129|130|137|143) verdict=cancelled ;; *) verdict=fail ;; esac
-  [ -n "$evidence" ] || evidence="test-run.sh record $dir on $box: exit $code published, no process remains"
-  if [ "$record" = launch ]; then
-    evidence="$evidence; launched at $sha on a clean tree (the record's head and dirty)"
-  else
-    evidence="$evidence; the record has no head or dirty (a run before test-run.sh recorded them, or outside a checkout), so the revision is $sha as reported by the worker"
-  fi
-  [ "$head" = "$sha" ] || evidence="$evidence; checkout head is now $head"
-  jq -cn --arg id "$request" --arg ev "$evidence" --arg sha "$sha" --arg wt "$wt" --arg host "$box" \
-    --arg handle "test-run:$(basename "$dir")" --arg log "$dir/log" --arg verdict "$verdict" \
-    '{request_id: $id, evidence: $ev, observed_sha: $sha, remote_checkout: $wt, handle: $handle, log: $log, verdict: $verdict, execution_host: $host}'
-}
-
-# Far side of `conclude --from-bg-run`, on the box that holds the directory: bg-run.sh's own `wait
-# <dir> --within 0` gives the verdict, so the directory contract (bg-run.sh's header: `refused`
-# before `rc`, liveness from `pid`/`cpid`) keeps one reader. The coordinator's copy of bg-run.sh
-# travels in this script (arg 1 is its path here), so the far box's skills checkout, which only
-# `launch`/`preflight`/`execution run` refresh, cannot read the directory with another version.
-# The one thing read past `wait` is the runner's own exit sentinel in `log`. Its grammar is a
-# fail-closed allowlist: a whole line `exit: <status>` or `<name>: exit: <status>`, the name
-# [A-Za-z0-9._-]+ and the status 0-255 without leading zeros -- what OCANNL's tools/test-run.sh
-# (`exit: N`), machine-verify-far.sh (`machine-verify: exit: N`) and ci-compiler-test.sh print. The
-# LAST such line wins. Deliberately not read: a transport line with a second word
-# (`machine-verify: ssh exit: N`, which restates rc), a line with trailing text or a CR, and
-# anything else in the log. Prints `status=rc`, `rc=` and `sentinel=` lines, or one FROM-BG-RUN
-# REFUSED line.
-from_bg_run_script() {
-  cat <<'EOF'
-dir="$1"
-refuse() { echo "FROM-BG-RUN REFUSED: $*"; exit 1; }
-[ -d "$dir" ] || refuse "no run directory $dir on $BOX"
-tmp=$(mktemp "${TMPDIR:-/tmp}/fw-bg-run.XXXXXX") || refuse "cannot create a scratch file on $BOX"
-bash -s -- wait "$dir" --within 0 > "$tmp" 2>&1 <<'FLEET_BG_RUN_SH'
-EOF
-  cat "$1"
-  cat <<'EOF'
-FLEET_BG_RUN_SH
-wrc=$?
-said=$(head -n1 "$tmp"); rm -f "$tmp"
-case "$wrc" in
-  0) ;;
-  3) refuse "bg-run.sh wait: RUNNING -- $dir has no rc and its task or command is alive; conclude once it finishes" ;;
-  4) refuse "bg-run.sh wait: STARTING -- no task has published a pid in $dir (never started, or not yet)" ;;
-  # DIED is never a conclusion: bg-run.sh's header names a window where it is wrong (a wrapper
-  # killed alone before its command published `cpid`), and no pause bounds how late the command
-  # may still publish and run. The coordinator checks for the run's processes itself.
-  5) refuse "bg-run.sh wait: DIED -- the task was killed before the command returned; bg-run cannot rule out a command that outlived it unpublished, so make sure no process of the run remains, then conclude it with a JSON payload (cancelled)" ;;
-  6) refuse "bg-run.sh wait: $said -- start refused this directory, so an rc there may be an earlier run's" ;;
-  *) refuse "bg-run.sh wait exit $wrc: $said" ;;
-esac
-code=${said#rc=}
-case "$said" in rc=*) ;; *) refuse "bg-run.sh wait printed '$said', not rc=<status>" ;; esac
-case "$code" in ''|*[!0-9]*) refuse "$dir/rc holds '$code', not a status" ;; esac
-[ -f "$dir/log" ] || refuse "$dir has an rc but no log"
-sentinel=$(LC_ALL=C grep -a -E '^([A-Za-z0-9._-]+: )?exit: (0|[1-9][0-9]?|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$' "$dir/log" | tail -n 1)
-printf 'status=rc\nrc=%s\nsentinel=%s\n' "$code" "$sentinel"
-EOF
-}
-
-# conclude_from_bg_run <run-dir> <request-id> <read-box> <execution-host> <sha> <checkout> <evidence>
-# <bg-run.sh path>: the conclude payload (JSON on stdout) read off a bg-run.sh directory, or a
-# refusal line on stdout and exit 1/4. The verdict mapping, stated once here and in the help text:
-#   - the code is the runner's own sentinel when the log carries one and it is nonzero, else rc --
-#     so a pass needs BOTH rc 0 and no nonzero sentinel, and a wrapper that swallowed a failure
-#     (or a runner whose status a pipe or tee replaced) cannot conclude as pass;
-#   - 0 pass; 124 (timeout(1), fleet-worker's `bounded`) and 142 (test-run.sh's cap) timeout;
-#     129/130/137/143 (a signal) cancelled; anything else fail;
-#   - bg-run's DIED is refused, not mapped (from_bg_run_script says why), as are RUNNING,
-#     STARTING and REFUSED.
-# The read box need not be the execution host: a trip driven over ssh (machine-verify from the
-# agent host) leaves its directory on the box that drove it, and 5 of the 09-25 wave's 8
-# bg-run conclusions were of that shape. So the payload carries no `execution_host` binding (the
-# registry would refuse the driving box), and the log and handle name the box read instead,
-# `<box>:<path>`. bg-run keeps no checkout: `--checkout` names one, and as the caller's explicit
-# statement it replaces any the record carries; without it a checkout already on the record is
-# kept, and otherwise the field says it was not recorded.
-conclude_from_bg_run() {
-  local dir="$1" request="$2" box="$3" host="$4" sha="$5" checkout="$6" evidence="$7" bgrun="$8"
-  local facts rc status code sentinel scode verdict note=""
-  facts=$({ prelude "$box"; from_bg_run_script "$bgrun"; } | run_on "$box" "$dir"); rc=$?
-  if unreachable "$rc"; then echo "FROM-BG-RUN UNREACHABLE $box: nothing concluded"; return 4; fi
-  [ "$rc" -eq 0 ] || { printf '%s\n' "$facts"; return 1; }
-  status=$(sed -n 's/^status=//p' <<<"$facts")
-  case "$status" in
-    rc)
-      code=$(sed -n 's/^rc=//p' <<<"$facts"); sentinel=$(sed -n 's/^sentinel=//p' <<<"$facts")
-      [[ "$code" =~ ^[0-9]+$ ]] || { echo "FROM-BG-RUN REFUSED: unreadable run facts from $box: $facts"; return 1; }
-      note="bg-run $dir on $box: rc=$code"
-      if [ -n "$sentinel" ]; then
-        scode=${sentinel##*exit: }
-        note="$note, runner sentinel '$sentinel'"
-        [ "$scode" = 0 ] || code="$scode"
-      fi
-      case "$code" in 0) verdict=pass ;; 124|142) verdict=timeout ;; 129|130|137|143) verdict=cancelled ;; *) verdict=fail ;; esac
-      note="$note; the command returned" ;;
-    *) echo "FROM-BG-RUN REFUSED: unreadable run facts from $box: $facts"; return 1 ;;
-  esac
-  [ -n "$evidence" ] || evidence="$note; revision $sha as reported by the worker"
-  [ "$box" = "$host" ] || evidence="$evidence; directory read on $box, which drove the run on $host"
-  jq -cn --arg id "$request" --arg ev "$evidence" --arg sha "$sha" --arg co "$checkout" \
-    --arg handle "bg-run:$box:$dir" --arg log "$box:$dir/log" --arg verdict "$verdict" \
-    '{request_id: $id, evidence: $ev, observed_sha: $sha, remote_checkout: $co, handle: $handle, log: $log, verdict: $verdict}'
+  "$CHECKOUT/scripts/py" -m ludics.fleetworker "$0" execution list
+  local rc=$?
+  [ "$rc" -ne 4 ] || return 255
+  return "$rc"
 }
 
 # in_roster <name>: is that an exact FLEET_BOXES entry? The registry refuses an execution host
@@ -2603,446 +2411,20 @@ box_spec_count() {
   echo "$found"
 }
 
-# `execution slot [--wait <seconds>] -- <command...>`: the RUN-TIME half of the correctness cap
-# (ludics-lite#160). The registry reservation is ownership and evidence, held for a worker's whole
-# life including its review waits, so counting it against the box's slots capped agents in flight
-# rather than concurrent load -- on 2026-09-16 a fourth worker was refused a standing reservation
-# while the three holding the slots were reading their briefs and nothing was running at all. So a
-# standing record consumes no slot (`"standing": true` in the reservation), and the slots are taken
-# HERE instead, by the worker itself, around one suite or batch.
-#
-# The lock is a real flock, N holders: one file per slot under the box's own state directory, and
-# the holder is the open descriptor, inherited across the exec of the wrapped command. That is why
-# there is no stale-lock reclaim to get wrong -- the kernel drops the lock when the process dies,
-# however it dies, including a kill -9 of a whole batch. The repository's own mkdir `take_lock`
-# could not serve: it is defined in the far-side prelude, for scripts shipped to a box, and this
-# lock has to outlive the acquiring process's exec on THIS box. There is no --box for the same
-# reason: a slot on another machine would be a lock on the wrong disk.
-#
-# THE GPU TOKENS (ludics-lite#391). On rog-nv-linux the bound is the GPU's 12 GiB, not the box:
-# three concurrent cuda batches ran out of device memory, while two ran clean beside two cc
-# batches. So where FLEET_BOX_GPU_TOKENS gives a box T tokens, fewer than its slots, the first T
-# slot files are its GPU tokens: a GPU batch may take only slot.1..slot.T, and a batch declared
-# `--cpu` takes the highest free slot, reaching the GPU ones last. Two properties follow, and both
-# are why this is not a second lock pool beside the slots:
-#   - fail-closed: a batch is a GPU batch unless it declares `--cpu` (`--gpu` says the default),
-#     so one whose caller forgot to declare it is still held to T, and a CPU batch that forgot
-#     only waits longer;
-#   - safe across the switch: the script before #391 gave rog-nv-linux two slots and took the
-#     first free one, so a batch it started holds slot.1 or slot.2 -- which this version counts as
-#     a token. A separate token pool would have seen two free tokens beside two such batches and
-#     let four cuda batches onto the GPU while the box's checkout moved from one version to the
-#     other.
-# The cost is fragmentation: a CPU batch that fell back into a GPU slot keeps it until it ends,
-# even after a higher slot frees. A GPU batch waiting on a token holds no slot meanwhile. Where a
-# box has as many tokens as slots nothing binds, and every batch takes the first free slot as
-# before, so every box but the one the token spec narrows is unchanged.
-#
-# THE NESTED SLOT (ahrefs/ocannl#1004). A project runner may take the slot itself (OCANNL's
-# tools/test-run.sh does, declaring --cpu from the backend it resolves), so no brief has to name
-# the wrapper and no worker can forget it -- but a worker that still wraps the runner would then
-# hold two slots for one batch, and four such workers on a four-slot box would each hold one and
-# wait for another until the deadline refused them all. So a held slot exports FLEET_SLOT_HELD
-# (`<box> <slot> <slots> <gpu|cpu>`, the last saying whether that slot may hold the GPU) to the
-# command, and an `execution slot` that finds it runs its command under the enclosing slot rather
-# than taking a second one: no flock, no registry read (the enclosing take made it), no second
-# sleep guard. The marker is judged, never trusted: it must name this box and a slot this spec
-# has, and that slot must be held NOW (a non-blocking flock on it must fail), so a marker exported
-# by hand, or outliving its batch, is said so and ignored and a slot is taken as usual. Whether
-# the slot may hold the GPU is judged from the current token spec, not from the marker's own word,
-# and a GPU batch inside a slot an enclosing batch took as --cpu is refused: the enclosing
-# declaration was wrong, and running would put a GPU batch past the tokens.
-#
-# The measurement check is a point-in-time gate read from the anchor's registry, exactly as
-# `execution dispatch` is: it refuses to start a batch beside an outstanding measurement, and
-# a measurement reserved afterwards is the registry's exclusivity to enforce, not this lock's.
-# The one batch it admits there is the measurement's own, run inside that measurement's
-# `execution hold --request` (THE MEASUREMENT'S OWN RUN, at `execution hold`).
-#
-# EVERY correctness run on the box goes through this lock, an assigned one (a full suite, a
-# cross-box leg) exactly as much as a standing worker's batch: it is the single run-time
-# mechanism, and the registry's reservation cap stays a bound on how many non-standing
-# assignments may be QUEUED there. Subtracting outstanding assignments from the cap here would
-# re-introduce the very thing #160 removes - a run refused because of a record that is not
-# running, its own included.
-#
-# Inside the slot the command runs under the OS-level sleep guard `execution hold` takes
-# (ludics-lite#317, below), so a correctness batch on a native Linux box carries the guard a
-# measurement does, for exactly as long as the batch runs. One Python program serves both
-# subcommands; `slot` is `hold` plus the flock.
-# Exit: the wrapped command's own status; 1 with a line beginning `EXECUTION SLOT REFUSED` (no
-# free slot or GPU token before the deadline, an outstanding measurement, a malformed spec); 4 when the
-# anchor's registry could not be read; 127 when the command itself could not be run. The command
-# is exec'd and not interpreted, so a pipeline or a builtin goes as `sh -c '...'`.
-#
-# THE GUARD (ludics-lite#317). Under WSL the Windows-side holder kept a lane's box alive; on
-# native Ubuntu nothing at the OS level stopped another session's `wake-lab.sh sleep`, or an idle
-# suspend, from taking a box out from under a running worker, because the lab locks are advisory
-# and bind only sessions that go through wake-lab.sh. A logind BLOCK inhibitor on sleep:idle is
-# the OS-side answer: systemd 259's `systemctl --check-inhibitors=yes suspend` (wake-lab.sh's
-# path) refuses on any `block` inhibitor covering sleep, the caller's own uid included -- only
-# `block-weak` exempts the same user, which is why the mode here is `block` -- and logind itself
-# refuses a suspend request from anyone without `suspend-ignore-inhibit`, a GDM greeter's
-# included.
-#
-# The inhibitor is held by a HELPER beside the command, never by a wrapper around it, and that
-# shape is forced by what systemd-inhibit does to the process it runs (measured on rog-nv-linux,
-# systemd 259): it closes every descriptor above 2 in its child, so a batch run UNDER it would
-# no longer inherit the slot's flock; it SIGTERMs that child when it dies itself; and it turns a
-# command killed by a signal into exit 1 and adds a "<cmd> failed with exit status <n>." line --
-# a wrapper that changes verdicts, and a PID that is not the workload's, so killing `$!` would
-# kill systemd-inhibit and not the batch (PR #323 review, round 1). So the helper is
-# `systemd-inhibit ... -- sh -c 'echo HELD; exec cat'`, reading a LIFETIME PIPE whose write end
-# the command inherits, and the command is exec'd exactly as before, on this PID, with the flock:
-# the inhibitor then lives as long as anything in the command's process tree holds that pipe --
-# the same lifetime as the flock, ended by the kernel however the tree ends, including a kill -9
-# of the command alone. The helper is double-forked so it is never the command's child: a
-# workload that waits for all of its children would otherwise wait on it forever. It reports
-# through a readiness pipe -- HELD once the inhibitor is taken, or systemd-inhibit's own refusal
-# and EOF -- and the command starts only after that answer, so there is no window in which the
-# run has started and the box is not yet held.
-#
-# Fail-open, and loudly. An unprivileged ssh session is a REMOTE subject to polkit, so
-# `org.freedesktop.login1.inhibit-block-sleep` falls under its `allow_any`, which stock Ubuntu
-# sets to auth_admin_keep: until the box's one-time polkit grant is installed (executions.md,
-# "The OS-level sleep guard") the request is denied. A run refused for that would stop every
-# batch on the box over a setup step, so a denial prints a WARNING naming it and runs the command
-# bare -- exactly as it runs on macOS, or on a Linux host with no systemd-inhibit at all.
-# No `--no-ask-password`: systemd-inhibit gained it in v257, so 255 (Ubuntu 24.04) and 256 reject
-# it as an unknown option, which would turn every hold there into the unguarded path (PR #323
-# review, round 1). It is not needed either: the helper's stdio are pipes, so systemd-inhibit has
-# no terminal to start a polkit agent on, and a denial comes back at once.
-run_py() {
-  cat <<'RUN_PY'
-import fcntl, os, select, shutil, signal, sys, time
-mode, box = sys.argv[1], sys.argv[2]
-if mode == "slot":
-    directory, cap, tokens, cpu = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == "cpu"
-    wait, inhibitor = int(sys.argv[7]), sys.argv[8]
-    why, command = "", sys.argv[9:]
-    prefix = "EXECUTION SLOT"
-elif mode == "nested":
-    # Judge an enclosing `execution slot`'s marker (THE NESTED SLOT, above) and print the verdict
-    # as one word on stdout: `inside` (run the command under it) or `take` (take a slot of one's
-    # own); a refusal prints its line and exits 1. It never runs the command, so no status the
-    # command could return is ever read as a verdict.
-    directory, cap, tokens, cpu = sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == "cpu"
-    marker, inhibitor, why, command = sys.argv[7], "", "", sys.argv[8:]
-    prefix = "EXECUTION SLOT"
-elif mode == "measured":
-    # Judge an enclosing `execution hold --request`'s marker (THE MEASUREMENT'S OWN RUN, at
-    # `execution hold`) against the registry's outstanding measurements on this box (", "-joined;
-    # "-" for the probe, which reads no registry) and print `inside` or `take`, as `nested` does;
-    # for the probe, the request id or nothing.
-    directory, marker, measuring = sys.argv[3], sys.argv[4], sys.argv[5]
-    inhibitor, why, command = "", "", sys.argv[6:]
-    prefix = "EXECUTION SLOT"
-elif mode == "bare":
-    # The command alone, as `slot` runs it once the slot is held: the enclosing batch holds both
-    # the slot and the sleep guard.
-    inhibitor, why, command = "", "", sys.argv[3:]
-    prefix = "EXECUTION SLOT"
-else:
-    # hold: <inhibitor> <why> <measurement lock or ""> <marker or ""> <slot count> <command...>
-    inhibitor, why, hold_lock, hold_marker = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
-    hold_cap, command = int(sys.argv[7]), sys.argv[8:]
-    prefix = "EXECUTION HOLD"
-HOLD_WAIT = 30  # seconds for systemd-inhibit to answer HELD or refuse; it answers at once
-
-def refuse_unrunnable(exc):
-    print("%s REFUSED %s: cannot run %s: %s" % (prefix, box, command[0], exc))
-    sys.exit(127)
-
-def start_guard(why):
-    """Take the sleep:idle block inhibitor in a helper; return the lifetime pipe's write end, or None."""
-    sys.stdout.flush(); sys.stderr.flush()  # nothing buffered may be written twice by a fork
-    if len(why) > 160:  # one line of `systemd-inhibit --list` and of `wake-lab.sh status`
-        why = why[:157] + "..."
-    life_r, life_w = os.pipe()
-    ready_r, ready_w = os.pipe()
-    middle = os.fork()
-    if middle == 0:
-        helper = os.fork()
-        if helper == 0:
-            try:
-                os.dup2(life_r, 0); os.dup2(ready_w, 1); os.dup2(ready_w, 2)
-                os.closerange(3, 65536)  # the slot flock, the lifetime pipe's write end, all of it
-                signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-                os.execv(inhibitor, [inhibitor, "--what=sleep:idle", "--mode=block", "--who=fleet-worker",
-                                     "--why=" + why, "--", "sh", "-c", "echo HELD; exec cat >/dev/null"])
-            finally:
-                os._exit(127)
-        os.write(ready_w, ("PID %d\n" % helper).encode())
-        os._exit(0)
-    os.waitpid(middle, 0)
-    os.close(life_r); os.close(ready_w)
-    text, helper, held = b"", None, False
-    deadline = time.monotonic() + HOLD_WAIT
-    while not held:
-        left = deadline - time.monotonic()
-        if left <= 0 or not select.select([ready_r], [], [], left)[0]:
-            text += b"no answer from systemd-inhibit after %ds" % HOLD_WAIT
-            break
-        chunk = os.read(ready_r, 4096)
-        if not chunk:
-            break
-        text += chunk
-        lines = text.split(b"\n")
-        held = b"HELD" in lines
-        for line in lines:
-            if line.startswith(b"PID "):
-                helper = int(line[4:])
-    os.close(ready_r)
-    if held:
-        sys.stderr.write("EXECUTION HOLD %s: sleep:idle block inhibitor held for: %s\n" % (box, why))
-        os.set_inheritable(life_w, True)
-        return life_w
-    if helper is not None:
-        try:
-            os.kill(helper, signal.SIGTERM)
-        except OSError:
-            pass
-    os.close(life_w)
-    detail = b" ".join(l for l in text.split(b"\n") if l and not l.startswith(b"PID ")).decode("utf-8", "replace")
-    sys.stderr.write("EXECUTION HOLD %s: WARNING: running WITHOUT a sleep inhibitor, so nothing at the OS level"
-                     " stops a suspend under it -- %s refused: %s (the one-time polkit grant:"
-                     " issue-wave/references/executions.md, \"The OS-level sleep guard\")\n"
-                     % (box, inhibitor, detail[:200]))
-    return None
-
-def run(why):
-    # Resolved before the guard: a command that cannot be found takes no inhibitor.
-    if shutil.which(command[0]) is None:
-        refuse_unrunnable("no such executable")
-    if inhibitor:
-        start_guard(why)
-    sys.stderr.flush()
-    try:
-        # Python ignores SIGPIPE, and an IGNORED disposition survives exec: without this the
-        # wrapped batch would see `yes | head -n1` exit 1 with a "Broken pipe" diagnostic
-        # where the same script run directly exits 141. A wrapper must not change verdicts.
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-        os.execvp(command[0], command)
-    except OSError as exc:
-        # A script whose interpreter is missing passes the lookup above and fails here.
-        refuse_unrunnable(exc)
-
-if mode == "hold":
-    if hold_lock:
-        # THE DRAIN (ludics-lite#481, at `execution hold`): every slot of the box, before the
-        # runner starts and for as long as its tree runs, so a batch that was running or waiting
-        # for a slot when the measurement was reserved ends before the measurement begins and
-        # none starts beside it. Before the marker's lock, so a nested slot of such a batch is
-        # still judged as it was until the batch ends. Fail-open and loud, as the marker is.
-        directory = os.path.dirname(hold_lock)
-        indices = set(range(1, hold_cap + 1))
-        try:
-            indices.update(int(name[5:]) for name in os.listdir(directory)
-                           if name.startswith("slot.") and name[5:].isdigit())
-        except OSError:
-            pass
-        # A hold nested in a live hold of this same measurement finds the slots held by its
-        # enclosing one, and waiting for them would wait for itself.
-        if os.environ.get("FLEET_MEASUREMENT_HELD") == hold_marker:
-            try:
-                descriptor = os.open(hold_lock, os.O_RDWR)
-            except OSError:
-                pass
-            else:
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError:
-                    indices = set()
-                os.close(descriptor)
-        for index in sorted(indices):
-            try:
-                descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_CREAT | os.O_RDWR, 0o644)
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    sys.stderr.write("EXECUTION HOLD %s: measurement %s waits for the batch in slot %d to end\n"
-                                     % (box, hold_marker.split()[1], index))
-                    sys.stderr.flush()
-                    fcntl.flock(descriptor, fcntl.LOCK_EX)
-                os.set_inheritable(descriptor, True)
-            except OSError as exc:
-                sys.stderr.write("EXECUTION HOLD %s: WARNING: slot %d is not held for the measurement, so a batch"
-                                 " may run beside it -- %s\n" % (box, index, exc))
-        # The measurement's marker and the lock that proves it live (THE MEASUREMENT'S OWN RUN,
-        # at `execution hold`): shared, so a second hold of the same measurement is not refused,
-        # and held on a descriptor every process of the command's tree inherits, so the kernel
-        # drops it when the last of them ends, as it drops a slot's. Fail-open and loud, as the
-        # guard is: a lock that cannot be taken costs the runner's own slot, never the measurement.
-        try:
-            descriptor = os.open(hold_lock, os.O_CREAT | os.O_RDWR, 0o644)
-            fcntl.flock(descriptor, fcntl.LOCK_SH)
-            os.set_inheritable(descriptor, True)
-        except OSError as exc:
-            sys.stderr.write("EXECUTION HOLD %s: WARNING: no measurement marker, so an `execution slot`"
-                             " inside this hold is refused -- cannot lock %s: %s\n" % (box, hold_lock, exc))
-        else:
-            os.environ["FLEET_MEASUREMENT_HELD"] = hold_marker
-            sys.stderr.write("EXECUTION HOLD %s: measurement %s held; an `execution slot` inside it runs"
-                             " under this hold\n" % (box, hold_marker.split()[1]))
-    run(why)
-
-if mode == "measured":
-    def judged():
-        """The request id an `execution slot` here runs inside, or the reason it does not."""
-        fields = marker.split()
-        if len(fields) != 2:
-            return None, "malformed"
-        if fields[0] != box:
-            return None, "another box's"
-        note = ""
-        if measuring != "-":
-            outstanding = [i for i in measuring.split(", ") if i]
-            if not outstanding:
-                # Its measurement is concluded (or never was) while its runner still runs. The live
-                # hold holds every slot of the box (THE DRAIN), so a slot of its own would wait for
-                # that very hold; under it the batch has the box, which is all a slot would give it.
-                note = "the registry has no outstanding measurement %s on %s" % (fields[1], box)
-            elif fields[1] not in outstanding:
-                return None, "the registry has no outstanding measurement %s on %s" % (fields[1], box)
-            elif outstanding != [fields[1]]:
-                return None, "other measurements are outstanding on %s too: %s" % (box, measuring)
-        # The hold must be live NOW, as an enclosing slot must be: a marker copied into a shell by
-        # hand, or left behind by a process that outlived its hold, is not running inside it.
-        try:
-            descriptor = os.open(os.path.join(directory, "measurement.lock"), os.O_RDWR)
-        except OSError:
-            return None, "no `execution hold --request` has run on %s" % box
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(descriptor)
-            return fields[1], note
-        os.close(descriptor)
-        return None, "no `execution hold --request` is live on %s" % box
-    request, reason = judged()
-    if measuring == "-":
-        print(request or "")
-        sys.exit(0)
-    if request is None:
-        sys.stderr.write("EXECUTION SLOT %s: FLEET_MEASUREMENT_HELD=%r does not cover this batch (%s)\n"
-                         % (box, marker, reason))
-        print("take")
-        sys.exit(0)
-    if reason:
-        sys.stderr.write("EXECUTION SLOT %s: inside the enclosing `execution hold --request %s`, which holds"
-                         " this box's slots (%s); no slot taken, for: %s\n" % (box, request, reason, " ".join(command)))
-    else:
-        sys.stderr.write("EXECUTION SLOT %s: inside measurement %s, held by an enclosing `execution hold`;"
-                         " no slot taken, for: %s\n" % (box, request, " ".join(command)))
-    print("inside")
-    sys.exit(0)
-
-if mode == "nested":
-    def not_here(reason):
-        sys.stderr.write("EXECUTION SLOT %s: FLEET_SLOT_HELD=%r does not cover this batch (%s); taking a slot\n"
-                         % (box, marker, reason))
-        print("take")
-        sys.exit(0)
-    fields = marker.split()
-    if len(fields) != 4 or not fields[1].isdigit():
-        not_here("malformed")
-    if fields[0] != box:
-        not_here("another box's")
-    index = int(fields[1])
-    if not 1 <= index <= cap:
-        not_here("no slot %d among this box's %d" % (index, cap))
-    # The slot must be held NOW: a marker copied into a shell by hand, or left behind in an
-    # environment that outlived its batch, names a slot nobody holds, and running under it would
-    # be running without one. A held flock refuses a second, non-blocking one on a new descriptor
-    # even from a descendant of its holder, so this cannot mistake a free slot for a held one.
-    try:
-        descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_RDWR)
-    except OSError:
-        not_here("slot %d has no lock file" % index)
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        pass  # held, as the marker says
-    else:
-        os.close(descriptor)
-        not_here("slot %d is not held" % index)
-    os.close(descriptor)
-    # A live `execution hold --request` holds every slot (THE DRAIN, at `execution hold`), and no
-    # batch inside it carries this marker -- the measurement's own runs are judged by theirs -- so
-    # the slot above being held proves nothing while one is live.
-    try:
-        descriptor = os.open(os.path.join(directory, "measurement.lock"), os.O_RDWR)
-    except OSError:
-        pass
-    else:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(descriptor)
-            not_here("a measurement's `execution hold --request` holds this box's slots")
-        os.close(descriptor)
-    # Whether that slot may hold the GPU is judged from THIS spec, never from the marker's own
-    # word: the tokens are the first <tokens> slot files (THE GPU TOKENS, above).
-    if tokens and index > tokens and not cpu:
-        print("EXECUTION SLOT REFUSED %s: this batch runs inside slot %d of %d, which an enclosing batch"
-              " took as --cpu and is not a GPU token; a batch that holds the GPU must not run there"
-              " (the enclosing `execution slot` must not declare --cpu)" % (box, index, cap))
-        sys.exit(1)
-    sys.stderr.write("EXECUTION SLOT %s: inside slot %d of %d, held by an enclosing batch, for: %s\n"
-                     % (box, index, cap, " ".join(command)))
-    print("inside")
-    sys.exit(0)
-
-if mode == "bare":
-    run("")
-
-# The candidate slots, in the order this batch tries them. Where the box has fewer GPU tokens
-# than slots, the tokens ARE the first <tokens> slot files: a GPU batch may take only those, and a
-# CPU batch takes the highest free slot, so it leaves the GPU ones for last (THE GPU TOKENS, above).
-if not tokens:
-    order = range(1, cap + 1)
-elif cpu:
-    order = range(cap, 0, -1)
-else:
-    order = range(1, tokens + 1)
-deadline = time.monotonic() + wait
-while True:
-    for index in order:
-        descriptor = os.open(os.path.join(directory, "slot.%d" % index), os.O_CREAT | os.O_RDWR, 0o644)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(descriptor)
-            continue
-        # The lock lives on this descriptor: it must survive the exec below, so it must not be
-        # closed on it. Nothing releases it afterwards -- the kernel does, when the process ends.
-        os.set_inheritable(descriptor, True)
-        held = "slot %d of %d" % (index, cap)
-        if tokens and index <= tokens:
-            held += ", GPU token %d of %d" % (index, tokens)
-        sys.stderr.write("EXECUTION SLOT %s: %s held for: %s\n" % (box, held, " ".join(command)))
-        # The marker a nested `execution slot` (and a runner that takes its own slot) reads:
-        # <box> <slot> <slots> <gpu|cpu>, the last saying whether this slot may hold the GPU.
-        os.environ["FLEET_SLOT_HELD"] = "%s %d %d %s" % (
-            box, index, cap, "gpu" if not tokens or index <= tokens else "cpu")
-        run("%s %s: %s" % (box, held, " ".join(command)))
-    if time.monotonic() >= deadline:
-        if tokens and not cpu:
-            print("EXECUTION SLOT REFUSED %s: all %d GPU tokens (slots 1-%d of %d) busy after %ds; a batch"
-                  " that holds no GPU declares --cpu" % (box, tokens, tokens, cap, wait))
-        else:
-            print("EXECUTION SLOT REFUSED %s: all %d run-time correctness slots busy after %ds"
-                  % (box, cap, wait))
-        sys.exit(1)
-    time.sleep(1)
-RUN_PY
-}
-
-# inhibitor_path: the systemd-inhibit this box would take the guard with, or empty for none.
-inhibitor_path() { type -P -- "$INHIBIT" 2>/dev/null || true; }
-
-cmd_execution_slot() {
-  local wait=600 kind="" box cap tokens listing rc measuring window dir helper probe="" bg="" here
+# THE PROBE WITHOUT PYTHON: `execution slot --probe`, the forwarder's one exception. A project
+# runner asks it before every batch (ahrefs/ocannl#1004), and any answer but the PROBE line tells
+# the runner to run WITHOUT a slot (issue-wave/references/executions.md), so a probe that needed
+# Python >= 3.12 would turn a box without one into a box whose batches silently skip the run-time
+# cap. Answered here in bash, as before the port: no interpreter, no lock, no registry. Only inside
+# a live `execution hold --request` (FLEET_MEASUREMENT_HELD set) is Python asked, for the
+# measurement it runs -- the marker is judged against the hold's lock, which takes a flock -- and a
+# Python that cannot answer reads as no measurement, as a failed python3 always did here. The
+# slot count and token count are the spec's own text, as they always were. Anything that is not a
+# probe (an argument the forwarder misread, `--bg --probe` naming a directory) goes to Python.
+cmd_execution_slot_probe() {
+  local kind="" probe="" bg="" box cap tokens inside="" answer
+  local -a all=("$@")
+  shift   # slot
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --probe) probe=1 ;;
@@ -3052,471 +2434,39 @@ cmd_execution_slot() {
       --wait)
         [ "$#" -ge 2 ] || die "execution slot: expected value for --wait"
         case "$2" in ''|*[!0-9]*) die "execution slot: --wait takes a whole number of seconds" ;; esac
-        wait="$2"; shift ;;
+        shift ;;
       --cpu|--gpu)
         [ -z "$kind" ] || [ "$kind" = "$1" ] || die "execution slot: --cpu and --gpu are exclusive"
         kind="$1" ;;
-      --) shift; break ;;
+      --) break ;;
       *) die "execution slot [--bg <parent>] [--wait <seconds>] [--cpu|--gpu] -- <command> [args...] | execution slot --probe" ;;
     esac
     shift
   done
-  [ -z "$probe" ] || [ -z "$bg" ] || die "execution slot: --probe takes no --bg; it runs nothing"
-  [ -n "$probe" ] || [ "$#" -ge 1 ] || die "execution slot: a command to hold the slot around is required, after --"
+  if [ -z "$probe" ]; then
+    if [ -n "${PYTHONPATH+set}" ]; then LUDICS_FW_PYTHONPATH="=$PYTHONPATH"; else LUDICS_FW_PYTHONPATH=""; fi
+    export LUDICS_FW_PYTHONPATH
+    exec "$CHECKOUT/scripts/py" -m ludics.fleetworker "$0" execution "${all[@]}"
+  fi
+  [ -z "$bg" ] || die "execution slot: --probe takes no --bg; it runs nothing"
   box="$LOCAL_BOX"
   [ -n "$box" ] || die "execution slot: this host has no fleet name; set FLEET_LOCAL_BOX (the slot is this box's own)"
-  # An alias or a typo would lock under a name of its own and read measurements under another,
-  # so a batch could run beside a measurement reserved on the canonical spelling of this very box.
-  # The registry refuses a noncanonical execution_host for the same reason; this is that check.
   in_roster "$box" || { echo "EXECUTION SLOT REFUSED $box: not a canonical FLEET_BOXES entry ($BOXES)"; exit 1; }
   cap=$(box_correctness_slots "$box") || { echo "EXECUTION SLOT REFUSED $box: $cap"; exit 1; }
   tokens=$(box_gpu_tokens "$box") || { echo "EXECUTION SLOT REFUSED $box: $tokens"; exit 1; }
   # Where there are as many tokens as slots the tokens cannot bind, and every batch takes any slot.
   [ "$tokens" -lt "$cap" ] || tokens=0
-  # THE PROBE: what a slot here would be, without taking one -- no lock, no registry read. A
-  # project runner that takes the slot itself asks this first (ahrefs/ocannl#1004): an answer
-  # means this is a fleet box, and that this fleet-worker.sh runs a nested slot inside an
-  # enclosing one, so a worker's own wrapper around the runner cannot cost two slots. Anything
-  # else -- a host with no fleet name (exit 2), a box outside the roster (1), a version without
-  # the probe (2, usage) -- tells the runner to run as it would without a fleet.
-  # Inside a live `execution hold --request` on this box the line goes on with `measurement <id>`
-  # (THE MEASUREMENT'S OWN RUN, at `execution hold`), judged from the marker and the hold's lock
-  # alone: the registry is not read, so the probe stays free.
-  dir="$(local_path "$SLOT_STATE")/$box"
-  if [ -n "$probe" ]; then
-    local inside=""
-    [ -z "${FLEET_MEASUREMENT_HELD:-}" ] ||
-      inside=$(python3 -c "$(run_py)" measured "$box" "$dir" "$FLEET_MEASUREMENT_HELD" - 2>/dev/null) || inside=""
-    echo "EXECUTION SLOT PROBE $box $cap $([ "$tokens" -eq 0 ] && echo "$cap" || echo "$tokens")${inside:+ measurement $inside}"
-    exit 0
-  fi
-  # THE DETACHED BATCH (ludics-lite#181): a batch that can outlast a 600 s tool call used to take
-  # three calls from a native worker (`bg-run.sh new`, a backgrounded `bg-run.sh start` around this
-  # command, `bg-run.sh wait`). `--bg <parent>` is the first two in one foreground call: bg-run.sh
-  # `spawn` allocates <parent>/run-<N>, runs this same `execution slot` there detached, and prints
-  # the directory, so the caller's one wait is `bg-run.sh wait <dir>` and its verdicts, and the
-  # directory is what `execution conclude --from-bg-run` reads. The run directory contract stays
-  # bg-run.sh's alone. What can be refused here is refused in the foreground (usage, a host with no
-  # fleet name, a box outside the roster, a malformed spec); the registry read and the wait for a
-  # slot happen in the run, whose log holds any refusal and whose rc is its status. The detached
-  # run inherits this environment, FLEET_SLOT_HELD and an enclosing slot's flock included, so a
-  # --bg batch inside an enclosing slot runs under that slot (THE NESTED SLOT, below) and keeps it
-  # held for as long as the batch runs, past the enclosing command's own end.
-  if [ -n "$bg" ]; then
-    here=$(cd "$(dirname "$0")" && pwd)
-    exec "$here/bg-run.sh" spawn "$bg" -- "$here/$(basename "$0")" execution slot --wait "$wait" ${kind:+"$kind"} -- "$@"
-  fi
-  # THE NESTED SLOT: inside a batch that already holds one of this box's slots, a second take
-  # would hold two for one batch, and N enclosing batches could deadlock waiting on each other.
-  # The enclosing slot's marker, once judged, is the slot: no second flock and no registry read
-  # (it was read when the enclosing slot was taken). A marker that does not cover this batch is
-  # said so and ignored.
-  if [ -n "${FLEET_SLOT_HELD:-}" ]; then
-    local verdict
-    verdict=$(python3 -c "$(run_py)" nested "$box" "$dir" "$cap" "$tokens" "${kind#--}" "$FLEET_SLOT_HELD" "$@") || {
-      printf '%s\n' "$verdict"; exit 1; }
-    case $verdict in
-      inside) exec python3 -c "$(run_py)" bare "$box" "$@" ;;
-      take) unset FLEET_SLOT_HELD ;;
-      *) echo "EXECUTION SLOT REFUSED $box: the nested-slot check answered '$verdict'"; exit 1 ;;
-    esac
-  fi
-  helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
-  [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
-  listing=$(execution_listing "$helper"); rc=$?
-  if unreachable "$rc"; then echo "EXECUTION SLOT UNREACHABLE $ANCHOR: registry unread, no slot taken"; exit 4; fi
-  [ "$rc" -eq 0 ] || { printf '%s\n' "$listing"; echo "EXECUTION SLOT REFUSED $box: the anchor's registry could not be read"; exit 1; }
-  measuring=$(jq -r --arg box "$box" \
-    '[.[] | select(.state != "concluded" and .request.execution_host == $box and .request.kind == "measurement")
-       | .request_id] | join(", ")' <<<"$listing") &&
-  window=$(jq -r --arg box "$box" \
-    '[.[] | select(.state != "concluded" and .request.execution_host == $box and .request.kind == "measurement"
-                   and .window == true) | .request_id] | join(", ")' <<<"$listing") ||
-    { echo "EXECUTION SLOT REFUSED $box: the anchor's registry did not parse"; exit 1; }
-  # THE MEASUREMENT'S OWN RUN (at `execution hold`): inside the hold of the one measurement
-  # outstanding here, the batch is that measurement's, so it runs under the hold -- no slot, no
-  # second sleep guard -- where any other batch is refused. A marker the registry or the hold's
-  # lock does not confirm is said so and ignored.
   if [ -n "${FLEET_MEASUREMENT_HELD:-}" ]; then
-    local judged
-    judged=$(python3 -c "$(run_py)" measured "$box" "$dir" "$FLEET_MEASUREMENT_HELD" "$measuring" "$@") || {
-      printf '%s\n' "$judged"; exit 1; }
-    case $judged in
-      inside) exec python3 -c "$(run_py)" bare "$box" "$@" ;;
-      take) unset FLEET_MEASUREMENT_HELD ;;
-      *) echo "EXECUTION SLOT REFUSED $box: the measurement check answered '$judged'"; exit 1 ;;
-    esac
+    answer=$("$CHECKOUT/scripts/py" -m ludics.fleetworker "$0" execution slot --probe 2>/dev/null) || answer=""
+    case "$answer" in "EXECUTION SLOT PROBE $box "*" measurement "*) inside="${answer##* measurement }" ;; esac
   fi
-  # THE MEASUREMENT WINDOW (ludics-lite#481): the refusal names it, so a worker whose standing
-  # reservation it suspended knows to retry once it closes rather than to debug or to request.
-  [ -z "$window" ] || { echo "EXECUTION SLOT REFUSED $box: measurement window $window is open on $box, and holds the box exclusively; standing reservations here are suspended until it concludes, so retry this batch then (no request needed); only a batch inside its own \`execution hold --request <id>\` runs there"; exit 1; }
-  [ -z "$measuring" ] || { echo "EXECUTION SLOT REFUSED $box: a measurement holds the box exclusively ($measuring); only a batch inside its own \`execution hold --request <id>\` runs there"; exit 1; }
-  mkdir -p "$dir" || die "execution slot: cannot create the slot directory $dir"
-  exec python3 -c "$(run_py)" slot "$box" "$dir" "$cap" "$tokens" "${kind#--}" "$wait" "$(inhibitor_path)" "$@"
-}
-
-# `execution hold [--why <text>] [--request <id>] -- <command...>`: run the command under THIS
-# box's OS-level guard against sleep and nothing else -- no slot, no registry read, no lease
-# (ludics-lite#317; the guard itself is described above `run_py`). It is the wrapper for an
-# exclusive measurement, which runs the runner without a slot of its own because `execution slot`
-# refuses every batch beside an outstanding measurement, and `slot` takes the same guard inside
-# the flock, so both kinds of run carry it through one implementation. Where no systemd-inhibit
-# resolves it runs the command bare and says nothing. Needs python3, as `slot` does (the per-box
-# preflight checks it).
-#
-# THE MEASUREMENT'S OWN RUN (ludics-lite#480). A runner that takes the slot itself (OCANNL's
-# tools/test-run.sh) asked for one inside its own measurement's hold and was refused by that very
-# measurement (exit 75, SLOT REFUSED), five times in one wave, and the workaround was folklore
-# every brief had to carry (`OCANNL_TOOL_FLEET_WORKER=none`). So `--request <id>` names the
-# measurement this hold runs: the command gets FLEET_MEASUREMENT_HELD=`<box> <id>` and inherits a
-# SHARED flock on `<slot dir>/measurement.lock`, and an `execution slot` that finds the marker
-# runs its command under this hold, with no slot taken, instead of refusing it -- as the nested
-# slot runs under an enclosing one. The marker is judged, never trusted, and what confirms it is
-# exactly this, nothing else: it names this box, the registry's outstanding measurements on this
-# box are that one request id and no other (so an unknown, concluded or correctness request, or
-# another box's, is not confirmed), and the lock is held NOW by some `hold --request` on this box.
-# That last check is per box, not per request: the registry admits one measurement on a box at a
-# time, so a live hold there is that measurement's. An unconfirmed marker is said so and ignored,
-# and the batch is refused while any measurement is outstanding -- as is a batch with no marker,
-# an independent correctness batch on the measured box among them. The hold itself reads no
-# registry, so it never refuses a measurement over the anchor; a mistyped id is caught by the
-# first `slot` inside it, which is refused.
-#
-# THE DRAIN (ludics-lite#481): with --request the hold also takes every slot of the box before the
-# command starts, waiting for a batch that holds one, and the command's tree inherits them, so no
-# batch runs beside a measurement: not one running when it was reserved (a measurement window
-# reserves one on a box whose workers are iterating), nor one that was waiting for a slot then.
-# The slot check reads the registry once, at the batch's start, and cannot see either. A nested
-# hold of the same live measurement takes none, since its enclosing hold holds them.
-# Exit: the command's own status; 127 with `EXECUTION HOLD REFUSED` when it cannot be run; 2 usage.
-cmd_execution_hold() {
-  local why="" request="" box dir="" marker="" cap=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --why)
-        [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution hold: expected text for --why"
-        why="$2"; shift ;;
-      --request)
-        [ "$#" -ge 2 ] && [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
-          die "execution hold: --request takes the measurement's request id ([A-Za-z0-9][A-Za-z0-9._-]*)"
-        request="$2"; shift ;;
-      --) shift; break ;;
-      *) die "execution hold [--why <text>] [--request <id>] -- <command> [args...]" ;;
-    esac
-    shift
-  done
-  [ "$#" -ge 1 ] || die "execution hold: a command to hold the box around is required, after --"
-  box="${LOCAL_BOX:-$(hostname -s 2>/dev/null)}"
-  if [ -n "$request" ]; then
-    # The marker names the box the slot reads it on, so it needs the name the slot has.
-    [ -n "$LOCAL_BOX" ] || die "execution hold: --request needs this host's fleet name; set FLEET_LOCAL_BOX"
-    dir="$(local_path "$SLOT_STATE")/$box"
-    mkdir -p "$dir" || die "execution hold: cannot create the slot directory $dir"
-    dir="$dir/measurement.lock" marker="$box $request"
-    # THE DRAIN takes every slot file there and slots 1..<count>; a spec it cannot read costs
-    # only the second half, never the measurement.
-    cap=$(box_correctness_slots "$box" 2>/dev/null) || cap=0
-  fi
-  [ -n "$why" ] || why="$box ${request:+measurement $request }hold: $*"
-  exec python3 -c "$(run_py)" hold "$box" "$(inhibitor_path)" "$why" "$dir" "$marker" "${cap:-0}" "$@"
-}
-
-cmd_execution() {
-  local action="${1:-}" payload='{}'
-  case "$action" in
-    list)
-      shift
-      local active=false compact=false
-      while [ "$#" -gt 0 ]; do
-        case "$1" in
-          --active) active=true ;;
-          --compact) compact=true ;;
-          *) die "execution list: expected --active or --compact" ;;
-        esac
-        shift
-      done
-      payload="{\"active\":$active,\"compact\":$compact}" ;;
-    # The run-time slot lock: no registry mutation, no lease, and the command runs from here.
-    slot) shift; cmd_execution_slot "$@" ;;
-    # The OS-level sleep guard alone: no slot, no registry, no lease.
-    hold) shift; cmd_execution_hold "$@" ;;
-    conclude)
-      if [ "${2:-}" = --from-run ]; then
-        local dir="${3:-}" request="" box="" sha="" evidence="" rc
-        [ -n "$dir" ] || die "execution conclude --from-run: <run-dir> required"
-        case "$dir" in /*) ;; *) die "execution conclude --from-run: the run directory must be absolute (it is read on the execution box)" ;; esac
-        shift 3
-        while [ "$#" -gt 0 ]; do
-          case "$1" in
-            --request|--box|--sha|--evidence)
-              [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution conclude: expected value for $1"
-              case "$1" in --request) request="$2" ;; --box) box="$2" ;; --sha) sha="$2" ;; --evidence) evidence="$2" ;; esac
-              shift ;;
-            *) die "execution conclude --from-run <run-dir> --request <id> [--box <box>] [--sha <sha>] [--evidence <text>]" ;;
-          esac
-          shift
-        done
-        [ -n "$request" ] || die "execution conclude --from-run: --request <id> required"
-        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "execution conclude --from-run: --sha <full commit SHA> required (the worker's result line names it; a record's own head is cross-checked against it)"
-        check_identity
-        if [ -z "$box" ]; then
-          box=$(execution_host_of "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py" "$request") || { echo "EXECUTION UNREACHABLE $ANCHOR: cannot resolve the request's execution host"; exit 4; }
-          [ -n "$box" ] || { echo "EXECUTION REFUSED: unknown request_id $request (no execution host to read the run on)"; exit 1; }
-        fi
-        payload=$(conclude_from_run "$dir" "$request" "$box" "$sha" "$evidence"); rc=$?
-        [ "$rc" -eq 0 ] || { printf '%s\n' "$payload"; exit "$rc"; }
-      elif [ "${2:-}" = --from-bg-run ]; then
-        local dir="${3:-}" request="" box="" sha="" evidence="" checkout="" rc listing host bgrun
-        local usage="execution conclude --from-bg-run <run-dir> --request <id> --sha <sha> [--box <box>] [--checkout <text>] [--evidence <text>]"
-        [ -n "$dir" ] || die "execution conclude --from-bg-run: <run-dir> required"
-        case "$dir" in /*) ;; *) die "execution conclude --from-bg-run: the run directory must be absolute (it is read on the box that holds it)" ;; esac
-        shift 3
-        while [ "$#" -gt 0 ]; do
-          case "$1" in
-            --request|--box|--sha|--evidence|--checkout)
-              [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution conclude: expected value for $1"
-              case "$1" in --request) request="$2" ;; --box) box="$2" ;; --sha) sha="$2" ;; --evidence) evidence="$2" ;; --checkout) checkout="$2" ;; esac
-              shift ;;
-            *) die "$usage" ;;
-          esac
-          shift
-        done
-        [ -n "$request" ] || die "execution conclude --from-bg-run: --request <id> required"
-        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || die "execution conclude --from-bg-run: --sha <full commit SHA> required (a bg-run directory records none; the worker's result line names it)"
-        bgrun="$(cd "$(dirname "$0")" && pwd)/bg-run.sh"
-        [ -s "$bgrun" ] && [ -r "$bgrun" ] || die "execution conclude --from-bg-run: missing $bgrun"
-        check_identity
-        listing=$(execution_listing "$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"); rc=$?
-        if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: cannot resolve the request's execution host"; exit 4; fi
-        [ "$rc" -eq 0 ] || { printf '%s\n' "$listing"; echo "EXECUTION REFUSED: the anchor's registry could not be read"; exit 1; }
-        host=$(jq -r --arg id "$request" '.[] | select(.request_id == $id) | .request.execution_host' <<<"$listing")
-        [ -n "$host" ] || { echo "EXECUTION REFUSED: unknown request_id $request (no execution host to read the run for)"; exit 1; }
-        # Without --checkout the record's own checkout is restated, or the placeholder when it has
-        # none -- always spelled out in the payload, so a retry of a conclusion whose answer was
-        # lost composes the same payload and meets the registry's identical-retry rule.
-        [ -n "$checkout" ] || checkout=$(jq -r --arg id "$request" '.[] | select(.request_id == $id) | .remote_checkout // empty' <<<"$listing")
-        [ -n "$checkout" ] || checkout="not recorded (bg-run keeps no checkout; the log names what ran)"
-        payload=$(conclude_from_bg_run "$dir" "$request" "${box:-$host}" "$host" "$sha" "$checkout" "$evidence" "$bgrun"); rc=$?
-        [ "$rc" -eq 0 ] || { printf '%s\n' "$payload"; exit "$rc"; }
-      else
-        [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
-        payload=$(cat "$2") || die "execution: cannot read payload"
-        check_identity
-      fi ;;
-    reserve|run|dispatch|record|reconcile)
-      [ "$#" -eq 2 ] && [ -r "$2" ] || die "execution $action: readable JSON file required"
-      payload=$(cat "$2") || die "execution: cannot read payload"
-      check_identity ;;
-    # THE MEASUREMENT WINDOW (ludics-lite#481; the registry rules are fleet-execution.py's header):
-    # the box is named apart from the payload so the call says which box's standing reservations
-    # it suspends, and the registry refuses a payload measuring on any other.
-    window)
-      [ "$#" -eq 3 ] && [ -n "$2" ] && [ -r "$3" ] || die "execution window <box> <measurement reserve.json>: a box and a readable JSON file required"
-      payload=$(jq -c --arg box "$2" '{box: $box, request: .}' "$3") || die "execution window: $3 is not a JSON reservation"
-      check_identity ;;
-    *) die "execution: list, slot -- <command>, hold -- <command>, run|reserve|dispatch|record|reconcile|conclude <json-file>, window <box> <json-file>, or conclude --from-run|--from-bg-run <run-dir> --request <id>" ;;
-  esac
-  local helper out rc map=""; helper="$(cd "$(dirname "$0")" && pwd)/fleet-execution.py"
-  [ -s "$helper" ] && [ -r "$helper" ] || die "execution: missing helper $helper"
-  case "$action" in reserve|run|dispatch|window) map=$(endpoint_map) || exit 1 ;; esac
-  out=$({
-    prelude "$ANCHOR"
-    if [ "$action" != list ]; then lease_mutation_prelude; else printf 'shift 3\n'; fi
-    cat <<'EXECUTION_COMMAND'
-python3 - "$ANCHOR_STATE" "$@" <<'FLEET_EXECUTION_PY'
-EXECUTION_COMMAND
-    cat "$helper"
-    printf '\nFLEET_EXECUTION_PY\n'
-  } | run_on "$ANCHOR" EXECUTION "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$action" "$(coordinator_id)" "$(my_token)" "$payload" "$BOXES" "$SLOTS" "$map" \
-    "$(fleet_name "$ANCHOR")" "$(fleet_name "$LAB_HOST")"); rc=$?
-  [ -z "$out" ] || printf '%s\n' "$out"
-  if unreachable "$rc"; then echo "EXECUTION UNREACHABLE $ANCHOR: outcome unknown; reconcile before retrying dispatch"; exit 4; fi
-  if [ "$rc" -eq 0 ]; then case "$action" in run|dispatch|window) execution_refresh "$out" >&2 ;; esac; fi
-  exit "$rc"
-}
-
-# endpoint_map: the lab's endpoint map as `wake-lab.sh endpoint-map` prints it, one `<box> <alias>...`
-# line per box, for the registry's one-entry-per-box roster check (ludics-lite#395) and for the lab
-# box whose lane lock a measurement reads (ludics-lite#445; the grammar and both boundaries are
-# fleet-execution.py's header). Read from THIS checkout's wake-lab.sh, found by the
-# physical path (the skill is reached through a ~/.claude/skills symlink), so the map is never
-# restated here. No wake-lab.sh in the checkout degrades loudly: one EXECUTION WARNING on stderr and
-# an empty map, which keeps the roster check to exact entries up to case, as before. A wake-lab.sh
-# that refuses its own map refuses the reservation: a map that is there and wrong is a defect to fix.
-endpoint_map() {
-  local wake out
-  wake="$CHECKOUT/scripts/wake-lab.sh"
-  if [ ! -f "$wake" ]; then
-    printf '%s\n' "EXECUTION WARNING: no endpoint map ($wake is missing): FLEET_BOXES is not checked for two aliases of one box, and a measurement is not checked against its box's lab lane lock" >&2
-    return 0
-  fi
-  out=$(bash "$wake" endpoint-map) || {
-    printf '%s\n' "EXECUTION REFUSED: $wake endpoint-map failed (above), so FLEET_BOXES cannot be checked for two aliases of one box" >&2
-    return 1
-  }
-  printf '%s\n' "$out"
-}
-
-# execution_refresh <record-json>: after a dispatch, refresh the execution host's skills checkout
-# (ludics-lite#362), since that box's own `execution slot`/`hold` and skill text are what the
-# assigned command runs next. AFTER the dispatch, never before it: the registry lock is released by
-# then, so a fetch that hangs cannot hold it, and a refused reservation - the box measuring for
-# someone else - never has its checkout touched. Every host, this box and the anchor included: no
-# launch preflight need have run on the box the coordinator itself runs from (PR #379 review). On
-# stderr, so stdout stays the record; the dispatch's exit status stands whatever the refresh
-# reports, and a record it cannot read is said so rather than skipped silently.
-#
-# A standing reservation queued behind a measurement window (ludics-lite#481) is not refreshed: the
-# box is measuring, and a fetch there is activity beside the timed run. Its worker's batches are
-# refused until the window concludes, so the line names the refresh to run then.
-execution_refresh() {
-  local host window
-  host=$(jq -r '.request.execution_host // empty' <<<"$1" 2>&1) && [ -n "$host" ] || {
-    printf '%s\n' "REFRESH FAILED: cannot read the execution host from the dispatched record (${host:-empty}); run fleet-worker.sh refresh <host> by hand"
-    return 1
-  }
-  window=$(jq -r 'select(.state == "suspended") | .suspended_by' <<<"$1" 2>/dev/null)
-  if [ -n "$window" ]; then
-    printf '%s\n' "REFRESH DEFERRED $host: measurement window $window is measuring there; run fleet-worker.sh refresh $host once it concludes"
-    return 0
-  fi
-  refresh_box "$host"
-}
-
-cmd_halt() {
-  local reason="$*"; [ -n "$reason" ] || die "halt: give the reason (what regressed, who owns the fix)"
-  local halt_id; halt_id=$(gen_uuid) || die "halt: cannot generate a halt identity"
-  check_identity
-  { prelude "$ANCHOR"; lease_mutation_prelude; cat <<'EOF'
-halt="$ANCHOR_STATE/HALT"; halt_id="$2"
-if [ -f "$halt" ]; then
-  existing_id=$(sed -n '1s/^[^ ]* id=\([^ ]*\) .*/\1/p' "$halt")
-  if [ -z "$existing_id" ]; then
-    # Legacy markers have no ID: retain their first line as the generation, append the update.
-    if printf 'update %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$halt"; then
-      echo "HALTED: launches refused until resume-launches -- $1"; exit 0
-    fi
-    echo "HALT FAILED: cannot update $halt on $BOX"; exit 1
-  fi
-  halt_id="$existing_id"
-fi
-if ! printf '%s id=%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$halt_id" "$1" > "$ANCHOR_STATE/HALT" 2>/dev/null || [ ! -f "$ANCHOR_STATE/HALT" ]; then
-  echo "HALT FAILED: cannot write $ANCHOR_STATE/HALT on $BOX -- the fleet is NOT halted"; exit 1
-fi
-echo "HALTED: launches refused until resume-launches -- $1"
-EOF
-  } | run_on "$ANCHOR" HALT "$(my_token)" "${FLEET_LOCK_WAIT:-10}" "$reason" "$halt_id"
-  local rc=$?; if unreachable "$rc"; then echo "HALT UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
-}
-
-cmd_resume_launches() {
-  check_identity
-  { prelude "$ANCHOR"; lease_mutation_prelude; cat <<'EOF'
-f="$ANCHOR_STATE/HALT"
-if [ -f "$f" ]; then
-  was=$(cat "$f"); rm -f "$f" 2>/dev/null
-  [ ! -e "$f" ] || { echo "RESUME-LAUNCHES FAILED: cannot remove $f on $BOX -- still halted"; exit 1; }
-  echo "RESUMED launches (was: $was)"
-else echo "launches were not halted"; fi
-EOF
-  } | run_on "$ANCHOR" RESUME-LAUNCHES "$(my_token)" "${FLEET_LOCK_WAIT:-10}"
-  local rc=$?; if unreachable "$rc"; then echo "RESUME-LAUNCHES UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
-}
-
-cmd_halted() {
-  { prelude "$ANCHOR"; cat <<'EOF'
-f="$ANCHOR_STATE/HALT"
-if [ -f "$f" ]; then echo "HALTED $(cat "$f")"; exit 1; else echo "launches open"; exit 0; fi
-EOF
-  } | run_on "$ANCHOR"
-  local rc=$?; if unreachable "$rc"; then echo "HALTED? UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
-}
-
-# ---------------------------------------------------------------------------------------------
-# The coordinator lease: one file on the anchor, created with O_EXCL (noclobber) so two
-# coordinators starting at once cannot both win, naming the holder's host and token.
-cmd_claim() {
-  check_identity
-  local take=0
-  while [ $# -gt 0 ]; do case "$1" in --take) take=1 ;; *) die "claim: unknown option $1" ;; esac; shift; done
-  local tf; tf=$(token_file)
-  if [ ! -s "$tf" ]; then
-    mkdir -p "$(dirname "$tf")" 2>/dev/null
-    # noclobber: two first claims of one identity race to create it; the loser reads the winner's.
-    local tok; tok=$(gen_uuid) || tok="$(hostname -s)-$(date +%s)-$$"
-    ( set -o noclobber; printf '%s\n' "$tok" > "$tf" ) 2>/dev/null || true
-  fi
-  [ -s "$tf" ] || { echo "CLAIM REFUSED: cannot persist this coordinator's token at $tf"; exit 1; }
-  { prelude "$ANCHOR"; cat <<'EOF'
-host="$1" token="$2" take="$3" lockwait="$4"
-mkdir -p "$ANCHOR_STATE"; lease="$ANCHOR_STATE/COORDINATOR"
-record() { printf 'host=%s\ntoken=%s\nsince=%s\n' "$host" "$token" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"; }
-# Every lease mutation - first claim, idempotent re-claim, takeover - runs under one lock, so
-# a claim cannot slip between a release and a queued takeover and leave two believers.
-lock="$lease.lock"
-msg=$(take_lock "$lock" "$lockwait" "CLAIM FAILED: lease lock on $BOX") || { echo "$msg"; exit 1; }
-trap 'release_lock "$lock"' EXIT
-verified() { [ "$(sed -n 's/^token=//p' "$lease" 2>/dev/null)" = "$token" ]; }
-# The record is written and verified in a temp file first, then published atomically (link for
-# a first claim, rename for a takeover), so a failed write never truncates a valid lease.
-tmp="$lease.tmp.$$"; trap 'rm -f "$tmp"; release_lock "$lock"' EXIT
-# ln/mv onto a DIRECTORY would publish the record inside it; refuse that shape outright.
-[ ! -d "$lease" ] || { echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place)"; exit 1; }
-staged() { record > "$tmp" 2>/dev/null && [ "$(sed -n 's/^token=//p' "$tmp" 2>/dev/null)" = "$token" ]; }
-if [ ! -f "$lease" ]; then
-  if staged && ln "$tmp" "$lease" 2>/dev/null && verified; then echo "CLAIMED coordinator lease on $BOX for $host"; exit 0; fi
-  echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable)"; exit 1
-fi
-held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
-if [ "$held" = "$token" ]; then echo "CLAIMED already held by $host since $since"; exit 0; fi
-if [ "$take" = 1 ]; then
-  if staged && mv -f "$tmp" "$lease" 2>/dev/null && verified; then
-    echo "CLAIMED (adopted) coordinator lease on $BOX for $host -- was ${hhost:-nobody} since ${since:-never}"; exit 0
-  fi
-  echo "CLAIM FAILED: could not write the lease at $lease on $BOX (a directory in its place, or unwritable) -- not adopted; the previous lease is intact"; exit 1
-fi
-echo "CLAIM REFUSED: coordinator lease held by $hhost since $since -- a wave is in flight; adopt with --take only if that coordinator is gone"
-exit 1
-EOF
-  } | run_on "$ANCHOR" "$(hostname -s)/$(coordinator_id)" "$(cat "$tf")" "$take" "${FLEET_LOCK_WAIT:-10}"
-  local rc=$?; if unreachable "$rc"; then echo "CLAIM UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
-}
-
-cmd_release() {
-  check_identity
-  { prelude "$ANCHOR"; cat <<'EOF'
-token="$1" lockwait="$2"; lease="$ANCHOR_STATE/COORDINATOR"
-# The token check and the removal happen under the same lock takeovers use, so a release
-# racing an adoption cannot delete the successor's freshly written lease.
-lock="$lease.lock"
-msg=$(take_lock "$lock" "$lockwait" "RELEASE FAILED: lease lock on $BOX") || { echo "$msg -- the lease is still held"; exit 1; }
-trap 'release_lock "$lock"' EXIT
-[ -f "$lease" ] || { echo "RELEASE: no lease held"; exit 0; }
-held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease")
-[ "$held" = "$token" ] || { echo "RELEASE REFUSED: lease held by $hhost, not you"; exit 1; }
-if rm -f "$lease" 2>/dev/null && [ ! -e "$lease" ]; then echo "RELEASED coordinator lease on $BOX"; else echo "RELEASE FAILED: could not remove $lease on $BOX -- the lease is still held"; exit 1; fi
-EOF
-  } | run_on "$ANCHOR" "$(my_token)" "${FLEET_LOCK_WAIT:-10}"
-  local rc=$?; if unreachable "$rc"; then echo "RELEASE UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
-}
-
-cmd_coordinator() {
-  check_identity
-  { prelude "$ANCHOR"; cat <<'EOF'
-token="$1"; lease="$ANCHOR_STATE/COORDINATOR"
-[ -f "$lease" ] || { echo "COORDINATOR: nobody holds the lease on $BOX"; exit 3; }
-held=$(sed -n 's/^token=//p' "$lease"); hhost=$(sed -n 's/^host=//p' "$lease"); since=$(sed -n 's/^since=//p' "$lease")
-if [ -n "$token" ] && [ "$held" = "$token" ]; then echo "COORDINATOR: you ($hhost) since $since"; exit 0; fi
-echo "COORDINATOR: $hhost since $since (not you)"; exit 1
-EOF
-  } | run_on "$ANCHOR" "$(my_token)"
-  local rc=$?; if unreachable "$rc"; then echo "COORDINATOR UNREACHABLE $ANCHOR"; exit 4; fi; exit "$rc"
+  echo "EXECUTION SLOT PROBE $box $cap $([ "$tokens" -eq 0 ] && echo "$cap" || echo "$tokens")${inside:+ measurement $inside}"
+  exit 0
 }
 
 # ---------------------------------------------------------------------------------------------
 cmd="${1:-}"; [ -n "$cmd" ] && shift
 case "$cmd" in
-  gate) cmd_gate "$@" ;;
   preflight) cmd_preflight "$@" ;;
   refresh) cmd_refresh "$@" ;;
   launch) cmd_launch "$@" ;;
@@ -3528,13 +2478,9 @@ case "$cmd" in
   ls) cmd_ls "$@" ;;
   load) cmd_load "$@" ;;
   prs) cmd_prs "$@" ;;
-  execution) cmd_execution "$@" ;;
-  halt) cmd_halt "$@" ;;
-  resume-launches) cmd_resume_launches "$@" ;;
-  halted) cmd_halted "$@" ;;
-  claim) cmd_claim "$@" ;;
-  release) cmd_release "$@" ;;
-  coordinator) cmd_coordinator "$@" ;;
+  # gate, execution, halt, resume-launches, halted, claim, release, coordinator: forwarded to
+  # Python at the top of this group, all but the probe.
+  execution) cmd_execution_slot_probe "$@" ;;
   *) sed -n '/^# Usage:/,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
 exit "$?"

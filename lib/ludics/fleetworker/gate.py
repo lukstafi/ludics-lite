@@ -1,0 +1,209 @@
+"""``gate``: the point-in-time check before a native worker's dispatch -- lease and halt on the
+anchor, the target's base CI, and the lease and halt again (fleet-worker.sh's ``cmd_gate``,
+``base_gate``, ``base_checker``, ``integration_records``).
+
+Not a reservation: it reads, and a refusal blocks the dispatch. The base verdict is ship-pr's
+``pr-review.sh base``, run on the coordinator (where gh is authenticated), found from this
+checkout's physical root. Its clocks are pinned here so the ceiling cannot drift from them
+(ludics-lite#175): the ceiling is the absence grace plus one poll interval.
+
+``launch`` (still shell) keeps its own copy of the base gate for now; this is the native gate's.
+"""
+
+import os
+import re
+import tempfile
+from typing import Any
+
+from ludics.fleetworker.config import Config
+from ludics.fleetworker.execution import field, listing, records_of
+from ludics.fleetworker.identity import die
+from ludics.fleetworker.lease import anchor_gate
+from ludics.fleetworker.transport import err, run
+
+BASE_ABSENT_GRACE = 300
+BASE_POLL_INTERVAL = 60
+BASE_WAIT = BASE_ABSENT_GRACE + BASE_POLL_INTERVAL
+
+# Gate policy and bounds are not inherited from an unrelated ship-pr operation; connection, auth,
+# state paths and review-only settings are kept.
+UNSET_FOR_CHECKER = (
+    "SHIP_PR_ADVISORY_CHECKS",
+    "SHIP_PR_TEST_SOURCE_ONLY",
+    "SHIP_PR_CHECKS_WAIT",
+    "SHIP_PR_CHECKS_HEARTBEAT",
+    "SHIP_PR_API_ATTEMPTS",
+    "SHIP_PR_API_BACKOFF",
+)
+
+
+# SHARED-CANDIDATE: base_checker
+def base_checker(cfg: Config, argv: list[str]) -> int:
+    """Run the checker with the gate's own policy, its stdout on our stderr."""
+    env = {k: v for k, v in cfg.env.items() if k not in UNSET_FOR_CHECKER}
+    env["SHIP_PR_BASE_ABSENT_GRACE"] = str(BASE_ABSENT_GRACE)
+    env["SHIP_PR_CHECKS_INTERVAL"] = str(BASE_POLL_INTERVAL)
+    return run(argv, env=env, stdout_to_stderr=True).rc
+
+
+def _ascii_downcase(text: str) -> str:
+    return text.translate(str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"))
+
+
+def _tsv(fields: list[str]) -> str:
+    """jq's ``@tsv``."""
+    escaped = [f.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r") for f in fields]
+    return "\t".join(escaped)
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ("" if value is None else str(value))
+
+
+def integration_rows(records: list[dict[str, Any]], repo: str) -> str:
+    """The registry's INTEGRATION RECORDS for the repository (ludics-lite#401): concluded, pass or
+    fail at an exact observed SHA, a coordinator's non-standing correctness run marked
+    ``"integration": true``, the repository compared without case. One
+    ``<sha>\\t<verdict>\\t<request id>\\t<concluded at>`` row each."""
+    rows: list[str] = []
+    for r in records:
+        sha = r.get("observed_sha")
+        if not (
+            r.get("state") == "concluded"
+            and r.get("verdict") in ("pass", "fail")
+            and field(r, "request", "integration") is True
+            and field(r, "request", "transport") == "coordinator"
+            and field(r, "request", "kind") == "correctness"
+            and isinstance(field(r, "request", "repository"), str)
+            and _ascii_downcase(field(r, "request", "repository")) == _ascii_downcase(repo)
+            and field(r, "request", "standing") in (None, False)
+            and isinstance(sha, str)
+            and re.fullmatch(r"[0-9a-f]{40}", sha)
+        ):
+            continue
+        rows.append(_tsv([sha, _text(r.get("verdict")), _text(r.get("request_id")), _text(r.get("updated_at"))]))
+    return "\n".join(rows)
+
+
+# SHARED-CANDIDATE: integration_records
+def integration_records(cfg: Config, repo: str) -> str | None:
+    """The rows, or None when the registry could not be read (which refuses the gate: a failed
+    record there would outrank a green PR head)."""
+    done = listing(cfg)
+    if done.rc != 0:
+        return None
+    records = records_of(done.out)
+    if records is None:
+        return None
+    return integration_rows(records, repo)
+
+
+def stage_records(rows: str) -> str | None:
+    """The rows in a scratch file, whole, or None (and no file): an empty or cut file is valid
+    input to the checker, and a record lost in the write would let a green head stand for a failed tip."""
+    path = ""
+    try:
+        descriptor, path = tempfile.mkstemp(prefix="fw-integration.", dir=os.environ.get("TMPDIR") or "/tmp")
+        with os.fdopen(descriptor, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(rows + "\n")
+        return path
+    except OSError:
+        if path:
+            _remove(path)
+        return None
+
+
+def _remove(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# SHARED-CANDIDATE: base_gate
+def base_gate(cfg: Config, target: str, branch: str, force: bool, reason: str) -> int:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target):
+        die("base gate: --target-repo <owner/repo> required")
+    if reason and not force:
+        die("base gate: --allow-red-base requires --force for a triage worker")
+    if branch.startswith("-") or "\n" in branch:
+        die("base gate: invalid --base-branch")
+    helper = os.path.join(cfg.checkout, "ship-pr", "scripts", "pr-review.sh")
+    if not (os.path.exists(helper) and os.access(helper, os.X_OK)):
+        err(f"BASE REFUSED: coordinator base checker missing: {helper}")
+        return 1
+    where = f"{target} {branch or 'default branch'}"
+    # The ordinary base read may carry an older green while the tip is running: --wait, bounded by
+    # the derived ceiling, and --interim (ludics-lite#308), which names a green PR head meanwhile.
+    argv = [helper, "--repo", target, "base"] + ([branch] if branch else []) + [f"--wait={BASE_WAIT}", "--interim"]
+    rows = integration_records(cfg, target)
+    if rows is None:
+        err(
+            f"BASE REFUSED: {where}: the execution registry could not be read, so whether an integration"
+            " record judges its tip is unknown; dispatch blocked"
+        )
+        return 1
+    records = ""
+    if rows:
+        staged = stage_records(rows)
+        if staged is None:
+            err(f"BASE REFUSED: {where}: cannot stage the integration records; dispatch blocked")
+            return 1
+        records = staged
+        argv += ["--integration-records", records]
+    rc = base_checker(cfg, argv)
+    if records:
+        _remove(records)
+    # The records were a snapshot, and the read can wait minutes: a green is taken only over the
+    # records it was given (review round 6 of #401).
+    if rc == 0:
+        later = integration_records(cfg, target)
+        if later is None:
+            err(f"BASE REFUSED: {where}: the execution registry could not be re-read after the verdict; dispatch blocked")
+            return 1
+        if later != rows:
+            err(
+                f"BASE REFUSED: {where}: an integration record for it concluded during the read, which the"
+                " verdict did not see; re-run the gate"
+            )
+            return 1
+    if rc == 1 and force and reason:
+        err(f"BASE TRIAGE OVERRIDE: {where}: {reason}")
+        rc = 0
+    if rc != 0:
+        err(f"BASE REFUSED: {where} (base checker exit {rc}); dispatch blocked")
+        return 1
+    return 0
+
+
+def cmd_gate(cfg: Config, args: list[str]) -> int:
+    force, target, branch, reason = False, "", "", ""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--allow-red-base":
+            if i + 1 >= len(args) or not re.search(r"[^ \t\n\r\f\v]", args[i + 1]):
+                die("base gate: --allow-red-base requires a triage reason")
+            reason = args[i + 1]
+            i += 1
+        elif arg == "--force":
+            force = True
+        elif arg in ("--target-repo", "--base-branch"):
+            if i + 1 >= len(args) or not args[i + 1]:
+                die(f"gate: expected value for {arg}")
+            if arg == "--target-repo":
+                target = args[i + 1]
+            else:
+                branch = args[i + 1]
+            i += 1
+        else:
+            die("gate: expected --target-repo <owner/repo> [--base-branch <branch>] [--force]")
+        i += 1
+    rc = anchor_gate(cfg, "GATE", "native-worker", force)
+    if rc != 0:
+        return rc
+    rc = base_gate(cfg, target, branch, force, reason)
+    if rc != 0:
+        return rc
+    return anchor_gate(cfg, "GATE", "native-worker", force)
+

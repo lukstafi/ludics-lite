@@ -101,8 +101,12 @@ ship-pr/scripts/test-pr-review-<suite>.sh                         # the conforma
 ```
 
 CI runs pyright and the unit tests in the `python` job of `.github/workflows/skill-scripts.yml`,
-and the shell suites where they always ran. The existing standalone helpers
-(`issue-wave/scripts/fleet-execution.py`, `scripts/fleet-peers.py`) are not behind `scripts/py`
-yet: their callers and their own tests run them with `python3` and by path (the execution-registry
-tests load `fleet-execution.py` with `runpy` and patch `os.replace` between records), so they move
-with the `fleet-worker.sh` port, not before it.
+and the shell suites where they always ran. `scripts/fleet-peers.py` is not behind `scripts/py`
+yet: its callers and its tests run it with `python3` and by path.
+
+The execution registry (formerly `issue-wave/scripts/fleet-execution.py`) is
+`lib/ludics/fleetworker/registry.py`, and it is the one module here that is SHIPPED: `fleet-worker.sh
+execution` sends its source to the anchor box, where a Python >= 3.12 found by the far side's own
+probe runs it from stdin. So it imports nothing from `ludics` (the anchor's checkout may hold
+another version) and its positional argv is a contract; `issue-wave/scripts/test-fleet-execution.py`
+loads it with `runpy` and patches `os.replace` between records.
