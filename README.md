@@ -1190,6 +1190,17 @@ copies: refused arguments, `--help` with an inherited pid list, the deadline, an
 of both scripts mid-run (with a negative control that strips the parse guard), and a
 `core.hooksPath` planted through each config channel (with one that strips the isolation).
 
+**The Python rewrite (ludics-lite#403).** The core scripts are moving to type-checked,
+standard-library-only Python 3.12 in one package, `lib/ludics/`, one script (and for `pr-review.sh`
+one subcommand) at a time behind unchanged command lines. Every Python entry point runs through
+`scripts/py`, which picks the first interpreter >= 3.12 (`scripts/test-py.sh`); a script's shell
+file stays the entry point and forwards to its module, and `pr-review.sh` forwards the subcommands
+named in its `PY_PORTED` (today: `body`). The shell suites above are the conformance suite for a
+port, unchanged. The package's own checks are `npx --yes pyright@1.1.414` (strict, `pythonVersion`
+3.12, from `pyrightconfig.json`) and `scripts/py -m unittest discover -s lib -t lib -p 'test_*.py'`,
+both run by CI's `python` job. Where a port's code goes, how forwarding and the suites' shell
+bridge work, and the rule for helpers shared across subcommands: [lib/ludics/README.md](lib/ludics/README.md).
+
 ## Why symlinks, not copies
 
 Copies drift silently, and did: the `ship-pr` watcher was independently repaired on a second
