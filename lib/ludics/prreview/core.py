@@ -536,13 +536,52 @@ class ListUnparsed:
 type ListResult = ListOk | GhFailed | GhUnanswered | ListUnparsed
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+_HIGH_SURROGATE = re.compile("[\ud800-\udbff]")
+_REPLACEMENT_CHARACTER = chr(0xFFFD)
+# Where a stream can hold a surrogate after decoding: an escape of one, or one already in the text.
+_SURROGATE_SOURCE = re.compile(r"\\u[dD][89a-fA-F]|[\ud800-\udfff]")
+
+
+class _Unparsed(Exception):
+    pass
+
+
+def _jq_string(s: str) -> str:
+    """A decoded string as jq 1.8 reads the same literal. Python's decoder joins a ``\\uD8xx\\uDCxx``
+    escape pair as jq does, but keeps a lone surrogate as a code point, where jq refuses a high one
+    ("Invalid \\uXXXX\\uXXXX surrogate pair escape", the feed unparsed) and reads a low one as
+    U+FFFD. A high surrogate here can only be an escape: the stream was decoded with
+    surrogateescape, which yields low ones alone (U+DC80..U+DCFF, for bytes that are not UTF-8,
+    which jq also reads as U+FFFD)."""
+    if not _SURROGATE.search(s):
+        return s
+    if _HIGH_SURROGATE.search(s):
+        raise _Unparsed
+    return _SURROGATE.sub(_REPLACEMENT_CHARACTER, s)
+
+
+def _jq_doc(doc: Json) -> Json:
+    match doc:
+        case str():
+            return _jq_string(doc)
+        case list():
+            return [_jq_doc(item) for item in doc]
+        case dict():
+            return {_jq_string(k): _jq_doc(v) for k, v in doc.items()}
+        case _:
+            return doc
+
+
 def json_stream(text: str) -> list[Json] | None:
     """The documents of a concatenated JSON stream (what ``gh --paginate`` prints, one per page),
-    as ``jq -s`` reads them; None when any of it does not parse."""
+    as ``jq -s`` reads them; None when any of it does not parse, a lone high-surrogate escape
+    included (see _jq_string)."""
     decoder = json.JSONDecoder()
     docs: list[Json] = []
     pos = 0
     length = len(text)
+    surrogates = _SURROGATE_SOURCE.search(text) is not None
     while True:
         while pos < length and text[pos] in " \t\n\r":
             pos += 1
@@ -552,7 +591,10 @@ def json_stream(text: str) -> list[Json] | None:
             doc, pos = decoder.raw_decode(text, pos)
         except ValueError:
             return None
-        docs.append(doc)
+        try:
+            docs.append(_jq_doc(doc) if surrogates else doc)
+        except _Unparsed:
+            return None
 
 
 def api_list(session: GhSession, path: str, repo: str) -> ListResult:

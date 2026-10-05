@@ -14,7 +14,7 @@ from collections.abc import Callable, Sequence
 from ludics import proc
 from ludics.prreview import jqsem as jq
 from ludics.prreview import poll, reads, rounds, state
-from ludics.prreview.core import GhSession, Json, load_config
+from ludics.prreview.core import GhSession, Json, json_stream, load_config
 
 REV = "chatgpt-codex-connector"
 BOT = REV + "[bot]"
@@ -122,6 +122,17 @@ def run_state(gh: FakeGh, nudge_after: int | None = None) -> str:
 
 
 class JqSemantics(unittest.TestCase):
+    def test_a_stream_parses_as_jq_reads_it(self) -> None:
+        self.assertEqual(json_stream('[1] [{"a":"b"}]\n'), [[1], [{"a": "b"}]])
+        self.assertEqual(json_stream('["\\ud83d\\ude00"]'), [["\U0001f600"]])
+        # A lone high-surrogate escape is jq's parse error, a lone low one its U+FFFD.
+        self.assertIsNone(json_stream('[{"b":"\\ud83d"}]'))
+        self.assertIsNone(json_stream('[{"\\uD83D":1}]'))
+        self.assertIsNone(json_stream('[1] ["x\\ud83d\\u0041"]'))
+        self.assertEqual(json_stream('[{"b":"a\\udc80"}]'), [[{"b": "a\ufffd"}]])
+        self.assertEqual(json_stream('["\\\\ud83d"]'), [["\\ud83d"]])
+        self.assertIsNone(json_stream("[1"))
+
     def test_order_is_jqs(self) -> None:
         values: list[Json] = [{"a": 1}, [1], "a", 2, True, False, None]
         self.assertEqual(jq.sort_by(values, lambda v: v), [None, False, True, 2, "a", [1], {"a": 1}])

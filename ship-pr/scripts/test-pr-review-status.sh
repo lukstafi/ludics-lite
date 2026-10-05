@@ -273,20 +273,70 @@ gh() {
 # of ludics.prreview that pr-review.sh's command line does not route to (`status-state <pr>
 # [<pending-request watermark>]`, `status-line <state line> [<pr number>]`), so every case here
 # judges what `status` runs; the arguments are what the shell functions read from their caller's
-# scope (watch_nudge_after, PR_NUM). The shell's status_state and status_line still serve `watch`
-# until it is ported, and run_shell_status asks them directly.
+# scope (watch_nudge_after, PR_NUM).
+#
+# The shell's status_state and status_line still serve `watch` until it is ported, and every case
+# here judges them too: the shell is asked first, over the same fixture state, and must answer the
+# line the Python does. Without that a regression in the state watch's verdicts are read from lands
+# green, since the watch suite reaches only a few of the states these cases build. The fixture's
+# own state (the request log, the read counters, the simulated push and posts) is put back between
+# the two, so the Python answers the reads the case set up, and what a case counts afterwards is the
+# Python's reads alone. The age is the one field the two may honestly disagree on: each reads the
+# clock for itself, a moment apart.
 run_status() {
   if py_ported status; then
+    local saved="$TEST_ROOT/fixture-state" shell_state
+    fixture_state_save "$saved"
+    run_shell_status
+    shell_state=$STATE
+    fixture_state_restore "$saved"
     STATE=$(py_forward call status-state 7 "${watch_nudge_after:-}")
     LINE=$(py_forward call status-line "$STATE" "${PR_NUM:-}")
+    same_state_but_age "$shell_state" "$STATE" ||
+      bail "watch's state (the shell's status_state) and status's (the Python's) differ:" \
+        "shell '$shell_state', Python '$STATE'"
+    assert_eq "$(status_line "$STATE")" "$LINE" \
+      "watch's rendering (the shell's status_line) and status's differ on the same state"
   else
     run_shell_status
   fi
 }
 
-# The shell's own state, which `watch` reads until it is ported. Only the cases that break one of
-# its jq programs by name (with_broken_jq) need it: a program no feed can reach on its own has no
-# black-box form, and no Python counterpart to break.
+# The fixture's files that a read changes, which run_status puts back between its two reads.
+FIXTURE_STATE_FILES=(requests pushed posted posted.keep fixture-calls nth.)
+fixture_state_save() { # <dir>
+  local name f
+  rm -rf "$1" && mkdir "$1" || bail "could not save the fixture state into $1"
+  for name in "${FIXTURE_STATE_FILES[@]}"; do
+    for f in "$TEST_ROOT/$name"*; do
+      [ ! -e "$f" ] || cp -R "$f" "$1/" || bail "could not save $f"
+    done
+  done
+}
+fixture_state_restore() { # <dir>
+  local name f
+  for name in "${FIXTURE_STATE_FILES[@]}"; do
+    rm -rf "$TEST_ROOT/$name"*
+  done
+  for f in "$1"/*; do
+    [ ! -e "$f" ] || cp -R "$f" "$TEST_ROOT/" || bail "could not restore $f"
+  done
+}
+
+# Two state lines that are the same but for an age read a moment later on the second.
+same_state_but_age() { # <first> <second>
+  local age_a age_b
+  [ "$(state_tok "$1")" = "$(state_tok "$2")" ] || return 1
+  [ "${1#*|*|}" = "${2#*|*|}" ] || return 1
+  age_a=$(state_age "$1") age_b=$(state_age "$2")
+  [ "$age_a" != "$age_b" ] || return 0
+  case "$age_a$age_b" in *[!0-9]*) return 1 ;; esac
+  [ $((age_b - age_a)) -ge 0 ] && [ $((age_b - age_a)) -le 2 ]
+}
+
+# The shell's own state, which `watch` reads until it is ported. run_status asks it beside the
+# Python's; the cases that break one of its jq programs by name (with_broken_jq) ask it alone: a
+# program no feed can reach on its own has no black-box form, and no Python counterpart to break.
 run_shell_status() {
   STATE=$(status_state 7)
   LINE=$(status_line "$STATE")
@@ -1156,6 +1206,27 @@ test_a_feed_that_did_not_answer_is_unknown_not_a_fact() {
   assert_eq "$(state_tok "$STATE")" approved "a 👍 stands over a comments read that did not answer"
 }
 
+# A feed jq refuses to parse is a read that did not answer, whatever another JSON parser makes of
+# it. jq 1.8 refuses a lone high-surrogate escape ("Invalid \uXXXX\uXXXX surrogate pair escape");
+# Python's json reads one as a code point, which once gave a definite state, exit 0, where the
+# shell's api_list (and so `watch`) says UNKNOWN, exit 3.
+test_a_feed_jq_cannot_parse_is_unknown_not_a_fact() {
+  local feed
+  for feed in comments reviews; do
+    idle_fixture
+    case "$feed" in
+    comments) COMMENTS_JSON='[{"id":3,"user":{"login":"someone"},"created_at":"2026-09-01T00:00:00Z","body":"\ud83d"}]' ;;
+    reviews) REVIEWS_JSON='[{"id":5,"user":{"login":"someone"},"state":"COMMENTED","commit_id":"head-sha","submitted_at":"2026-09-01T00:00:00Z","body":"x\ud83dy"}]' ;;
+    esac
+    run_status
+    assert_eq "$(state_tok "$STATE")" unknown "$feed: a feed jq cannot parse is unknown"
+    assert_contains "$(state_detail "$STATE")" "the $feed API did not answer" \
+      "$feed: the detail names the read"
+    run_cmd_status
+    assert_eq "$CMD_RC" 3 "$feed: status exits 3 on a feed jq cannot parse"
+  done
+}
+
 test_empty_reviews_need_their_own_findings() {
   reset_fixture
   REVIEWS_JSON="[$(review 88 "$HEAD_SHA" "$PAST" | jq '.body=" \n\t"')]"
@@ -2002,6 +2073,7 @@ tests=(
   test_the_round_started_placeholder_does_not_spend_the_eyes
   test_a_spent_eyes_is_not_a_running_round
   test_a_feed_that_did_not_answer_is_unknown_not_a_fact
+  test_a_feed_jq_cannot_parse_is_unknown_not_a_fact
   test_a_broken_jq_program_is_unknown_not_a_value
   test_a_broken_jq_program_is_unknown_on_the_failed_head_read
   test_a_broken_jq_program_is_unknown_on_the_pending_request_read
