@@ -357,6 +357,23 @@ test_a_file_the_reader_refuses_is_read_as_a_push_workflow() {
   assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "no named source is consulted"
 }
 
+# The reader refuses a tab only on a line it READS: it stops at the end of the `on:` block, so a
+# tab further down (a `<<-EOF` heredoc in a job's script) leaves the triggers read, and the retired
+# workflow stays retired. Refusing the whole file for it would read the workflow as a push one and
+# hand out its stale push green (the #401 shape) — a port that refused a tab anywhere did exactly
+# that.
+test_a_tab_past_the_triggers_does_not_unread_the_file() {
+  pushless_fixture
+  TIP_PULLS='[]'
+  WORKFLOW_YAML="$PUSHLESS_YAML"$'    steps:\n      - run: |\n          cat <<-EOF\n\t\tindented\n\t\tEOF\n'
+  run_base
+  assert_eq "$BASE_RC" 4 "a retired workflow with a tab under jobs: is still retired"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: NO VERDICT (tip ${SHA_C:0:8}) — ci no longer run(s) on push" \
+    "the headline is the retired one"
+  assert_not_contains "$BASE_OUTPUT" "could not be parsed for its triggers" "the file was parsed"
+  assert_not_contains "$BASE_OUTPUT" ": green" "the old push green is not the tip's"
+}
+
 # A read of the file that fails without establishing anything is UNKNOWN, not a guess in either
 # direction: transport that outlived its retries, and just as much the API REFUSING the read — a
 # token that may read Actions but not the repository's contents would otherwise pass for a file
@@ -940,6 +957,7 @@ tests=(
   test_a_malformed_records_file_is_refused
   test_a_workflow_that_still_runs_on_push_reads_as_before
   test_a_file_the_reader_refuses_is_read_as_a_push_workflow
+  test_a_tab_past_the_triggers_does_not_unread_the_file
   test_a_file_read_that_fails_is_unknown
   test_a_file_confirmed_absent_at_the_tip_reads_as_before
   test_a_push_workflow_green_at_the_tip_does_not_speak_for_a_retired_one

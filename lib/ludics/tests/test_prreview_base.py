@@ -71,7 +71,8 @@ class Readers(unittest.TestCase):
         flow = "on:\n  push:\n    paths-ignore: ['docs/**', \"*.md\"]\n"
         self.assertEqual(workflow_filter(flow, "push", "paths-ignore"), ["docs/**", "*.md"])
         refused = {
-            "a tab anywhere": DOCS_IGNORED.replace("    runs-on", "\truns-on"),
+            "a tab in the block": DOCS_IGNORED.replace("      - \"**.md\"", "\t- \"**.md\""),
+            "a tab before on:": "# a\tcomment\n" + DOCS_IGNORED,
             "an alias": "on:\n  push:\n    paths-ignore: *docs\n",
             "an include filter only": "on:\n  push:\n    paths:\n      - src/**\n",
             "no such event": "on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n",
@@ -82,6 +83,20 @@ class Readers(unittest.TestCase):
         for why, text in refused.items():
             with self.subTest(why):
                 self.assertIsNone(workflow_filter(text, "push", "paths-ignore"))
+
+    def test_a_tab_is_refused_only_on_a_line_the_readers_reach(self) -> None:
+        # awk's `/\t/ { bad = 1; exit }` runs per record, and both programs `exit` once they leave
+        # what they read, so a tab under jobs: (a <<-EOF heredoc) is never seen. Refusing it would
+        # read a retired workflow as a push one (the #401 false green).
+        tail = "    steps:\n      - run: |\n          cat <<-EOF\n\t\tx\n\t\tEOF\n"
+        self.assertEqual(workflow_filter(DOCS_IGNORED + tail, "push", "paths-ignore"),
+                         ["docs/**", "**.md"])
+        self.assertEqual(workflow_keys(DOCS_IGNORED + tail), ["push"])
+        self.assertEqual(workflow_keys(DOCS_IGNORED + tail, "push"), ["branches", "paths-ignore"])
+        self.assertEqual(workflow_keys(PUSHLESS + tail), ["pull_request", "schedule", "workflow_dispatch"])
+        self.assertIsNone(workflow_keys(PUSHLESS.replace("  workflow_dispatch", "\tworkflow_dispatch")))
+        self.assertIsNone(workflow_keys("on:\n  push:\n# a\ttab\n  pull_request:\n"),
+                          "a tab on a comment line inside the block is still reached")
 
     def test_the_keys_reader_reads_three_forms_and_tells_absent_from_unread(self) -> None:
         self.assertEqual(workflow_keys(PUSHLESS), ["pull_request", "schedule", "workflow_dispatch"])
@@ -111,6 +126,13 @@ class Readers(unittest.TestCase):
         self.assertFalse(adv("ci"))
         self.assertTrue(base.Advisory("^[[:alpha:]]+ docs$")("pages docs"))
         self.assertFalse(base.Advisory("(unclosed")("anything"), "an ERE grep refuses matches nothing")
+
+    def test_the_advisory_ere_reads_grep_word_anchors(self) -> None:
+        # grep -E (BSD and GNU) reads \< and \> as word anchors; Python's re reads literal < and >.
+        self.assertTrue(base.Advisory("\\<claude\\>")("claude review"))
+        self.assertTrue(base.Advisory("^claude\\>")("claude"))
+        self.assertFalse(base.Advisory("\\<claude\\>")("xclaude review"))
+        self.assertFalse(base.Advisory("^claude\\>")("claudex"))
 
 
 def row(wid: str, concl: str, sha: str, rid: str, created: str = "2026-09-10T00:00:00Z",

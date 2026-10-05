@@ -139,17 +139,23 @@ _POSIX_CLASSES = {
 }
 
 
+_WORD_ANCHORS = {"\\<": "\\b(?=\\w)", "\\>": "\\b(?<=\\w)"}
+
+
 def ere_to_python(ere: str) -> re.Pattern[str] | None:
     """A POSIX extended regular expression as Python's ``re``, or None when it does not compile
     (grep's exit 2, which matched nothing). Only bracket expressions differ in what this list
-    uses: POSIX classes, a literal backslash, and a leading ``]`` are rewritten there."""
+    uses: POSIX classes, a literal backslash, and a leading ``]`` are rewritten there. Outside
+    them, grep's word anchors ``\\<`` and ``\\>`` (both BSD and GNU grep -E honour them) become
+    lookarounds; Python would read them as a literal ``<`` and ``>``."""
     out: list[str] = []
     i = 0
     n = len(ere)
     while i < n:
         c = ere[i]
         if c == "\\" and i + 1 < n:
-            out.append(ere[i : i + 2])
+            pair = ere[i : i + 2]
+            out.append(_WORD_ANCHORS.get(pair, pair))
             i += 2
             continue
         if c != "[":

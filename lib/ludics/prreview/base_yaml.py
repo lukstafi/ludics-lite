@@ -17,6 +17,7 @@ shared candidates.
 """
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
@@ -53,14 +54,16 @@ class _Line:
     rest: str
 
 
-def _lines(text: str) -> list[_Line] | None:
+def _lines(text: str) -> Iterator[_Line | None]:
     """The records both programs read, preprocessed as their shared main rule does: trailing
-    spaces and CRs dropped, empty lines and comment lines skipped. None for a file holding a TAB
-    anywhere (the programs' first rule refuses it before anything else is read)."""
-    out: list[_Line] = []
+    spaces and CRs dropped, empty lines and comment lines skipped. A line holding a TAB yields
+    None, which the readers take as a refusal. Lazily, as awk reads: the programs' first rule
+    refuses a tab only on a line they reach, and both ``exit`` once they leave the part of the
+    file they read, so a tab further down (a heredoc under ``jobs:``) is never seen."""
     for raw in text.split("\n"):
         if "\t" in raw:
-            return None
+            yield None
+            return
         line = re.sub(r"[ \r]+$", "", raw)
         if line == "":
             continue
@@ -71,8 +74,7 @@ def _lines(text: str) -> list[_Line] | None:
         rest = re.sub(r"^[^:]*:", "", key, count=1)
         rest = re.sub(r"^[ ]+", "", rest, count=1)
         rest = re.sub(r"[ ]+#.*$", "", rest, count=1)
-        out.append(_Line(ind, key, rest))
-    return out
+        yield _Line(ind, key, rest)
 
 
 def _no_value(rest: str) -> bool:
@@ -86,9 +88,6 @@ def workflow_filter(text: str, want: str, seq: str) -> list[str] | None:
     established (the file does not parse this narrowly, or the key is not there). ``want`` and
     ``seq`` are matched as the awk program matched them: as regular expressions anchored at the
     key's start."""
-    lines = _lines(text)
-    if lines is None:
-        return None
     want_re = re.compile("^" + want + "[ ]*:")
     seq_re = re.compile("^" + seq + "[ ]*:")
     pats: list[str] = []
@@ -104,7 +103,10 @@ def workflow_filter(text: str, want: str, seq: str) -> list[str] | None:
         pats.append(item)
         return True
 
-    for ln in lines:
+    for ln in _lines(text):
+        if ln is None:
+            bad = True
+            break
         if state == 0:
             if ln.ind == 0 and _ON_KEY.match(ln.key):
                 if not _no_value(ln.rest):
@@ -165,9 +167,6 @@ def workflow_keys(text: str, want: str = "") -> list[str] | None:
     (``want`` empty), or the keys under the event ``want``. None when they cannot be established.
     Under a named event no keys at all is an answer (an empty list); at the ``on:`` level it is
     not, since a workflow with no trigger is a file this has misread."""
-    lines = _lines(text)
-    if lines is None:
-        return None
     keys: list[str] = []
     state = 0
     on_ind = want_ind = 0
@@ -185,7 +184,10 @@ def workflow_keys(text: str, want: str = "") -> list[str] | None:
     def key_name(key: str) -> str:
         return re.sub(r"[ ]*:.*$", "", key, count=1)
 
-    for ln in lines:
+    for ln in _lines(text):
+        if ln is None:
+            bad = True
+            break
         if state == 0:
             if ln.ind == 0 and _ON_KEY.match(ln.key):
                 on_ind = ln.ind
