@@ -553,7 +553,8 @@ inline CI run commands on its required platforms, so a new shell or Python suite
 miss either Unix platform, nor a new `ship-pr/scripts/test-*.sh` its Git Bash leg.
 Platform-specific fixtures have explicit exceptions in the checker.
 
-`check-prompts.sh` is the prompt hygiene check itself: every skill and routine `SKILL.md` opens
+`check-prompts.sh` (since ludics-lite#403 a forward to the Python in `lib/ludics/checkprompts/`) is
+the prompt hygiene check itself: every skill and routine `SKILL.md` opens
 with YAML frontmatter carrying one `name`, equal to its directory, and one single-line
 `description`, and every directory carrying a `SKILL.md` is named, in backticks, in the first cell
 of a row of the README that indexes it — the skill table above, the routine table in
@@ -569,7 +570,7 @@ ludics-lite#260 cut the wave prompt into sections addressed by anchor — `cli-c
 `native-workers.md#placement-and-launch` and six more — and verified them by hand, once; a renamed
 file or a retitled heading leaves such a link rendering as a link and landing nowhere, which is a
 defect a reader finds and a test never did. This is the same kind of lookup as the index one, over
-one fixed shape, spelled out in the checker's own header: a parenthesized target directly after a
+one fixed shape, spelled out in the header of the checker's `links` module: a parenthesized target directly after a
 bracketed label, on one line, with no blank in it, a path half ending in `.md`, and the whole
 target spelled in ordinary path characters. Anything else — a URL, a title after the target, a
 site-absolute path, a bare anchor, a percent escape or other spelling it would have to decode, a
@@ -1195,7 +1196,8 @@ standard-library-only Python 3.12 in one package, `lib/ludics/`, one script (and
 one subcommand) at a time behind unchanged command lines. Every Python entry point runs through
 `scripts/py`, which picks the first interpreter >= 3.12 (`scripts/test-py.sh`); a script's shell
 file stays the entry point and forwards to its module, and `pr-review.sh` forwards the subcommands
-named in its `PY_PORTED` (today: `body`). The shell suites above are the conformance suite for a
+named in its `PY_PORTED` (today: `body`); `check-prompts.sh` forwards whole, to
+`ludics.checkprompts`. The shell suites above are the conformance suite for a
 port, unchanged. The package's own checks are `npx --yes pyright@1.1.414` (strict, `pythonVersion`
 3.12, from `pyrightconfig.json`) and `scripts/py -m unittest discover -s lib -t lib -p 'test_*.py'`,
 both run by CI's `python` job. Where a port's code goes, how forwarding and the suites' shell
