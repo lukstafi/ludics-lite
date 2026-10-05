@@ -1073,12 +1073,27 @@ grep -q 'drift' <<<"$out" && ko "a root without scripts/sync-routines.sh is held
 CLEANUP_HELPER=ship-pr/scripts/post-merge-cleanup.sh
 CLEANUP_PROMPT=ship-pr/SKILL.md
 CLEANUP_AGREE="$CLEANUP_PROMPT and $CLEANUP_HELPER's usage() agree"
+# The helper in the tree is a STAND-IN that prints what the real helper prints: check-prompts reads
+# the helper's printed usage text and nothing else of it, and since the v2 rewrite
+# (ludics-lite#403) that text comes from a Python package the helper forwards to, which a copy of
+# the one file would not find. So the real helper is run once, here, as check-prompts runs it, and
+# the stand-in replays its stderr and exit status. The probes that mutate the helper mutate that
+# TEXT -- a row added, rows removed, a placeholder dropped, the status changed -- which is the
+# whole of what the checker sees, whatever renders it.
+CLEANUP_USAGE_RC=0
+CLEANUP_USAGE=$(bash "$SRC/$CLEANUP_HELPER" </dev/null 2>&1 >/dev/null) || CLEANUP_USAGE_RC=$?
+[ "$CLEANUP_USAGE_RC" -eq 2 ] \
+  || ko "the real $CLEANUP_HELPER run with no arguments exited $CLEANUP_USAGE_RC, not 2: $CLEANUP_USAGE"
 cleanup_tree() {
   rm -rf "$R"
   mkdir -p "$R/ship-pr/scripts"
   # shellcheck disable=SC2086
   copy_prompts "$R" README.md routines/README.md "$CLEANUP_PROMPT" $LINK_TARGETS
-  cp "$SRC/$CLEANUP_HELPER" "$R/$CLEANUP_HELPER"
+  {
+    printf '%s\n' '#!/usr/bin/env bash' "cat >&2 <<'CLEANUP_USAGE_TEXT'"
+    printf '%s\n' "$CLEANUP_USAGE" CLEANUP_USAGE_TEXT "exit $CLEANUP_USAGE_RC"
+  } >"$R/$CLEANUP_HELPER"
+  chmod +x "$R/$CLEANUP_HELPER"
 }
 # cleanup_edit <file> <sed-expression>: rewrites one copy, and says so if it matched nothing.
 cleanup_edit() {
@@ -1086,11 +1101,12 @@ cleanup_edit() {
   cmp -s "$R/cleanup.tmp" "$R/$1" && { ko "cleanup_edit: '$2' matched nothing in $1"; return 1; }
   mv "$R/cleanup.tmp" "$R/$1"
 }
-# cleanup_add_dry_run: declares a `--dry-run` flag in the helper's option table, ahead of `--base`,
-# so its usage text lists the option bare -- the one row shape the real table does not carry.
+# cleanup_add_dry_run: lists a `--dry-run` flag in the helper's usage text, ahead of `--base`, as
+# the option table renders a row with no placeholder -- the one row shape the real table does not
+# carry.
 cleanup_add_dry_run() {
-  cleanup_edit "$CLEANUP_HELPER" "s/^option --base /option --dry-run '' DRY_RUN 'Report what cleanup would do and change nothing'\\
-option --base /"
+  cleanup_edit "$CLEANUP_HELPER" "s/^  --base /  --dry-run             Report what cleanup would do and change nothing\\
+  --base /"
 }
 # The one invocation line the mutations below rewrite, spelled the way the prompt spells it: a
 # continuation line carrying two options. Read off the prompt rather than restated, so a probe
@@ -1259,20 +1275,20 @@ expect "an option named only in prose is still named" 0 "$CLEANUP_AGREE" -- "$CP
 # table its parse loop reads (ludics-lite#332), and a text this reader sees no options in is refused
 # rather than holding the prompt to nothing.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" '/^option --base /,/^$/d'
+cleanup_edit "$CLEANUP_HELPER" '/^  /d'
 expect "a usage() listing no options is refused, not passed" 1 \
   "$CLEANUP_HELPER: usage() lists no options" -- "$CP" "$R"
 # ...and a run that is not the usage error is no listing at all: a crash's output is not read as
 # an empty register, nor as a register.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" 's/^  exit 2$/  exit 1/'
+cleanup_edit "$CLEANUP_HELPER" 's/^exit 2$/exit 1/'
 expect "a helper whose usage error does not exit 2 is refused" 1 \
   "$CLEANUP_HELPER: run with no arguments, it printed no usage text" -- "$CP" "$R"
 # The listing is the table's: a row's placeholder is both what the text prints and what the
 # parser consumes, so a flag row is listed bare -- and the word after it on the prompt's command
 # line is read as the next option rather than skipped as a value.
 cleanup_tree
-cleanup_edit "$CLEANUP_HELPER" "s/^option --regenerable '<name>' /option --regenerable '' /"
+cleanup_edit "$CLEANUP_HELPER" 's/^  --regenerable <name>  /  --regenerable         /'
 printf '\n```bash\n~/x/post-merge-cleanup.sh a b c --regenerable --keep-branch\n```\n' >> "$R/$CLEANUP_PROMPT"
 expect "a flag row in the table is listed bare, so the word after it is an option" 1 \
   "passes '--keep-branch'" -- "$CP" "$R"
