@@ -101,6 +101,12 @@ R="$TMP/tree"
 fresh "$R"
 expect "a well-formed tree passes" 0 '6 passed, 0 failed' -- "$CP" "$R"
 expect "a missing root is refused, not passed" 2 'no such directory' -- "$CP" "$TMP/nowhere"
+# A root carrying no prompt at all is a verdict, not a pass over nothing.
+mkdir -p "$TMP/empty"
+expect "a root with no prompt at all is refused, not passed" 1 \
+  "FAIL: .: no */SKILL.md or routines/*/SKILL.md under $TMP/empty" -- "$CP" "$TMP/empty"
+expect "--help prints the usage and succeeds" 0 'usage: check-prompts.sh [root] | --one <dir>' -- "$CP" --help
+expect "an unknown option is a usage error" 2 'check-prompts: unknown option: --bogus' -- "$CP" --bogus
 
 # Single-directory mode shares the grammar but has no repository layout requirements.
 fresh "$R"
@@ -125,6 +131,11 @@ expect "no opening fence" 1 'alpha/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
 
 fresh "$R"; printf -- '---\nname: beta\ndescription: unclosed\n\n# beta\n' > "$R/beta/SKILL.md"
 expect "no closing fence" 1 'beta/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
+# The opening fence is the line `---` exactly: a CRLF line end or a trailing blank is not it.
+fresh "$R"; printf -- '---\r\nname: alpha\r\ndescription: CRLF throughout\r\n---\r\n' > "$R/alpha/SKILL.md"
+expect "a CRLF opening fence is no fence" 1 'alpha/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
+fresh "$R"; printf -- '--- \nname: alpha\ndescription: a blank after the fence\n---\n' > "$R/alpha/SKILL.md"
+expect "...nor is one with a trailing blank" 1 'alpha/SKILL.md: no YAML frontmatter' -- "$CP" "$R"
 
 fresh "$R"; skill "$R" alpha 'description: nameless'
 expect "missing name" 1 "alpha/SKILL.md: frontmatter has no 'name:' line" -- "$CP" "$R"
@@ -469,6 +480,16 @@ fixture_tree
 rm "$R/alpha/scripts/test-python.py"
 # The lookup is one-way, as the prompt register is: stale commands require no table model.
 expect "a removed fixture leaves no membership obligation" 0 '0 failed' -- "$CP" "$R"
+# A suite is a .sh, .py or .ps1 file: another `test-*` file is data, and owes no register line.
+fixture_tree
+touch "$R/alpha/scripts/test-data.json"
+expect "a test-* file that is not a suite carries no obligation" 0 'required CI platforms agree' -- "$CP" "$R"
+# The README's register is its `## Tests` section: the same command line under another heading
+# registers nothing.
+fixture_tree
+sed 's/^## Tests$/## Notes/' "$R/README.md" > "$R/register.tmp" && mv "$R/register.tmp" "$R/README.md"
+expect "a command line outside the README's Tests section is not in the register" 1 \
+  "fixture 'alpha/scripts/test-shell.sh' has no command line" -- "$CP" "$R"
 
 # --- the mac-studio correctness-slot count ----------------------------------------------------
 # The prompts quote a number that lives in one line of fleet-worker.sh (ludics-lite#160), so this
@@ -664,6 +685,11 @@ expect "a count about a box whose name starts with mac-studio is not this one's"
 slots_tree
 slots_edit issue-wave/references/native-claude.md 's/([a-z]* on mac-studio/(twenty six on mac-studio/'
 expect "a numeral phrase is read whole, spaces and all" 1 "native-claude.md: spells the mac-studio slot count 'twenty six'" -- "$CP" "$R"
+# The box name's far boundary may be the end of the text itself: a phrase closing the file, with
+# no newline after it, is read like any other.
+slots_tree
+printf '\n%s on mac-studio' "$STALE" >> "$R/README.md"
+expect "a count phrase ending the file is still read" 1 "README.md: spells the mac-studio slot count '$STALE'" -- "$CP" "$R"
 
 # A file the scan skips before reading it is a file the scan cannot hold, so the one filter that
 # stands before `slot_mentions` is pinned here. A NUL anywhere makes grep call the file binary,
@@ -994,6 +1020,17 @@ the path assigned to a variable|DRIFT_COMMAND=\2
 some other file of the same name|/tmp/sync-routines.sh
 ...and one under a same-named directory elsewhere|/tmp/scripts/sync-routines.sh
 EOF
+
+# `$HOME` names the same path `~` does; and an indented command line is four blanks or more, so
+# one indented less is prose, not the command.
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^\( *\)~/\([^ `]*sync-routines\.sh\)$|\1$HOME/\2|'
+expect "the invocation spelled through \$HOME is the same command" 0 \
+  'runs it to read its own drift' -- "$CP" "$R"
+drift_tree
+drift_edit "routines/$DRIFT_ONE/SKILL.md" 's|^ *\([^ `]*sync-routines\.sh\)$|   \1|'
+expect "an invocation indented less than four blanks is not the command" 1 \
+  "routines/$DRIFT_ONE/SKILL.md: $DRIFT_WANT" -- "$CP" "$R"
 
 # The path is the README's to state, and the checker reads it from there rather than restating
 # it: a root whose install line is gone cannot be judged, and says so instead of passing.
@@ -1888,6 +1925,26 @@ links_tree
 links_body alpha/SKILL.md 'Prose with \\[note](references/gone.md), where the backslash is the escaped one.'
 expect "...while two backslashes escape each other and leave a real opener" 1 \
   'resolves to no file: alpha/references/gone.md' -- "$CP" "$R"
+
+# The `]` of a candidate is read with the same parity: an escaped one closes no label either.
+links_tree
+links_body alpha/SKILL.md 'Prose [with an escaped closer\](references/gone.md) renders as text.'
+expect "an escaped closing bracket closes no label" 0 '0 failed' -- "$CP" "$R"
+# A `+` is one of the path characters the shape admits, so such a target is read and checked.
+links_tree
+links_body alpha/SKILL.md 'See [a plus in the name](references/c++.md).'
+expect "a '+' is a path character, so its target is read" 1 \
+  'resolves to no file: alpha/references/c++.md' -- "$CP" "$R"
+# An ATX heading is one to six hashes followed by a blank or the line end: seven hashes, and a
+# hash run glued to its text, are paragraphs to GFM and contribute no anchor.
+links_tree
+printf '\n####### Seven hashes\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [seven](references/notes.md#seven-hashes).'
+expect "seven hashes open no heading" 1 "GitHub slug is 'seven-hashes'" -- "$CP" "$R"
+links_tree
+printf '\n#tagline\n' >> "$R/alpha/references/notes.md"
+links_body alpha/SKILL.md 'See [a tag](references/notes.md#tagline).'
+expect "...nor does a hash run glued to its text" 1 "GitHub slug is 'tagline'" -- "$CP" "$R"
 
 # The raw-HTML forms beyond tags and comments render as markup and contribute no heading text, so
 # the source reading handed `## <?target?>` the anchor `target`, which GitHub does not create
