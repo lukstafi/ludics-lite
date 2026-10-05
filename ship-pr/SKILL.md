@@ -320,8 +320,8 @@ not buy fresh grace. Comments arriving after the extension was fixed remain pend
 next observer, so a later request cannot renew this window or lose its own opportunity to be
 observed. Ordinary replies and edits reset nothing.
 
-Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts a foreground
-tool's timeout, which is why it is backgrounded. Spell the repo out, as above: a background shell
+Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it; the polling budget below
+sets its pause) outlasts a foreground tool's timeout, which is why it is backgrounded. Spell the repo out, as above: a background shell
 does not reliably start in the checkout.
 
 **Never pipe a gate command** — `watch`, `poll`, `checks`, `base`, `merge` — through `tail`, `head`
@@ -872,6 +872,18 @@ the successor automatically, and neither merge override bypasses this refusal. A
 head returns 3, never superseded or green. Detection occurs on the next poll (after any active
 API calls), not through a push notification. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
 wait again instead.
+
+**The polling budget** (ludics-lite#543) is shared by every observer: `watch`, `checks --wait` and
+`merge --wait`. Each one reads at once, then pauses for its interval (`WATCH_INTERVAL`,
+`SHIP_PR_CHECKS_INTERVAL`). While nothing moves, the pause doubles up to 300 s for a review and
+600 s for a build (`SHIP_PR_REVIEW_POLL_CAP`, `SHIP_PR_BUILD_POLL_CAP`). A PR has ONE observer of each
+kind: a second `watch`, or a second `--wait` on a PR, exits 2 naming the first's pid, so wait on
+that one rather than arming another. A call GitHub refuses on quota is exit 3, never a verdict, and
+it sets a hold for every `pr-review.sh` on the host. The hold ends where the failing endpoint's own
+headers say (never `/rate_limit`), and it lifts only when that endpoint answers a probe. An
+observer waits the hold out within its ceiling. Any other command exits 3 at once without calling.
+So a quota exit 3 is not a reason to re-arm sooner: the next call waits for the same hold. The
+mechanism and its boundary are in `pr-review.sh` (*the polling budget*).
 
 **`ABSENT` seconds after a push used to be the trap here** — a push (a rebase before merging, or
 any other) creates a head whose checks do not EXIST yet, and a wait armed in that window saw

@@ -381,6 +381,7 @@ ship-pr/scripts/test-pr-review-status.sh
 ship-pr/scripts/test-pr-review-watch.sh
 ship-pr/scripts/test-pr-review-reply.sh
 ship-pr/scripts/test-pr-review-retry.sh
+ship-pr/scripts/test-pr-review-budget.sh
 ship-pr/scripts/test-pr-review-api-contract.sh
 scripts/test-wake-lab.sh
 scripts/test-wake-lab-linux.sh
@@ -848,6 +849,19 @@ run watch` run as processes against a gh stub that refuses every call, each exit
 one call. `watch` used to hold its window blind and exit 3, the code that says re-arm.
 `test-pr-review-merge.sh` holds the merge call's half: the script's own flags refused is exit 2,
 and with the caller's flags forwarded after `--` the same refusal stays the ambiguous exit 3.
+
+`test-pr-review-budget.sh` drives the polling budget (ludics-lite#543) on a clock kept in a file,
+so the hold's end, its probes and the pauses are exact and nothing sleeps. A call GitHub refuses on
+quota is UNKNOWN (exit 3) and never merges. Its hold ends where the failing endpoint's own
+`X-RateLimit-Reset` says (never `/rate_limit`), and every caller during the hold, `merge` and
+`checks` alike, sends no request at all. A quota answer to the run await is exit 3, not the "no
+such run" exit 2. A `--wait` waits the hold out and repeats the refused read only after a probe of
+that endpoint answers; a probe that still finds the quota out sets the next hold from its own
+headers. A second build observer of a PR is refused naming the first's pid, a dead holder is
+replaced, and while one process probes an ended hold the others send nothing. A still queue backs
+off from the interval to the build cap with nothing printed per poll, a moving signal resets the
+pause, and a red still ends the wait at once. `test-pr-review-watch.sh` pins the same pause for a
+review window. A transport failure (a 502) stays exit 3 with no merge and sets no hold.
 
 `test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
 comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge
