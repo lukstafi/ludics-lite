@@ -440,9 +440,10 @@ class GhSession:
         quota_unheld = 0
         budget = self.budget if budgeted else None
         while True:
-            in_scope = budget is not None and budget.in_scope()
-            # The polling budget's hold: no call while one stands.
-            if budget is not None and in_scope:
+            # The polling budget: an own call goes to github.com or not at all, and no call while a
+            # hold stands.
+            if budget is not None:
+                budget.require_github()
                 held = budget.gate(mode)
                 if held is not None:
                     self._err_line = held
@@ -466,7 +467,7 @@ class GhSession:
             # waits that hold out at the gate above and repeats; a read the probe found no hold for
             # gets one more try, and a write is never repeated.
             if quota_failure(first):
-                if budget is not None and in_scope:
+                if budget is not None:
                     unrecorded = budget.quota_hit(args)
                     if unrecorded is not None:
                         self._err_line = unrecorded
@@ -583,8 +584,8 @@ def repo_from_cwd(
     One divergence, on purpose: the shell's ``gh ... | grep .`` under pipefail printed gh's
     nonempty lines even when gh then FAILED, and fell through to git as well; here a failed gh
     contributes nothing."""
-    in_scope = budget is not None and budget.in_scope()
-    if budget is not None and in_scope:
+    if budget is not None:
+        budget.require_github()
         held = budget.gate("read")
         if held is not None:
             fail(3, f"could not resolve the repository from the checkout: {held}.",
@@ -596,7 +597,7 @@ def repo_from_cwd(
             return "\n".join(lines)
     # Refused on quota, it is a hold like any other call's, and still no reason for the remote.
     if quota_failure(_first_line(done.stderr)):
-        unrecorded = budget.quota_hit(["repo", "view"]) if budget is not None and in_scope else None
+        unrecorded = budget.quota_hit(["repo", "view"]) if budget is not None else None
         if unrecorded is not None:
             fail(3, f"could not resolve the repository from the checkout: {unrecorded}.")
         fail(3, "could not resolve the repository from the checkout: gh repo view was refused on quota.",

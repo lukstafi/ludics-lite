@@ -648,12 +648,14 @@ test_a_hold_set_before_the_lock_stops_the_probe() {
 
 # The script's own calls name no host, so gh sends them to GH_HOST when it is set: an Enterprise
 # GH_HOST puts them outside the budget. A job-only run view reads the job.
-# (A job-only run view reading the job: test_prreview_budget.py.)
+# A GH_HOST naming another host would put the calls out of the budget, so it is refused before
+# any call (ludics-lite#551). (A job-only run view reading the job: test_prreview_budget.py.)
 test_the_scope_and_the_job_read_what_gh_reads() {
   reset_fixture
   QUOTA_UNTIL=$((T0 + 7200))
   run ghe eval 'GH_HOST=ghe.example.com cmd_checks "$REPO#7"'
-  assert_eq "$(standing)" "" "a GH_HOST naming another host puts the calls out of scope ($(err ghe))"
+  assert_eq "$(rc ghe) $(requests)" "2 " "a GH_HOST naming another host is refused, unasked ($(err ghe))"
+  assert_eq "$(standing)" "" "and holds nothing"
   run dotcom eval 'GH_HOST=github.com cmd_checks "$REPO#7"'
   assert_eq "$(standing | cut -f2)" "repos/$REPO/pulls/7" "and github.com keeps them in ($(err dotcom))"
 }
@@ -750,12 +752,14 @@ test_a_wait_behind_a_probe_marks_the_round() {
 
 # An observer's quota refusal outside the budget (an Enterprise GH_HOST) gets no second try: with
 # no hold to wait for, a second read is only another request during the incident.
+# An observer on another host is never retried on quota: since ludics-lite#551 it is refused before
+# its first request, so there is no refusal to retry.
 test_an_out_of_scope_refusal_is_not_retried() {
   reset_fixture
   QUOTA_UNTIL=$((T0 + 600))
   run read eval 'GH_HOST=ghe.example.com cmd_checks "$REPO#7" --wait'
-  assert_eq "$(rc read)" 3 "it is UNKNOWN ($(err read))"
-  assert_eq "$(requests)" "read repos/$REPO/pulls/7 quota" "after one request"
+  assert_eq "$(rc read)" 2 "it is refused ($(err read))"
+  assert_eq "$(requests)" "" "before any request"
 }
 
 # The run await's -R can name another host (HOST/OWNER/REPO): that server's quota is its own, so
@@ -764,7 +768,7 @@ test_a_host_qualified_run_await_is_scoped_by_its_host() {
   reset_fixture
   QUOTA_UNTIL=$((T0 + 600))
   run ghe cmd_retry run watch 55 -R ghe.example.com/o/r
-  assert_eq "$(rc ghe)" 3 "its refusal is UNKNOWN ($(err ghe))"
+  assert_eq "$(rc ghe) $(requests)" "2 " "another host is refused before any request (ludics-lite#551) ($(err ghe))"
   assert_eq "$(standing)" "" "and sets no hold"
   reset_fixture
   QUOTA_UNTIL=$((T0 + 600))
@@ -941,6 +945,26 @@ test_a_moving_run_before_any_check_resets_the_pause() {
     "the run's own status moving resets the pause, with no check row to show it"
 }
 
+# Another host is refused loudly, before any request, in one message: the budget covers github.com
+# alone, and the fleet uses nothing else (ludics-lite#551, the coordinator's round-9 proposal on
+# #549). A retry caller's own call is outside the budget, whatever host it names.
+test_another_host_is_refused_loudly() {
+  reset_fixture
+  run ghe eval 'GH_HOST=ghe.example.com cmd_checks "$REPO#7"'
+  assert_eq "$(rc ghe)" 2 "a GH_HOST naming another server is refused ($(err ghe))"
+  assert_contains "$(err ghe)" "ghe.example.com" "naming it"
+  assert_eq "$(err ghe | grep -c .)" 1 "in one message"
+  assert_eq "$(requests)" "" "before any request"
+  run named cmd_retry run watch 55 -R ghe.example.com/o/r
+  assert_eq "$(rc named)" 2 "a named host is refused alike ($(err named))"
+  assert_eq "$(err named | grep -c .)" 1 "in one message"
+  assert_eq "$(requests)" "" "before any request"
+  run base eval 'REPO=; GH_HOST=ghe.example.com cmd_base'
+  assert_eq "$(rc base) $(requests)" "2 " "and so is base's resolution of the repository ($(err base))"
+  run caller eval 'GH_HOST=ghe.example.com cmd_retry --read api repos/ghe/repo'
+  assert_eq "$(rc caller)" 0 "a retry caller's call is outside the budget, any host ($(err caller))"
+}
+
 run_tests \
   test_a_quota_refusal_is_unknown_and_holds_every_caller \
   test_a_transport_failure_is_unknown_and_never_merges \
@@ -980,6 +1004,7 @@ run_tests \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
   test_an_unrecordable_first_hold_is_a_state_directory_error \
   test_a_moving_run_before_any_check_resets_the_pause \
+  test_another_host_is_refused_loudly \
   -- "$@"
 exit "$?"
 }

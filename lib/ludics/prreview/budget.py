@@ -46,9 +46,10 @@ quota with a 200). A probe addresses the call's own endpoint: the one positional
 ``repos/<repo>/actions/runs/<id>`` (or ``.../jobs/<id>`` with ``--job``) for ``run view``, and
 ``graphql`` for every other gh command, since gh's pr and issue commands ride GraphQL, which has its
 own quota. A call whose endpoint cannot be told sets no hold. The budget covers this script's OWN
-calls to github.com: a ``retry`` caller's call (any host, repository or command form gh accepts) is
-neither gated nor held, a GH_HOST naming another server takes every call out, and every probe
-names github.com. A gate round that waited a hold out between its reads is read again whole
+calls, and they go to github.com alone: a GH_HOST naming another server, or a run await whose -R
+names one (HOST/OWNER/REPO), is refused with exit 2 before any call (ludics-lite#551; it used to put
+the calls silently outside the budget), and every probe names github.com. A ``retry`` caller's call
+(any host, repository or command form gh accepts) is neither gated, held nor refused. A gate round that waited a hold out between its reads is read again whole
 (``Gate.check``), and nothing after ``merge``'s gate waits a hold out at all; ``watch`` rounds are
 not re-read (an approval it reports still goes through that gate). The hold is per state
 directory, not per account: another host learns of the quota from its own first refusal. And one
@@ -346,6 +347,26 @@ class Budget:
         host, else GH_HOST, which gh uses only when no host is named."""
         host = self.host or self.env.get("GH_HOST", "") or GITHUB
         return host == GITHUB
+
+    def require_github(self) -> None:
+        """Refuse (exit 2) one of this script's own calls bound for another host, before it is sent
+        (ludics-lite#551). Such a call used to go out silently outside the budget -- no hold, no
+        observer's wait -- and the fleet reaches no other host; one clear refusal says so instead."""
+        if self.in_scope():
+            return
+        if self.host:
+            die(
+                f"the repository is named on {self.host} (HOST/OWNER/REPO), and pr-review.sh's own",
+                "calls go to github.com alone: its polling budget (the quota hold every process on the",
+                "host shares, ludics-lite#543) covers no other server. Name it as owner/name. Nothing",
+                "was sent.",
+            )
+        die(
+            f"GH_HOST names {self.env.get('GH_HOST', '')}, and pr-review.sh's own calls go to github.com",
+            "alone: its polling budget (the quota hold every process on the host shares,",
+            "ludics-lite#543) covers no other server. Unset GH_HOST, or set it to github.com. Nothing",
+            "was sent.",
+        )
 
     def waiting(self) -> bool:
         """Is this command an observer still inside its ceiling?"""
