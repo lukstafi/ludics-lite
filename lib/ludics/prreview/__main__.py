@@ -13,6 +13,8 @@ import os
 import sys
 
 from ludics import cli
+from ludics.prreview import budget
+from ludics.prreview.clock import clock_from_env, plain_sleep
 from ludics.prreview.core import PROG, GhSession, die, load_config
 
 PORTED = (
@@ -34,7 +36,19 @@ def dispatch(argv: list[str]) -> int:
     elif args and args[0].startswith("--repo="):
         env["REPO"] = args[0][len("--repo=") :]
         args = args[1:]
-    session = GhSession(load_config(env))
+    config = load_config(env)
+    # The polling budget every subcommand's own calls share (its knobs validated here, for every
+    # subcommand, as the shell validated them when it was sourced). The observer lock a command
+    # takes is released however it ends.
+    shared = budget.from_env(env, clock_from_env(env))
+    session = GhSession(config, sleep=plain_sleep(env), budget=shared)
+    try:
+        return _run(session, args, env)
+    finally:
+        shared.release()
+
+
+def _run(session: GhSession, args: list[str], env: dict[str, str]) -> int:
     sub = args[0] if args else ""
     rest = args[1:]
     match sub:

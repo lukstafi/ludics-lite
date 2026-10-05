@@ -14,6 +14,7 @@ obscurely (``abc`` ended the command with status 0 and no output), so here it is
 import os
 
 from ludics import cli
+from ludics.prreview.clock import clock_from_env
 from ludics.prreview.core import GhSession, die, fail, pr_arg
 from ludics.prreview.gate import Gate, load_gate_config
 from ludics.prreview.shtext import is_digits
@@ -46,7 +47,11 @@ def run(session: GhSession, args: list[str]) -> int:
         else:
             die(f"checks: unknown option '{arg}'")
     target = pr_arg(pr, session.config.repo)
-    gate = Gate(session, target.repo, config)
+    # A --wait is the PR's build observer from its first read on, the advisory list's included
+    # (the polling budget, budget.py): a second is refused before it reads anything.
+    if session.budget is not None:
+        session.budget.observe("build", wait_for, target.repo, target.num)
+    gate = Gate(session, target.repo, config, clock_from_env(os.environ))
     policy = gate.advisory_policy()
     if policy == 0:
         rc = gate.check(target.num, wait_for)

@@ -27,6 +27,7 @@ from ludics.prreview import ere
 from ludics.prreview import knobs
 from ludics.prreview.core import GhFailed, GhOk, GhSession, GhUnanswered, warn
 from ludics.prreview.checkruns import conclusion_class, newest_first_lines
+from ludics.prreview.budget import pause
 from ludics.prreview.clock import Clock, FuncClock, age_of, fmt_age, freshest_age, newest
 from ludics.prreview.shtext import herestring_lines, is_digits, placeholder, tab_fields
 from ludics.prreview.workflows import RecognitionLimits, Reads, head_within_paths_ignore
@@ -579,6 +580,18 @@ class Gate:
         report. 0 green or a confirmed absence; 1 red (a check, a checkless run, or every red
         waived); 3 unread; 4 no verdict yet; 5 the head was superseded."""
         repo = self.repo
+        budget = self.session.budget
+        # A wait is the PR's build observer (the polling budget, budget.py): one at a time, and it
+        # may wait a quota hold out within its ceiling, the same ceiling as its own. Both run from
+        # the command's start (``wait_from``, which `checks` and `merge` take before their own first
+        # read), so neither a hold nor a preflight read extends the advertised wait. A single read
+        # is neither.
+        started = self.clock.now()
+        if wait_for > 0 and budget is not None:
+            budget.observe("build", wait_for, repo, pr)
+            if budget.wait_from is not None:
+                started = budget.wait_from
+        deadline = started + wait_for
         self.gate_base = ""
         self.waived = set()
         self.run_waived = 0
@@ -593,11 +606,13 @@ class Gate:
             )
             return 3
         self.check_sha = sha
-        started = self.clock.now()
-        deadline = started + wait_for
         beat = started
         run_why = ""
+        last_sig = ""
+        last_pause: int | None = None
         while True:
+            if budget is not None:
+                budget.waited = False
             rows = self.build_checks(sha)
             if rows is None:
                 self.verdict = "unknown"
@@ -664,6 +679,11 @@ class Gate:
                     " re-run for the new head"
                 )
                 return 5
+            # A round that waited a quota hold out between its reads is two moments, not one: a
+            # check read green before the wait may have been re-run since. Read the round again.
+            if budget is not None and budget.waited:
+                warn("a quota hold was waited out inside this round's reads; reading the round again")
+                continue
             now = self.clock.now()
             if self.verdict not in ("pending", "unjudged"):
                 break
@@ -676,7 +696,16 @@ class Gate:
                     f"{wait_for // 60} min ({note})",
                 )
                 beat = now
-            self.clock.sleep(min(self.config.checks_interval, deadline - now))
+            # The budget's pause: back to the interval after a read that saw the signal move,
+            # doubling toward the build cap while a queue sits still, and capped at the remaining
+            # deadline. The signal's state alone: run_why is prose for a person, and it carries the
+            # head's age during the run-creation grace, which moves on every read.
+            sig = f"{self.verdict}|{self.check_pending}|{self.check_green}|{self.check_total}"
+            cap = budget.build_cap if budget is not None else self.config.checks_interval
+            sleep_for = pause(self.config.checks_interval, cap, last_pause, sig != last_sig)
+            last_sig = sig
+            last_pause = sleep_for
+            self.clock.sleep(min(sleep_for, deadline - now))
         note = f" ({self.check_green} build check(s) have passed so far)" if self.check_green > 0 else ""
         head = f"build signal {repo}#{pr} @{sha[:8]}"
         match self.verdict:

@@ -48,7 +48,9 @@ The helpers more than one `pr-review.sh` subcommand reads are ported once, in a 
 ```
 prreview/jqsem.py          jq's value semantics, order and regex dialect, for every ported jq program
 prreview/shtext.py         the shell's readings of text (`IFS=$'\t' read`, `${x#*$'\n'}`), encode_ref
-prreview/clock.py          the clock (SHIP_PR_TEST_CLOCK) and newest/age_of/freshest_age/fmt_age
+prreview/clock.py          the clock (SHIP_PR_TEST_CLOCK), the bridged sleep, newest/age_of/freshest_age/fmt_age
+prreview/budget.py         the polling budget (ludics-lite#543): the pause, the quota hold and its probe,
+                           the observer locks, and the state directory every version on a host shares
 prreview/knobs.py          the source-time constants beyond the core's, one forward name each
 prreview/feeds.py          the feeds, the round snapshot, pr_head_read, substantive_reviews
 prreview/state.py          status_state, status_line, approval_gate, gated_state, review_rounds
@@ -95,11 +97,16 @@ and the Python runs each such call as `<the same bash> -c '. <file>; gh "$@"'`. 
 shell's own `$(gh ...)` subshell saw, so a fixture that keeps its counters in files (they all do,
 for that reason) behaves the same. In production nothing is a function and `gh` is the binary.
 
-Not bridged: a suite's stub of a **time** command (`sleep`, `date`, SECONDS). The clock is an
-environment interface instead, `SHIP_PR_TEST_CLOCK` (`prreview/clock.py`, shared by every port):
-a file holding an epoch second that IS the clock -- every age and deadline is read from it -- and
-that a sleep advances instead of waiting. The shell's `clock_now` reads the same file, so a suite
-that exports it drives either implementation; test-pr-review-watch.sh runs every case on it.
+Not bridged: a suite's stub of the **clock** (`date`, SECONDS). The clock is an environment
+interface instead, `SHIP_PR_TEST_CLOCK` (`prreview/clock.py`, shared by every port): a file holding
+an epoch second that IS the clock -- every age and deadline is read from it -- and that a sleep
+advances instead of waiting. The shell's `clock_now` reads the same file, so a suite that exports it
+drives either implementation; test-pr-review-watch.sh runs every case on it.
+
+`sleep` IS bridged (with `gh` and `git`): a suite's `sleep` observes the wait -- the pauses it logs,
+what it lets happen meanwhile (test-pr-review-budget.sh's SLEEP_HOOK) -- which only a call carries.
+When the forwarding shell defines one, it is every sleep the Python takes, the test clock's
+included, so a suite that defines one under SHIP_PR_TEST_CLOCK advances that clock in it.
 
 ## Helpers shared across subcommands
 

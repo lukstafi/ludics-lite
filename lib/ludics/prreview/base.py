@@ -52,7 +52,7 @@ from ludics.prreview.ere import Advisory
 from ludics.prreview.gate import GateConfig, Gate, load_gate_config
 from ludics.prreview.workflows import Reads
 from ludics.prreview.checkruns import conclusion_class, newest_first
-from ludics.prreview.clock import FuncClock, age_of
+from ludics.prreview.clock import Clock, FuncClock, age_of, clock_from_env
 from ludics.prreview.shtext import encode_ref, tab_fields
 from ludics.prreview.workflow_yaml import paths_ignore_covers, workflow_filter, workflow_keys
 from ludics.prreview.core import (
@@ -432,7 +432,7 @@ class Base:
         knobs: Knobs,
         repo: str,
         *,
-        clock: FuncClock | None = None,
+        clock: Clock | FuncClock | None = None,
         gate_config: GateConfig | None = None,
         gate: GateRunner | None = None,
         records: Sequence[Record] = (),
@@ -440,7 +440,7 @@ class Base:
         self.session = session
         self.knobs = knobs
         self.repo = repo
-        self.clock = clock if clock is not None else FuncClock()
+        self.clock: Clock | FuncClock = clock if clock is not None else clock_from_env(os.environ)
         self.gate_config = gate_config if gate_config is not None else load_gate_config(os.environ)
         self._gate: GateRunner = gate if gate is not None else self._gate_checks
         self.records = list(records)
@@ -874,7 +874,7 @@ def parse_args(args: Sequence[str], repo: str, knobs: Knobs) -> Args:
     return Args(repo, branch, int(wait_text), interim, records)
 
 
-def run(session: GhSession, args: list[str], *, clock: FuncClock | None = None,
+def run(session: GhSession, args: list[str], *, clock: Clock | FuncClock | None = None,
         gate: GateRunner | None = None, env: Mapping[str, str] | None = None) -> int:
     environ = os.environ if env is None else env
     knobs = load_knobs(environ)
@@ -892,7 +892,8 @@ def run(session: GhSession, args: list[str], *, clock: FuncClock | None = None,
              "tip has not moved — a tip that moves restamps the grace and no ceiling this close can then",
              "reach it. Size it from the two knobs instead:",
              f"--wait={grace + interval} or more (ludics-lite#175).")
-    repo = parsed.repo or repo_from_cwd() or ""
+    # A standing quota hold is exit 3 from the resolution itself (repo_from_cwd), never a guess.
+    repo = parsed.repo or repo_from_cwd(budget=session.budget) or ""
     if not repo:
         die("base: name the repo — `base owner/name [branch]`, --repo, or REPO=.",
             "cwd inference only works from a checkout, and not from a background shell.")

@@ -34,9 +34,13 @@ import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, NoReturn
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 from ludics import cli, proc
+
+if TYPE_CHECKING:
+    # budget.py imports this module; the session holds one at run time, typed here only.
+    from ludics.prreview.budget import Budget
 
 PROG = "pr-review.sh"
 
@@ -137,9 +141,26 @@ def gateway_failure(text: str) -> bool:
 
 _HTTP_4XX = re.compile(r"HTTP 4[0-9][0-9]")
 
+# The quota reader's fail-closed allowlist (budget.py's BOUNDARY states it).
+_QUOTA_MARKERS = (
+    "API rate limit exceeded",
+    "API rate limit already exceeded",
+    "secondary rate limit",
+    "(HTTP 429)",
+)
+
+
+def quota_failure(text: str) -> bool:
+    """``quota_failure``: does this text say GitHub's quota refused the call? Then it is no answer
+    about what was asked (the polling budget, budget.py)."""
+    return any(marker in text for marker in _QUOTA_MARKERS)
+
 
 def api_rejection(text: str) -> bool:
-    """``api_rejection``: an explicit 4xx, i.e. the API ANSWERED the request."""
+    """``api_rejection``: an explicit 4xx, i.e. the API ANSWERED the request. A quota refusal (a
+    403 or 429) is not an answer about the request either."""
+    if quota_failure(text):
+        return False
     return _HTTP_4XX.search(text) is not None
 
 
@@ -370,6 +391,7 @@ class GhSession:
         *,
         run: Callable[[str, Sequence[str]], proc.Completed] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        budget: "Budget | None" = None,
     ) -> None:
         self.config = config
         self._run: Callable[[str, Sequence[str]], proc.Completed] = (
@@ -377,6 +399,9 @@ class GhSession:
         )
         self._sleep = sleep
         self._err_line = ""
+        # The polling budget (budget.py): every own call passes its hold's gate. None in the unit
+        # tests that drive the retry policy alone.
+        self.budget = budget
 
     def err_line(self) -> str:
         return self._err_line
@@ -384,26 +409,44 @@ class GhSession:
     def retry(self, mode: Mode, args: Sequence[str]) -> GhResult:
         """``gh_retry <mode> <args>`` for THIS script's own arguments. gh refusing one of them
         raises ``GhRefusedOwn`` (exit 2 for the whole command)."""
-        result = self._retry(mode, args, "own")
+        result = self._retry(mode, args, "own", budgeted=True)
         match result:
             case GhArgsRefused():
                 raise AssertionError("an own call's refusal raises, it is never returned")
             case GhOk() | GhFailed() | GhUnanswered():
                 return result
 
-    def retry_caller(self, mode: Mode, args: Sequence[str], *, listed: bool) -> GhCallerResult:
+    def retry_caller(
+        self, mode: Mode, args: Sequence[str], *, listed: bool, budgeted: bool = False
+    ) -> GhCallerResult:
         """``gh_retry`` with ``GH_RETRY_CALLER_ARGS`` set: a CALLER's arguments (``cmd_retry``).
         ``listed`` (the command passed ``gh_api_only_command``): a refusal of the arguments
-        returns ``GhArgsRefused`` on the first attempt. Unlisted: stderr is not read as gh's."""
-        return self._retry(mode, args, "listed" if listed else "unlisted")
+        returns ``GhArgsRefused`` on the first attempt. Unlisted: stderr is not read as gh's.
+        ``budgeted``: the call is still this script's own (merge's, with a caller's ``gh pr merge``
+        flags forwarded), so it passes the polling budget; a ``retry`` caller's is outside it."""
+        return self._retry(mode, args, "listed" if listed else "unlisted", budgeted=budgeted)
 
     def _retry(
-        self, mode: Mode, args: Sequence[str], whose: Literal["own", "listed", "unlisted"]
+        self,
+        mode: Mode,
+        args: Sequence[str],
+        whose: Literal["own", "listed", "unlisted"],
+        *,
+        budgeted: bool,
     ) -> GhCallerResult:
         attempts = self.config.api_attempts
         delay = self.config.api_backoff
         attempt = 1
+        quota_unheld = 0
+        budget = self.budget if budgeted else None
         while True:
+            in_scope = budget is not None and budget.in_scope()
+            # The polling budget's hold: no call while one stands.
+            if budget is not None and in_scope:
+                held = budget.gate(mode)
+                if held is not None:
+                    self._err_line = held
+                    return GhUnanswered()
             done = self._run("gh", args)
             err = proc.substitution(done.stderr)
             out = proc.substitution(done.stdout)
@@ -418,6 +461,20 @@ class GhSession:
                 if whose == "listed":
                     return GhArgsRefused()
                 raise GhRefusedOwn(refused_own_message(args, first))
+            # A quota refusal is no answer about what was asked, so it is 3 under both policies, and
+            # it is not retried on the backoff below: it sets the hold instead. An observer's read
+            # waits that hold out at the gate above and repeats; a read the probe found no hold for
+            # gets one more try, and a write is never repeated.
+            if quota_failure(first):
+                if budget is not None and in_scope:
+                    budget.quota_hit(args)
+                    if mode == "read" and budget.waiting():
+                        if budget.hold_read() is not None:
+                            continue
+                        quota_unheld += 1
+                        if quota_unheld < 2:
+                            continue
+                return GhUnanswered()
             # A fixed GraphQL answer is read FIRST, under both policies: the substring scans
             # below would match a marker the message only quotes.
             if graphql_fixed_answer(first):
@@ -511,18 +568,35 @@ def pr_arg(arg: str, repo: str) -> PrTarget:
 
 def repo_from_cwd(
     run: Callable[[str, Sequence[str]], proc.Completed] = proc.run_tool,
+    budget: "Budget | None" = None,
 ) -> str | None:
     """``repo_from_cwd``, for ``base`` alone: ``gh repo view`` (it honours gh-resolved), then the
     origin remote, which answers locally when GraphQL is down. None when neither names one.
 
+    ``gh repo view`` is not the session's call, so it passes the polling budget's gate itself. A
+    hold, or a quota refusal of the view, is exit 3 and never a reason to fall back to the remote,
+    which in a fork names the fork and not the repository gh resolved.
+
     One divergence, on purpose: the shell's ``gh ... | grep .`` under pipefail printed gh's
     nonempty lines even when gh then FAILED, and fell through to git as well; here a failed gh
     contributes nothing."""
+    in_scope = budget is not None and budget.in_scope()
+    if budget is not None and in_scope:
+        held = budget.gate("read")
+        if held is not None:
+            fail(3, f"could not resolve the repository from the checkout: {held}.",
+                 "Pass it as owner/name, or wait for the hold.")
     done = run("gh", ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
     if done.rc == 0:
         lines = [line for line in done.stdout.split("\n") if line]
         if lines:
             return "\n".join(lines)
+    # Refused on quota, it is a hold like any other call's, and still no reason for the remote.
+    if quota_failure(_first_line(done.stderr)):
+        if budget is not None and in_scope:
+            budget.quota_hit(["repo", "view"])
+        fail(3, "could not resolve the repository from the checkout: gh repo view was refused on quota.",
+             "Pass it as owner/name, or wait for the hold.")
     done = run("git", ["remote", "get-url", "origin"])
     if done.rc != 0:
         return None

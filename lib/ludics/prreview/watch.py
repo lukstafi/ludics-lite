@@ -31,6 +31,7 @@ from dataclasses import dataclass, replace
 from typing import assert_never
 
 from ludics.prreview import knobs
+from ludics.prreview.budget import pause as budget_pause
 from ludics.prreview.core import (
     GhOk,
     GhSession,
@@ -515,7 +516,16 @@ class Watch:
         extension_mark = ""
         rerequested = ""
         rerequest_end: int | None = None
+        last_key: str | None = None
+        last_pause: int | None = None
         ctx.nudge_after = mark_of(self.mark, 2)
+        # The review observer of this PR (the polling budget, budget.py), which may wait a quota
+        # hold out within its window.
+        budget = ctx.session.budget
+        if budget is not None:
+            budget.observer_claim("review", self.repo, pr)
+            budget.wait_until = self.clock.now() + timeout
+        cap = budget.review_cap if budget is not None else interval
 
         self.state = status_state(ctx, pr)
         was = self.state.tok
@@ -629,9 +639,21 @@ class Watch:
                 case _:
                     assert_never(tok)
 
-            pause = interval
+            # The budget's pause: back to the interval after a round whose state moved, doubling
+            # toward the review cap while it does not.
+            key = tok
+            pause = budget_pause(interval, cap, last_pause, key != last_key)
+            last_key = key
+            last_pause = pause
+            # A pause the budget GREW past the window's end is cut to it, so the budget never ends
+            # a window earlier than the fixed interval would have: its last read is at the window's
+            # end, not up to a whole cap before it. A pause still at the interval keeps the
+            # fixed-interval rule.
             now = self.clock.now()
-            if now - start + interval > timeout:
+            remaining = timeout - (now - start)
+            if pause > interval and 0 < remaining < pause:
+                pause = remaining
+            if now - start + pause > timeout:
                 if candidate_end is None:
                     break
                 if extension_end is None:

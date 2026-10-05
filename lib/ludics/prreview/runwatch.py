@@ -32,6 +32,7 @@ from typing import assert_never
 
 from ludics import cli
 from ludics.prreview import knobs
+from ludics.prreview.budget import pause
 from ludics.prreview.checkruns import conclusion_class
 from ludics.prreview.clock import Clock, clock_from_env
 from ludics.prreview.core import (
@@ -151,6 +152,16 @@ def run(
     started = clk.now()
     deadline = started + timing.wait
     beat = started
+    # An observer of the run, which may wait a quota hold out within its ceiling. A repository named
+    # as HOST/OWNER/REPO (gh run view's -R form) names its host, which GH_HOST then does not.
+    budget = session.budget
+    if budget is not None:
+        budget.wait_until = deadline
+        if repo.count("/") >= 2:
+            budget.host = repo.split("/", 1)[0]
+    cap = budget.build_cap if budget is not None else interval
+    last_status: str | None = None
+    last_pause: int | None = None
     while True:
         result = session.retry(
             "read",
@@ -203,7 +214,13 @@ def run(
                 f"{(now - started) // 60} min",
             )
             beat = now
-        clk.sleep(min(interval, deadline - now))
+        # The polling budget's pause: the interval while the run's status moves, doubling toward
+        # the build cap while it does not. Capped at the remaining deadline: -i is a documented
+        # pass-through, and an interval past what is left would sleep far beyond the ceiling.
+        sleep_for = pause(interval, cap, last_pause, status != last_status)
+        last_status = status
+        last_pause = sleep_for
+        clk.sleep(min(sleep_for, deadline - now))
     verdict = conclusion_class(conclusion)
     match verdict:
         case "green":

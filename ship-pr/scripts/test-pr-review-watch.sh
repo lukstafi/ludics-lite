@@ -626,11 +626,15 @@ test_the_quiet_exit_names_the_head_and_what_scrolled_past() {
 # interval toward the review cap, so a quiet 900s window at the 90s interval reads six times, not
 # eleven. The last pause is cut to the window's end, so the window's last read is at its end. A subshell case, like the
 # others that redefine sleep, so it is listed after the cases that make the snapshot directory in
-# the suite's own shell (one made in a subshell outlives it).
+# the suite's own shell (one made in a subshell outlives it). The sleep is the suite's, to log each
+# pause, and it advances the test clock the window is kept on (the shell bridge hands it to the
+# Python; SECONDS is what a shell watch kept its window on).
 test_an_unmoving_window_backs_off_to_the_review_cap() (
   sleep() {
     printf '%s\n' "$1" >>"$TEST_ROOT/sleeps"
     SECONDS=$((SECONDS + $1))
+    [ -z "${SHIP_PR_TEST_CLOCK:-}" ] ||
+      printf '%s\n' "$(($(cat "$SHIP_PR_TEST_CLOCK") + $1))" >"$SHIP_PR_TEST_CLOCK"
   }
   reset_fixture
   : >"$TEST_ROOT/sleeps"
