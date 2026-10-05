@@ -1109,12 +1109,17 @@ review_comments() { # <pr> <review id>
 # About-Codex fold, the items line, the per-feed watermark). A watch round still runs it here, in a
 # command substitution: when the round has armed its snapshot, the snapshot's path goes with the
 # call, and the Python writes this round's feeds and review cache into it in the format
-# state_comments, state_reviews and review_comments read (see "the round snapshot" above).
+# state_comments, state_reviews and review_comments read (see "the round snapshot" above). Its
+# last gh error comes back the same way, through GH_ERR_FILE, which watch quotes through
+# $(gh_err_line) when a poll did not answer.
 cmd_poll() {
+  local err_file
+  err_file=$(py_native_path "$GH_ERR_FILE")
   if [ "$SNAPSHOT_ARMED" = 1 ] && [ -n "$SNAP" ]; then
-    LUDICS_PR_REVIEW_ROUND_SNAPSHOT="$(py_native_path "$SNAP")" py_forward call poll "$@"
+    LUDICS_PR_REVIEW_GH_ERR_FILE="$err_file" \
+      LUDICS_PR_REVIEW_ROUND_SNAPSHOT="$(py_native_path "$SNAP")" py_forward call poll "$@"
   else
-    py_forward call poll "$@"
+    LUDICS_PR_REVIEW_GH_ERR_FILE="$err_file" py_forward call poll "$@"
   fi
 }
 

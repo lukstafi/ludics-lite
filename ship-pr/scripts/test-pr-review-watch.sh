@@ -680,6 +680,23 @@ test_a_final_poll_that_did_not_answer_withholds_the_verdict() {
   assert_contains "$WATCH_OUT" "no review materialized" "and recommends the nudge"
 }
 
+# The withheld verdict quotes the final poll's error, which is the last gh call's: here the new
+# review's own comments read, after the three feeds answered. The poll runs in Python
+# (ludics-lite#403) and the line is printed by the shell, so the error has to come back through
+# GH_ERR_FILE as the shell's own gh_retry left it; a poll that did not hand it back made the line
+# say "did not answer ()".
+test_a_withheld_verdict_quotes_the_final_poll_s_error() {
+  reset_fixture
+  retune GRACE=1
+  schedule reviews 2 "[$(review 800 other-sha 2026-09-01T10:00:00Z)]"
+  FAIL_REVIEW_COMMENTS=1
+  run_watch 0,0,0 5 1
+  assert_eq "$WATCH_RC" 3 "an unobserved tail is transport, not a verdict"
+  assert_contains "$WATCH_OUT" "the verdict is WITHHELD" "and the line says the verdict was withheld"
+  assert_contains "$WATCH_OUT" "did not answer (gh: 503 No server is currently available" \
+    "and quotes the final poll's own error"
+}
+
 # The 👍 is a REACTION, and cmd_poll reads comments and reviews. An approval landing in the same
 # gap the final poll covers is invisible to that poll, so the state is re-read before the verdict
 # is printed — or the loop recommends a nudge at a PR that has just been approved, and the
@@ -1916,6 +1933,7 @@ tests=(
   test_a_verdict_polls_once_more_before_recommending_a_nudge
   test_a_verdict_that_still_stands_names_the_head_it_is_about
   test_a_final_poll_that_did_not_answer_withholds_the_verdict
+  test_a_withheld_verdict_quotes_the_final_poll_s_error
   test_an_approval_landing_during_the_final_poll_drops_the_verdict
   test_a_state_that_moved_drops_the_verdict_as_quiet
   test_a_state_that_could_not_be_re_read_withholds_the_verdict

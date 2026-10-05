@@ -46,6 +46,7 @@ from ludics.prreview.reads import (
     CacheUnparsed,
     Snapshot,
     by_reviewer,
+    hand_back_err_line,
     review_comments,
     snapshot_from_env,
 )
@@ -410,7 +411,10 @@ def run(session: GhSession, args: list[str]) -> int:
         cli.exit_with(1, "1: usage: poll <pr> [watermark]")
     target = pr_arg(args[0], session.config.repo)
     mark = args[1] if len(args) > 1 else ""
-    return poll_round(session, target.repo, target.num, mark, snapshot_from_env())
+    try:
+        return poll_round(session, target.repo, target.num, mark, snapshot_from_env())
+    finally:
+        hand_back_err_line(session)
 
 
 # --- the history, moved from pr-review.sh with the code it explained (ludics-lite#403) ------------

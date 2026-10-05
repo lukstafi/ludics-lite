@@ -14,7 +14,8 @@ The round snapshot. `watch` is still shell (ludics-lite#403), and a watch round 
 observation of the feeds with the state read beside it through files (pr-review.sh's "the round
 snapshot", ludics-lite#95). `poll` is Python and runs inside that round, so it writes the round's
 feeds and reads/writes its per-review cache in the shell's own format when the forwarder hands it
-the snapshot's path (``ROUND_SNAPSHOT``). The watch porter replaces this with an object.
+the snapshot's path (``ROUND_SNAPSHOT``). The watch porter replaces this with an object. For the
+same reason a poll hands its last gh error back through the shell's GH_ERR_FILE (``GH_ERR_FILE``).
 """
 
 import math
@@ -188,6 +189,27 @@ class Snapshot:
 def snapshot_from_env(env: dict[str, str] | None = None) -> Snapshot | None:
     prefix = (os.environ if env is None else env).get(ROUND_SNAPSHOT, "")
     return Snapshot(prefix) if prefix else None
+
+
+# The shell's GH_ERR_FILE, handed over by a watch round's cmd_poll, private to the forward.
+GH_ERR_FILE = "LUDICS_PR_REVIEW_GH_ERR_FILE"
+
+
+def hand_back_err_line(session: GhSession, env: dict[str, str] | None = None) -> None:
+    """Leave this command's last gh error where the shell's gh_err_line reads it. Watch quotes
+    $(gh_err_line) after a poll that did not answer ("the final poll ... did not answer (<error>)"),
+    and the shell's gh_retry kept that file current after every call: the last FAILED attempt's
+    first stderr line, emptied by a call that succeeded. The session holds the same line, so it is
+    written once, as the poll ends; a write that fails leaves the message without its quote, as the
+    shell's own did."""
+    path = (os.environ if env is None else env).get(GH_ERR_FILE, "")
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8", errors="surrogateescape") as handle:
+            handle.write(session.err_line())
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
