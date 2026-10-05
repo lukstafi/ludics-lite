@@ -127,6 +127,11 @@ rc=$?
 [ "$rc" -eq 43 ] && ok "stdin reaches the program and its exit status is the wrapper's" ||
   ko "rc=$rc, want 43 -- $out"
 
+# The package is importable, from lib/ of this checkout.
+out=$("$PY" -c 'import ludics, os; print(os.path.dirname(os.path.realpath(ludics.__file__)))' 2>&1)
+[ "$out" = "$ROOT/lib/ludics" ] && ok "the ludics package is importable from lib/" ||
+  ko "import ludics: $out (want $ROOT/lib/ludics)"
+
 # Nothing from the caller's cwd shadows a module: pr-review.sh runs from inside arbitrary project
 # checkouts. Without -P, a `json.py` in the cwd is what `import json` loads.
 mkdir -p "$TMP/project"
