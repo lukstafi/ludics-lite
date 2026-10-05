@@ -317,7 +317,7 @@ fw_spec_count() {
   echo "$found"
 }
 cmd_execution_slot_probe() {
-  local kind="" probe="" bg="" box cap tokens inside="" answer slots gpu_tokens entry ok
+  local kind="" probe="" bg="" box cap tokens inside="" answer entry ok
   local -a all=("$@") roster=()
   shift   # slot
   while [ "$#" -gt 0 ]; do
@@ -344,18 +344,11 @@ cmd_execution_slot_probe() {
   [ -z "$bg" ] || die "execution slot: --probe takes no --bg; it runs nothing"
   box="${FLEET_LOCAL_BOX-$(fw_local_box)}"
   [ -n "$box" ] || die "execution slot: this host has no fleet name; set FLEET_LOCAL_BOX (the slot is this box's own)"
-  BOXES="${FLEET_BOXES:-mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux}"
   ok=""; read -r -d "" -a roster <<< "$BOXES" || :
   for entry in ${roster[@]+"${roster[@]}"}; do [ "$entry" = "$box" ] && ok=1; done
   [ -n "$ok" ] || { echo "EXECUTION SLOT REFUSED $box: not a canonical FLEET_BOXES entry ($BOXES)"; exit 1; }
-  if [ "$(fw_words "$BOXES")" = "$(fw_words "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux")" ]; then
-    slots="${FLEET_BOX_CORRECTNESS_SLOTS-mac-studio=6 rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3}"
-    gpu_tokens="${FLEET_BOX_GPU_TOKENS-rog-nv-linux=2}"
-  else
-    slots="${FLEET_BOX_CORRECTNESS_SLOTS-}"; gpu_tokens="${FLEET_BOX_GPU_TOKENS-}"
-  fi
-  cap=$(fw_spec_count FLEET_BOX_CORRECTNESS_SLOTS "$slots" "$box" 1) || { echo "EXECUTION SLOT REFUSED $box: $cap"; exit 1; }
-  tokens=$(fw_spec_count FLEET_BOX_GPU_TOKENS "$gpu_tokens" "$box" "$cap") || { echo "EXECUTION SLOT REFUSED $box: $tokens"; exit 1; }
+  cap=$(fw_spec_count FLEET_BOX_CORRECTNESS_SLOTS "$SLOTS" "$box" 1) || { echo "EXECUTION SLOT REFUSED $box: $cap"; exit 1; }
+  tokens=$(fw_spec_count FLEET_BOX_GPU_TOKENS "$GPU_TOKENS" "$box" "$cap") || { echo "EXECUTION SLOT REFUSED $box: $tokens"; exit 1; }
   # Where there are as many tokens as slots the tokens cannot bind, and every batch takes any slot.
   [ "$tokens" -lt "$cap" ] || tokens=0
   if [ -n "${FLEET_MEASUREMENT_HELD:-}" ]; then
@@ -365,6 +358,16 @@ cmd_execution_slot_probe() {
   echo "EXECUTION SLOT PROBE $box $cap $([ "$tokens" -eq 0 ] && echo "$cap" || echo "$tokens")${inside:+ measurement $inside}"
   exit 0
 }
+
+# The roster and the two specs, as config.py reads them: the site's slot and token defaults apply
+# whenever the roster IS the default one, compared as a word set (ludics-lite#329); set, even to
+# empty, a spec overrides that. The slot default is read from this line by check-prompts, which
+# holds every prompt that states mac-studio's count to it (ludics-lite#160).
+DEFAULT_BOXES="mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
+BOXES="${FLEET_BOXES:-$DEFAULT_BOXES}"
+if [ "$(fw_words "$BOXES")" = "$(fw_words "$DEFAULT_BOXES")" ]; then DEFAULT_ROSTER=1; else DEFAULT_ROSTER=0; fi
+SLOTS="${FLEET_BOX_CORRECTNESS_SLOTS-$([ "$DEFAULT_ROSTER" = 0 ] || echo mac-studio=6 rog-nv-linux=4 minix-amd-linux=4 tuf-amd-linux=3)}"
+GPU_TOKENS="${FLEET_BOX_GPU_TOKENS-$([ "$DEFAULT_ROSTER" = 0 ] || echo rog-nv-linux=2)}"
 
 shift   # execution
 cmd_execution_slot_probe "$@"
