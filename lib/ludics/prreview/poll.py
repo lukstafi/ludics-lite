@@ -257,9 +257,10 @@ def _new_items(
 
 
 def _watermark(feed: list[Json], mark: int) -> str:
-    """``[.[][].id // 0, $m] | max``, printed as jq prints it."""
+    """``[.[][].id // 0, $m] | max``, printed as jq prints it: ``jq -s`` without ``-c``, so an
+    array or object maximum is pretty-printed over several lines."""
     ids = [i for i in (jq.idx(item, "id") for item in feed) if jq.truthy(i)]
-    return jq.tojson(jq.jmax([*(ids or [0]), mark]))
+    return jq.pretty(jq.jmax([*(ids or [0]), mark]))
 
 
 def _print_each[T](items: list[T], render: Callable[[T], str]) -> None:
@@ -393,7 +394,9 @@ def poll_round(
         )
     except jq.JqError:
         return 4
-    cli.say(f"items: {items_inline} {items_issue} {items_review}")
+    # Each field was a command substitution in the shell, which drops a NUL byte.
+    items = " ".join((items_inline, items_issue, items_review)).replace("\0", "")
+    cli.say(f"items: {items}")
     try:
         marks = (
             _watermark(inline, m_inline),

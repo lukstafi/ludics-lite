@@ -260,6 +260,19 @@ class PollRound(unittest.TestCase):
         self.assertIn("printed first", out)
         self.assertNotIn("watermark:", out)
 
+    def test_the_index_and_watermark_lines_are_what_the_shell_captured(self) -> None:
+        # The watermark was `jq -s` without -c, so an array maximum spans lines; each items field
+        # was a command substitution, which drops a NUL. Neither shape is GitHub's, but the lines
+        # are what watch reads.
+        gh = feeds(
+            comments=[{**comment(0, "x", "a"), "id": "8\u00000"}, {**comment(0, "x", "b"), "id": [1]}],
+        )
+        rc, out, _ = self.run_poll(gh)
+        self.assertEqual(rc, 0)
+        self.assertIn(f"items:  summary:80:-:{BOT}:-", out)
+        self.assertIn("--- summary id=8\u00000 ", out)
+        self.assertTrue(out.endswith("watermark: 0,[\n  1\n],0\n"), out)
+
     def test_a_feed_that_did_not_answer_is_exit_3(self) -> None:
         gh = feeds()
         gh.down.add("repos/o/r/issues/7/comments?per_page=100")

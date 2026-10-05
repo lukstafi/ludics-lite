@@ -167,6 +167,13 @@ def tojson(v: Json) -> str:
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
 
 
+def pretty(v: Json) -> str:
+    """jq's default output (no ``-c``): an array or object over several lines, indented by two."""
+    if isinstance(v, (list, dict)) and v:
+        return json.dumps(v, ensure_ascii=False, indent=2)
+    return tojson(v)
+
+
 def text(v: Json) -> str:
     """String interpolation ``\\(v)`` and ``tostring``: a string as itself, the rest as JSON."""
     return v if isinstance(v, str) else tojson(v)
