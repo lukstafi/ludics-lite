@@ -63,7 +63,8 @@ def check_drift_guard(report: Report, tree: Tree) -> None:
         for line in records(tree.read(SYNC_SCRIPT) or "")
         if (m := LOCAL_ROUTINES.fullmatch(line)) is not None
     ]
-    names = "\n".join(found).rstrip("\n")
+    # Read by sed, which keeps a NUL, into a command substitution, which drops it.
+    names = "\n".join(found).replace("\0", "").rstrip("\n")
     if not names:
         # Not a pass: the obligation exists and this reader cannot see who carries it.
         report.ko(

@@ -52,8 +52,17 @@ def parse(argv: list[str]) -> Mode:
     return Whole(first)
 
 
+HERE_ENV = "LUDICS_CHECK_PROMPTS_HERE"
+
+
 def this_checkout() -> str:
-    """The checkout this package lives in: lib/ludics/checkprompts/ is three levels below it."""
+    """The checkout check-prompts.sh lives in: ``$HERE/..``, where the forwarder names ``HERE``
+    as the shell checker did (``cd "$(dirname "$0")" && pwd``, logical, so a checkout reached
+    through a symbolic link is named by it). Without it, the checkout this package lives in:
+    lib/ludics/checkprompts/ is three levels below it."""
+    here = os.environ.get(HERE_ENV, "")
+    if here:
+        return os.path.join(here, "..")
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.dirname(os.path.dirname(os.path.dirname(here)))
 
@@ -71,13 +80,18 @@ def logical_cwd() -> str:
 
 
 def canonical(root: str) -> str:
-    """``cd "$ROOT" && pwd``: absolute, logical, and without a trailing slash, so every
-    root-relative path reads the same whether the caller wrote ``<dir>`` or ``<dir>/``."""
+    """``cd "$ROOT" && pwd``: absolute and without a trailing slash, so every root-relative path
+    reads the same whether the caller wrote ``<dir>`` or ``<dir>/``. Logical when that names a
+    directory to enter; when it does not (``lnk/../root`` through a symbolic link whose parent
+    holds no ``root``), bash's ``cd`` enters the path as given and ``pwd`` names it physically."""
     if not os.path.isdir(root):
         raise cli.Exit(2, f"no such directory: {root}")
     if not os.access(root, os.X_OK):
         raise cli.Exit(2, f"cannot enter: {root}")
-    return os.path.normpath(os.path.join(logical_cwd(), root))
+    logical = os.path.normpath(os.path.join(logical_cwd(), root))
+    if os.path.isdir(logical) and os.access(logical, os.X_OK):
+        return logical
+    return os.path.realpath(root)
 
 
 def run(argv: list[str]) -> int:

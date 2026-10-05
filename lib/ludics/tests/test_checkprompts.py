@@ -12,7 +12,7 @@ import tempfile
 import unittest
 
 from ludics.checkprompts import __main__ as entry
-from ludics.checkprompts.bytes_view import lat, records, u
+from ludics.checkprompts.bytes_view import awk_records, lat, records, u
 from ludics.checkprompts.cleanup import invocation_options, lex
 from ludics.checkprompts.frontmatter import Refused, Resolved, frontmatter, value_of, well_formed_bytes
 from ludics.checkprompts.links import heading_slugs, md_links, render_spans, resolve, slug
@@ -23,6 +23,8 @@ from ludics.checkprompts.slots import (
     DigitMention,
     NoCount,
     WordMention,
+    as_number,
+    awk_assigned,
     code_of,
     numerals_before,
     slot_default,
@@ -41,6 +43,9 @@ class BytesViewTest(unittest.TestCase):
         self.assertEqual(records(""), [])
         self.assertEqual(records("a\n\n"), ["a", ""])
         self.assertEqual(records("a\nb"), ["a", "b"])
+
+    def test_awk_records_stop_at_a_nul(self) -> None:
+        self.assertEqual(awk_records("ab\0cd\ngh\0\nij"), ["ab", "gh", "ij"])
 
 
 class ValueGrammarTest(unittest.TestCase):
@@ -183,6 +188,23 @@ class SlotsTest(unittest.TestCase):
         )
         # A comment shaped like an assignment is prose, and held.
         self.assertEqual(slot_mentions("# was: SLOTS=mac-studio=3\n"), [DigitMention("3", "mac-studio=3")])
+
+
+    def test_as_number_is_bash_arithmetic(self) -> None:
+        self.assertEqual(as_number("006"), "6")
+        self.assertEqual(as_number("18446744073709551622"), "6")
+        self.assertEqual(as_number("18446744073709551616"), "0")
+        self.assertEqual(as_number("9223372036854775808"), "-9223372036854775808")
+        self.assertEqual(as_number("99999999999999999999999"), "200376420520689663")
+        self.assertEqual(as_number("6oops"), "6oops")
+
+    def test_awk_assigned_is_escape_processed(self) -> None:
+        self.assertEqual(awk_assigned("/a/b/"), "/a/b/")
+        self.assertEqual(awk_assigned("a\\qb\\101\\\\c\\\"d\\/e"), 'aqbA\\c"d/e')
+        self.assertEqual(awk_assigned("[\\n][\\t][\\777][\\89]"), "[\n][\t][\xff][I]")
+        self.assertEqual(awk_assigned("a\\0b"), "a")
+        self.assertEqual(awk_assigned("a\\"), "a\\")
+        self.assertIsNone(awk_assigned("a\nb"))
 
 
 class CleanupTest(unittest.TestCase):

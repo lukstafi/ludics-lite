@@ -10,4 +10,9 @@
 # Ported to Python (ludics-lite#403): the checks live in lib/ludics/checkprompts/, whose modules
 # each state what they read and where their reading stops. This file is the entry point the skills,
 # CI and preflight call, and forwards to it unchanged; scripts/test-check-prompts.sh is its suite.
+# The default root is this file's checkout as the shell checker named it, `$HERE/..` with HERE
+# taken logically, so it rides along: the Python cannot see `$0`. A copy of this file alone, with
+# no scripts/py and lib/ beside it, runs nothing (scripts/py is what finds Python >= 3.12).
+LUDICS_CHECK_PROMPTS_HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
+export LUDICS_CHECK_PROMPTS_HERE
 exec "$(dirname "$0")/py" -m ludics.checkprompts "$@"

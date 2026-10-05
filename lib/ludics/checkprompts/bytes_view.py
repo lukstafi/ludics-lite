@@ -62,6 +62,13 @@ def records(text: str) -> list[str]:
     return lines
 
 
+def awk_records(text: str) -> list[str]:
+    """The lines an AWK reader saw: ``records``, each cut at its first NUL. The shell checker ran
+    on macOS under BWK awk, which holds a record as a C string, so text after a NUL on its line
+    was not there to the program (sed kept it; that reading is ``records``)."""
+    return [r.split("\0", 1)[0] for r in records(text)]
+
+
 def ws_split(s: str) -> list[str]:
     """awk's ``split(s, a, /[[:space:]]+/)``: a leading or trailing blank run yields an empty field,
     and an empty string yields none."""

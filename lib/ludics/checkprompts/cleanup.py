@@ -24,9 +24,10 @@ and the prompt writes none of them.
 
 import os
 import re
+import subprocess
 from dataclasses import dataclass
 
-from ludics.checkprompts.bytes_view import WS, WS_CLASS, lat, one_of, records, substitution
+from ludics.checkprompts.bytes_view import WS, WS_CLASS, awk_records, lat, one_of, records, substitution
 from ludics.checkprompts.tree import Report, Tree
 from ludics.proc import run_tool
 
@@ -46,10 +47,12 @@ def usage_options(tree: Tree) -> list[tuple[str, int]] | None:
     no usage text: an exit other than 2, or a stderr not opening with ``usage: ``."""
     env = dict(os.environ)
     env["LC_ALL"] = "C"  # the locale the shell checker exported to it
-    done = run_tool("bash", [tree.path(CLEANUP_HELPER)], env=env)
+    # With no input, as the shell ran it: a helper that reads stdin must not see the caller's.
+    done = run_tool("bash", [tree.path(CLEANUP_HELPER)], env=env, stdin=subprocess.DEVNULL)
     if done.rc != 2:
         return None
-    text = lat(substitution(done.stderr))
+    # Captured by a command substitution, which drops a NUL.
+    text = lat(substitution(done.stderr.replace("\0", "")))
     if not text.startswith("usage: "):
         return None
     listed: list[tuple[str, int]] = []
@@ -145,7 +148,7 @@ def invocation_options(text: str, valued: str) -> list[str]:
     flen = 0
     cont = False
     skip = False
-    for rec in records(text):
+    for rec in awk_records(text):
         m = FENCE.match(rec)
         if m is not None:
             run = m.end() - rec.index("`")

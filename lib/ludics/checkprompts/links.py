@@ -28,7 +28,7 @@ that did). A link written inside a fence or between backticks is read like any o
 import re
 from dataclasses import dataclass, field
 
-from ludics.checkprompts.bytes_view import WS_CLASS, ascii_lower, is_alnum, records
+from ludics.checkprompts.bytes_view import WS_CLASS, ascii_lower, awk_records, is_alnum
 from ludics.checkprompts.tree import Report, Tree
 
 LINK_FILE_GLOBS = (
@@ -89,7 +89,7 @@ def resolve(directory: str, path: str) -> str:
 
 def md_links(rel: str, directory: str, text: str) -> list[Link]:
     found: list[Link] = []
-    for line in records(text):
+    for line in awk_records(text):
         while (i := line.find("](") + 1) > 0:
             # A link opens with a LABEL: the bracket THIS `]` closes, walked backwards, counting
             # the pairs that close on the way; a bracket a backslash made literal is text.
@@ -289,7 +289,7 @@ def heading_slugs(text: str) -> Slugs:
     slugs = Slugs()
     taken: set[str] = set()
     occurrences: dict[str, int] = {}
-    for index, raw in enumerate(records(text)):
+    for index, raw in enumerate(awk_records(text)):
         line = raw
         # A byte-order mark opens a file, and GFM removes it before parsing; a CR is the other
         # half of a CRLF line ending.

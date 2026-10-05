@@ -38,12 +38,12 @@ import re
 from dataclasses import dataclass
 from typing import assert_never
 
-from ludics.checkprompts.bytes_view import WS, WS_CLASS, ascii_lower, lat, records, ws_split
+from ludics.checkprompts.bytes_view import WS, WS_CLASS, ascii_lower, awk_records, lat, read_bytes, u, ws_split
 from ludics.checkprompts.tree import Report, Tree
 
 SLOT_SCRIPT = "issue-wave/scripts/fleet-worker.sh"
 SLOT_PROMPTS = ("README.md", "issue-wave/SKILL.md", "issue-wave/references/executions.md")
-SLOT_MECHANISM = frozenset(("scripts/check-prompts.sh", "scripts/test-check-prompts.sh"))
+SLOT_MECHANISM = ("scripts/check-prompts.sh", "scripts/test-check-prompts.sh")
 NUMBER_WORDS = (
     "zero one two three four five six seven eight nine ten eleven twelve".split(" ")
 )
@@ -205,8 +205,12 @@ def unquote(s: str) -> str:
 
 def as_number(token: str) -> str:
     """``token`` as a decimal number, leading zeros dropped; a token that is not all digits is
-    returned unchanged, so it is reported as written and agrees with nothing."""
-    return str(int(token)) if token and token.isascii() and token.isdigit() else token
+    returned unchanged, so it is reported as written and agrees with nothing. The number is bash
+    arithmetic's (``$((10#n))``), which wraps at 64 bits: 2^64 + 6 is 6, and 2^63 is negative."""
+    if not (token and token.isascii() and token.isdigit()):
+        return token
+    n = int(token) % 2**64
+    return str(n - 2**64 if n >= 2**63 else n)
 
 
 # --- the default ---------------------------------------------------------------------------------
@@ -248,7 +252,7 @@ def slot_default(text: str) -> SlotDefault:
     queued: list[tuple[str, bool]] = []  # heredoc delimiters, and whether `<<-` strips tabs
     in_func = False
     last = ""
-    for rec in records(text):
+    for rec in awk_records(text):
         # A heredoc body is data the script WRITES, not code it runs.
         if queued:
             line = re.sub(r"^\t+", "", rec) if queued[0][1] else rec
@@ -381,7 +385,7 @@ def find_assignments(code: str) -> list[tuple[int, int]]:
 def slot_mentions(text: str) -> list[Mention]:
     """Every statement of the count in ``text``: the digit form first, then the word form, each in
     the order it stands."""
-    recs = records(text)
+    recs = awk_records(text)
     joined = "".join(" " + r for r in recs)
     code = "".join(" " + uncommented(r) for r in recs)
     lower = ascii_lower(joined)
@@ -418,11 +422,64 @@ def slot_mentions(text: str) -> list[Mention]:
     return out
 
 
+def awk_assigned(value: str) -> str | None:
+    """What an ``awk -v name=<value>`` assignment holds under the macOS awk: escapes processed
+    (``\\n``, ``\\t``, ``\\b``, ``\\f``, ``\\r``, ``\\v``, ``\\a``, ``\\\\``, up to three
+    digits as octal, any other escaped character as itself, a trailing backslash kept), the
+    result cut at a NUL as a C string is; None when the value holds a newline, which that awk
+    refuses as a syntax error, running nothing."""
+    out: list[str] = []
+    i = 0
+    while i < len(value):
+        c = value[i]
+        if c == "\n":
+            return None
+        i += 1
+        if c != "\\":
+            out.append(c)
+            continue
+        if i == len(value):
+            out.append("\\")
+            break
+        c = value[i]
+        i += 1
+        if c in AWK_ESCAPES:
+            out.append(AWK_ESCAPES[c])
+        elif "0" <= c <= "9":
+            n = ord(c) - ord("0")
+            for _ in range(2):
+                if i < len(value) and "0" <= value[i] <= "9":
+                    n = 8 * n + ord(value[i]) - ord("0")
+                    i += 1
+            out.append(chr(n & 0xFF))
+        else:
+            out.append(c)
+    return "".join(out).split("\0", 1)[0]
+
+
+AWK_ESCAPES = {
+    "\\": "\\",
+    "n": "\n",
+    "t": "\t",
+    "b": "\b",
+    "f": "\f",
+    "r": "\r",
+    "v": "\v",
+    "a": "\a",
+}
+
+
 def slot_files(tree: Tree) -> list[str]:
-    """Every ``*.md`` and ``*.sh`` regular file under the root, as ``find -name .git -prune``
-    walks it (symbolic links neither followed nor listed), root-relative and byte-sorted, minus
-    the mechanism's own two."""
-    if os.path.basename(tree.root) == ".git":
+    """Every ``*.md`` and ``*.sh`` regular file under the root, as the shell checker listed them:
+    ``find "$ROOT" -name .git -prune -o -type f ... -print`` (symbolic links neither followed nor
+    listed, and a root that IS one not entered), its output read as awk records, each cut back to
+    root-relative by an ``awk -v root="$ROOT/"`` prefix -- escape-processed, so a root whose path
+    holds a backslash matches no record -- minus the mechanism's own two (a match inside their
+    space-joined list), then byte-sorted."""
+    if os.path.basename(tree.root) == ".git" or os.path.islink(tree.root):
+        return []
+    cut = awk_assigned(lat(tree.root) + "/")
+    if cut is None:
         return []
     found: list[str] = []
 
@@ -444,7 +501,16 @@ def slot_files(tree: Tree) -> list[str]:
                 continue
 
     walk(tree.root, "")
-    return sorted(f for f in found if f not in SLOT_MECHANISM)
+    skip = " " + " ".join(SLOT_MECHANISM) + " "
+    out: list[str] = []
+    for rel in found:
+        # A newline in a name splits find's output line, and awk reads the halves apart.
+        for rec in (lat(tree.root) + "/" + rel).split("\n"):
+            if rec.startswith(cut):
+                f = rec[len(cut) :]
+                if f and f" {f} " not in skip:
+                    out.append(f)
+    return sorted(out)
 
 
 def check_slots(report: Report, tree: Tree) -> None:
@@ -474,17 +540,17 @@ def check_slots(report: Report, tree: Tree) -> None:
         return
     # An unspellable default leaves the word forms unmatchable rather than unchecked.
     word = NUMBER_WORDS[int(default)] if int(default) < len(NUMBER_WORDS) else ""
-    stated: set[str] = set()
+    stated = " "  # the files that state the count, each followed by a blank, as the shell kept them
     bad = False
     for f in slot_files(tree):
-        data = tree.read_bytes(f)
+        data = read_bytes(tree.root + "/" + u(f))  # `$ROOT/$f`, whatever `f` begins with
         # Both shapes contain the literal `mac-studio`, so a file without it states no count.
         if data is None or b"mac-studio" not in data.lower():
             continue
         mentions = slot_mentions(data.decode("latin-1"))
         if not mentions:
             continue
-        stated.add(f)
+        stated += f + " "
         for mention in mentions:
             match mention:
                 case DigitMention(token, shown):
@@ -509,7 +575,7 @@ def check_slots(report: Report, tree: Tree) -> None:
                     assert_never(unreachable)
     # A prompt that stops stating the count is how the agreement would quietly stop being checked.
     for f in SLOT_PROMPTS:
-        if f not in stated:
+        if f" {f} " not in stated:
             report.ko(
                 f,
                 "states no mac-studio slot count in a form this check reads"

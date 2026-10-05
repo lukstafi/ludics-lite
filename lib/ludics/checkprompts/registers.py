@@ -22,7 +22,7 @@ filenames cannot stand in for a command.
 
 import re
 
-from ludics.checkprompts.bytes_view import WS, WS_CLASS, records, ws_split
+from ludics.checkprompts.bytes_view import WS, WS_CLASS, awk_records, ws_split
 from ludics.checkprompts.tree import Report, Tree
 
 ROW_LEAD = re.compile(WS_CLASS + r"*\|?" + WS_CLASS + "*")
@@ -39,11 +39,11 @@ def indexed(lines: list[str], name: str) -> bool:
 
 
 def check_index(report: Report, tree: Tree, readme: str, prefix: str, what: str) -> None:
-    text = tree.read(readme) if tree.is_file(readme) else None
-    if text is None:
+    if not tree.is_file(readme):
         report.ko(readme, f"missing: it indexes the {what} directories")
         return
-    lines = records(text)
+    # A regular file that cannot be read is there, and indexes nothing: awk failed on it.
+    lines = awk_records(tree.read(readme) or "")
     dirs = sorted(rel[len(prefix) : -len("/SKILL.md")] for rel in tree.files(prefix + "*/SKILL.md"))
     bad = False
     for d in dirs:
@@ -133,7 +133,7 @@ def check_fixtures(report: Report, tree: Tree) -> None:
     def lines_of(rel: str) -> list[str] | None:
         if rel not in cache:
             text = tree.read(rel) if tree.is_file(rel) else None
-            cache[rel] = None if text is None else records(text)
+            cache[rel] = None if text is None else awk_records(text)
         return cache[rel]
 
     bad = False
