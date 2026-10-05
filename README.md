@@ -816,7 +816,9 @@ advances between the gate's read and the merge call, adding a workflow whose `pa
 head's diff, is gated again on the new base and refused (exit 4, no merge call), and a base that
 moved without touching what the recognition reads merges after that second read;
 `test-pr-review-merge.sh` holds the merge loop's other outcomes of the re-read (no read for a
-green, an unread base, a head that moved with the base).
+green, an unread base, a head that moved with the base). Every case drives a command, never an
+internal function (ludics-lite#403): the gate through `checks`, the override's waiver through
+`merge --override`, and the advisory list through what the gate then counts.
 `test-pr-review-merge.sh` pins that `merge` reads the list too, and does not merge when the read
 did not answer.
 
@@ -901,7 +903,9 @@ merge attempt for the gated head (a base can move between attempts), a repeated 
 once and a lost one withdrawn, whatever the base and the merge method, and a capped, short or
 unread series saying the scan did not run.
 `test-pr-review-base-drift.sh` pins the other half: the drift count is anchored on the base's tip and never on the PR's `base.sha` snapshot,
-which stands still on a conflicted PR.
+which stands still on a conflicted PR. It reads the drift where `merge` prints it, every such merge
+landing (a warning is never a gate), and what the read concluded off its printed contract: UNKNOWN,
+`!!!`, or neither.
 
 `test-pr-review-watch.sh` drives what ends a `watch` (ludics-lite#72), against a fixture that
 answers the feeds in sequence across polls — the round a final poll catches has to be absent from
@@ -1107,8 +1111,10 @@ refused rather than protecting nothing. It also closes the trap that bit twice (
 name — a reporter called `fail` — silently replaces the library's, turning every refusal's exit
 code into the reporter's. So the preamble snapshots the function table when it is sourced, and
 `run_tests` refuses, naming the function and where the suite redefined it, any library function
-redefined without a `stub <fn>` declaration (the merge suite declares `build_checks`, `run_signal`
-and `warn_base_drift`), and any declaration the suite never honoured. It also carries `retune`, for
+redefined without a `stub <fn>` declaration, and any declaration the suite never honoured. No
+fixture suite declares one any more: a stub of an internal function cannot judge a subcommand
+served by Python, so the merge, gate and drift suites drive `merge` and `checks` black-box
+(ludics-lite#403), and the guard's own controls are what still exercise the declaration. It also carries `retune`, for
 the constants `pr-review.sh` reads from the environment exactly once, when it is sourced (`GRACE`,
 `STALL`, `ROUND_GAP`, `ABSENT_GRACE`, `CHECKS_INTERVAL`, …): a case that needs a different clock
 cannot pass `SHIP_PR_REVIEW_GRACE` to it and has to assign the constant, and the restore is the
