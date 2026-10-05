@@ -285,21 +285,24 @@ gh() {
 # green, since the watch suite reaches only a few of the states these cases build. The fixture's
 # own state (the request log, the read counters, the simulated push and posts) is put back between
 # the two, so the Python answers the reads the case set up, and what a case counts afterwards is the
-# Python's reads alone. The age is the one field the two may honestly disagree on: each reads the
-# clock for itself, a moment apart.
+# Python's reads alone. Both read ONE clock, SHIP_PR_TEST_CLOCK pinned to the moment the pair
+# starts (the shell's clock_now and the Python's clock both read it), so the two lines must match
+# exactly, age included. Each reading its own wall clock a moment apart needed a tolerance, and
+# Git Bash's process start-up outran it (3 s, windows git bash run 37385845719).
 run_status() {
   if py_ported status; then
     local saved="$TEST_ROOT/fixture-state" shell_state
+    date +%s >"$TEST_ROOT/status-clock" || bail "could not pin the clock for the state pair"
     fixture_state_save "$saved"
-    run_shell_status
+    SHIP_PR_TEST_CLOCK="$TEST_ROOT/status-clock" run_shell_status
     shell_state=$STATE
     fixture_state_restore "$saved"
-    STATE=$(py_forward call status-state 7 "${watch_nudge_after:-}")
-    LINE=$(py_forward call status-line "$STATE" "${PR_NUM:-}")
-    same_state_but_age "$shell_state" "$STATE" ||
+    STATE=$(SHIP_PR_TEST_CLOCK="$TEST_ROOT/status-clock" py_forward call status-state 7 "${watch_nudge_after:-}")
+    LINE=$(SHIP_PR_TEST_CLOCK="$TEST_ROOT/status-clock" py_forward call status-line "$STATE" "${PR_NUM:-}")
+    [ "$shell_state" = "$STATE" ] ||
       bail "watch's state (the shell's status_state) and status's (the Python's) differ:" \
         "shell '$shell_state', Python '$STATE'"
-    assert_eq "$(status_line "$STATE")" "$LINE" \
+    assert_eq "$(SHIP_PR_TEST_CLOCK="$TEST_ROOT/status-clock" status_line "$STATE")" "$LINE" \
       "watch's rendering (the shell's status_line) and status's differ on the same state"
   else
     run_shell_status
@@ -325,17 +328,6 @@ fixture_state_restore() { # <dir>
   for f in "$1"/*; do
     [ ! -e "$f" ] || cp -R "$f" "$TEST_ROOT/" || bail "could not restore $f"
   done
-}
-
-# Two state lines that are the same but for an age read a moment later on the second.
-same_state_but_age() { # <first> <second>
-  local age_a age_b
-  [ "$(state_tok "$1")" = "$(state_tok "$2")" ] || return 1
-  [ "${1#*|*|}" = "${2#*|*|}" ] || return 1
-  age_a=$(state_age "$1") age_b=$(state_age "$2")
-  [ "$age_a" != "$age_b" ] || return 0
-  case "$age_a$age_b" in *[!0-9]*) return 1 ;; esac
-  [ $((age_b - age_a)) -ge 0 ] && [ $((age_b - age_a)) -le 2 ]
 }
 
 # The shell's own state, which `watch` reads until it is ported. run_status asks it beside the

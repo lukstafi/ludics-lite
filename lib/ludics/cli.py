@@ -100,20 +100,31 @@ def die_of_sigpipe() -> int:
 
 # scripts/py's note of the caller's PYTHONPATH: ``=<value>`` when it was set, empty when not.
 CALLER_PYTHONPATH = "LUDICS_CALLER_PYTHONPATH"
+# pr-review.sh's forward under Git Bash sets MSYS2_ARG_CONV_EXCL=* so that this interpreter's
+# arguments arrive as typed, and notes the caller's own value here the same way.
+CALLER_ARG_CONV_EXCL = "LUDICS_CALLER_ARG_CONV_EXCL"
+
+
+def _restore(env: MutableMapping[str, str], note: str, name: str) -> None:
+    saved = env.pop(note, None)
+    if saved is None:
+        return
+    if saved.startswith("="):
+        env[name] = saved[1:]
+    else:
+        env.pop(name, None)
 
 
 def restore_caller_environment(env: MutableMapping[str, str]) -> None:
     """Put back the PYTHONPATH scripts/py replaced with the checkout's lib/, so every program an
     entry point runs -- a batch under ``fleet-worker.sh execution slot``, git's hooks, a fixture's
     gh -- sees the caller's environment, not the ``ludics`` package. This process's own path was
-    fixed at startup. A run not through scripts/py has no note, and keeps what it has."""
-    saved = env.pop(CALLER_PYTHONPATH, None)
-    if saved is None:
-        return
-    if saved.startswith("="):
-        env["PYTHONPATH"] = saved[1:]
-    else:
-        env.pop("PYTHONPATH", None)
+    fixed at startup. A run not through scripts/py has no note, and keeps what it has. Likewise
+    MSYS2_ARG_CONV_EXCL, which the forward set only for this interpreter's own start: an MSYS
+    program this one runs (the bridge's bash) must rewrite its native children's arguments as the
+    caller's shell would."""
+    _restore(env, CALLER_PYTHONPATH, "PYTHONPATH")
+    _restore(env, CALLER_ARG_CONV_EXCL, "MSYS2_ARG_CONV_EXCL")
 
 
 def main(prog: str, run: Callable[[list[str]], int]) -> int:
