@@ -623,6 +623,59 @@ test_interim_finds_an_older_run_off_the_page() {
   assert_eq "$BASE_RC" 0 "the same page with that run finished: the interim answers"
 }
 
+# The fold's own deeper read (ludics-lite#535) leaves the interim as #533 set it. Twelve cancelled
+# rows over a judged GREEN at an older merge, the tip's own run in flight on top: the fold now
+# finds that green below the page, so a plain read settles for it as it does for a green on the
+# page (the verdict line says which commit it is about), and a wait's interim answers as before.
+test_interim_over_a_green_behind_a_page_of_cancelled_runs() {
+  local rows
+  rows=$(jq -cn '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 7720}] +
+    [range(7712; 7700; -1) | {conclusion: "cancelled", head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", id: .}] +
+    [{conclusion: "success", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7699}]')
+  burst_fixture "$rows"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 0 "the older run green, the tip's run is all that is coming"
+  assert_contains "$BASE_OUTPUT" "green, interim (tip ${SHA_C:0:8};" "and the interim answers"
+  burst_fixture "$rows"
+  run_base --interim
+  assert_eq "$BASE_RC" 0 "a plain read finds the green below the page"
+  assert_contains "$BASE_OUTPUT" "green    ci — success at ${SHA_A:0:8}" "and names the run it is"
+  assert_contains "$BASE_OUTPUT" "(ci is running now at ${SHA_C:0:8})" "beside the tip's run in flight"
+  assert_not_contains "$BASE_OUTPUT" "NO VERDICT" "not the no-verdict the page of ten read"
+  # And a run still going at an older merge below the page holds it, as #533's read did.
+  burst_fixture "$(jq -cn --argjson r "$rows" '$r[:-1] + [{status: "in_progress", conclusion: null, head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7699}]')"
+  run_base --wait=2 --interim
+  assert_eq "$BASE_RC" 4 "an older run in flight below the page holds the interim"
+  assert_not_contains "$BASE_OUTPUT" "green, interim" "no green while it judges"
+}
+
+# The bound: a hundred push rows, none of them judged. Whatever judged the branch is behind them,
+# a red included, and is never read, so this is no verdict saying so, never green — the interim
+# included, whose source is a PR head's green while nothing below the bound was read
+# (ludics-lite#535). Exactly a hundred rows, so the feed holds nothing further to find.
+test_a_hundred_runs_that_judged_nothing_are_never_green() {
+  local rows wait
+  rows=$(jq -cn '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 8000,
+                   created_at: "2026-09-10T12:00:00Z"}] +
+    [range(1; 100) | {conclusion: "cancelled", head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", id: (8000 - .),
+                      created_at: ((1789041600 - 60 * .) | todate)}]')
+  for wait in "" --wait=2; do
+    burst_fixture "$rows"
+    run_base --interim ${wait:+"$wait"}
+    assert_eq "$BASE_RC" 4 "a bound with no judged run is no verdict ($wait)"
+    assert_not_contains "$BASE_OUTPUT" "$BRANCH: green" "never green ($wait)"
+    assert_contains "$BASE_OUTPUT" "none of its newest 100 push runs on $BRANCH judged it, and this read stops there" \
+      "the workflow's line says the bound was reached ($wait)"
+  done
+  assert_contains "$BASE_OUTPUT" "(no interim verdict: none of the newest 100 push runs of ci judged the branch" \
+    "and the interim says why it is held"
+  burst_fixture "$rows"
+  run_base
+  assert_eq "$BASE_RC" 4 "plain, it is no verdict"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: NO VERDICT (tip ${SHA_C:0:8}) — none of the newest 100 push runs of ci judged the branch, and the read stops there" \
+    "and the headline names the bound"
+}
+
 # The interim re-confirms the tip before it is taken, as the covered break does: a merge landing
 # inside the round makes the green one for a tip the branch has left.
 test_interim_reconfirms_the_tip() {
@@ -820,6 +873,8 @@ tests=(
   test_interim_is_not_asked_outside_its_shape
   test_interim_in_a_group_that_does_not_cancel
   test_interim_finds_an_older_run_off_the_page
+  test_interim_over_a_green_behind_a_page_of_cancelled_runs
+  test_a_hundred_runs_that_judged_nothing_are_never_green
   test_interim_reconfirms_the_tip
   test_interim_waits_out_a_workflow_the_tip_may_have_added
   test_interim_rereads_the_tips_run_after_the_source

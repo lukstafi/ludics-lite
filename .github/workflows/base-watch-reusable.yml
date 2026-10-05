@@ -159,7 +159,7 @@ jobs:
             ;;
           4)
             title="base watch: $BRANCH's tip has no CI verdict"
-            what="reached no verdict for $BRANCH: no workflow has ever completed a push run on it, or the runs that did were stopped without judging and nothing behind them ever judged the branch, or a run is in flight (pending) over such a window and the tip is not GitHub's clean merge of a PR whose head built green. That is neither green nor red, and nothing stands behind $BRANCH until it is one of them"
+            what="reached no verdict for $BRANCH: no workflow has ever completed a push run on it, or the runs that did were stopped without judging and nothing behind them ever judged the branch, or none of a workflow's newest hundred push runs judged it (the read stops there, so a red behind them is not seen), or a run is in flight (pending) over such a window and the tip is not GitHub's clean merge of a PR whose head built green. That is neither green nor red, and nothing stands behind $BRANCH until it is one of them"
             again="Still without a verdict on $today"
             ;;
           *)
