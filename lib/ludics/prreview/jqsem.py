@@ -19,7 +19,7 @@ import re
 import time
 from collections.abc import Callable, Iterable, Sequence
 
-from ludics.prreview.core import Json
+from ludics.prreview.core import JqLiteral, Json
 
 
 class JqError(Exception):
@@ -111,6 +111,8 @@ def body_of(item: Json) -> str:
 
 
 def number_text(value: int | float) -> str:
+    if isinstance(value, JqLiteral):
+        return value.text
     if isinstance(value, int):
         return str(value)
     if value != value or value in (float("inf"), float("-inf")):
@@ -119,8 +121,36 @@ def number_text(value: int | float) -> str:
 
 
 def tojson(value: Json) -> str:
-    """jq's ``tojson``/``-c``: compact, keys in their order, non-ASCII as itself."""
+    """jq's ``tojson``/``-c``: compact, keys in their order, non-ASCII as itself; a JqLiteral as
+    its literal."""
+    if _has_literal(value):
+        return _literal_json(value)
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _has_literal(value: Json) -> bool:
+    match value:
+        case JqLiteral():
+            return True
+        case list():
+            return any(_has_literal(item) for item in value)
+        case dict():
+            return any(_has_literal(item) for item in value.values())
+        case _:
+            return False
+
+
+def _literal_json(value: Json) -> str:
+    """tojson's text for a value holding a JqLiteral: json.dumps for every leaf but those."""
+    match value:
+        case JqLiteral():
+            return value.text
+        case list():
+            return "[" + ",".join(_literal_json(item) for item in value) + "]"
+        case dict():
+            return "{" + ",".join(tojson(k) + ":" + _literal_json(v) for k, v in value.items()) + "}"
+        case _:
+            return tojson(value)
 
 
 def jstr(value: Json) -> str:

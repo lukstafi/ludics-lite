@@ -1295,6 +1295,28 @@ if [ "$rc" -eq 0 ] && grep -q "^tuf${tab}tuf-amd-linux${tab}ok=false${tab}cpu5=?
    grep -q "^mac-studio${tab}local${tab}ok=true" <<<"$out"; then
   ok "load reports a sleeping TUF as an ok=false row beside the live boxes, exit 0"
 else ko "load over a sleeping TUF (rc=$rc) -- $out"; fi
+# A number prints as the payload spelled it, as jq 1.8 prints a literal it did not compute with:
+# 1E+2 stays 1E+2 (not 100.0), 3.50 keeps its zero, -0 its sign, and a lowercase exponent reads
+# in jq's canonical spelling (1.5e3 is 1.5E+3), inside an array as well as alone; a number's
+# length (its absolute value) keeps the literal too, its sign dropped.
+cat > "$TMP/fleet-literals.json" <<'JSON'
+{"machines":[{"name":3.50,"endpoints":{"e":{"kind":"unix","host":"h","ok":1.10,"data":{"counts":{"dune":-0},"sessions":{"claude":-3.50,"codex":-0},"gpu":{"name":[1.5e3,2]}},"avg":{"m5":{"cpu_pct":0.0000001,"gpu_util_pct":1E+2}}}}}]}
+JSON
+out=$(env PATH="$TMP/loadbin:$PATH" SHIM_FLEET_JSON="$TMP/fleet-literals.json" "$FW" load 2>&1); rc=$?
+want="3.50${tab}h${tab}ok=1.10${tab}cpu5=1E-7%${tab}gpu5=1E+2%${tab}dune=-0${tab}claude=3.50${tab}codex=0${tab}gpu=[1.5E+3,2]"
+if [ "$rc" -eq 0 ] && [ "$out" = "$want" ]; then
+  ok "load prints each number as the payload spelled it, in jq 1.8's canonical form"
+else ko "load over number literals (rc=$rc) -- got: $out -- want: $want"; fi
+# A payload that parses only in part: jq printed the rows of every document before the one it
+# could not parse, then refused -- the refusal comes after them, not instead of them.
+{ printf '%s' '{"machines":[{"name":"a","endpoints":{"e":{"kind":"unix","host":"h","ok":true}}}]}'
+  printf '%s' ' {"machines":[]} {"machines":'; } > "$TMP/fleet-cut.json"
+out=$(env PATH="$TMP/loadbin:$PATH" SHIM_FLEET_JSON="$TMP/fleet-cut.json" FLEET_FLOTILLA=http://fl "$FW" load 2>&1); rc=$?
+want="a${tab}h${tab}ok=true${tab}cpu5=?%${tab}gpu5=-%${tab}dune=?${tab}claude=0${tab}codex=0${tab}gpu=-
+LOAD: unexpected payload from http://fl/api/fleet"
+if [ "$rc" -eq 1 ] && [ "$out" = "$want" ]; then
+  ok "load over a payload cut short prints the rows before the cut, then refuses, exit 1"
+else ko "load over a cut payload (rc=$rc) -- got: $out -- want: $want"; fi
 }
 
 section "launch / attach / status / log with a project repo and --repo/--branch" && {

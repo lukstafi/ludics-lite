@@ -19,7 +19,7 @@ from ludics.fleetworker.config import Config
 from ludics.fleetworker.execution import listing
 from ludics.fleetworker.identity import die
 from ludics.fleetworker.transport import run, substitution
-from ludics.prreview.core import Json, json_stream
+from ludics.prreview.core import JqLiteral, Json, JsonStreamError, json_docs, json_stream
 from ludics.prreview.jqsem import JqError, alt, fromdateiso8601, idx, jstr, path, sort_by, truthy, type_name, unique
 
 # --- jq's iteration and length -------------------------------------------------------------------
@@ -35,12 +35,15 @@ def each(value: Json) -> list[Json]:
 
 
 def length(value: Json) -> int | float:
-    """jq's ``length``: items, keys, characters, a number's absolute value, 0 for null."""
+    """jq's ``length``: items, keys, characters, a number's absolute value, 0 for null. A literal
+    stays one, its sign dropped (jq 1.8: ``-3.50 | length`` is ``3.50``, ``-0`` is ``0``)."""
     match value:
         case None:
             return 0
         case bool():
             raise JqError("boolean has no length")
+        case JqLiteral():
+            return JqLiteral(value.text[1:]) if value.text.startswith("-") else value
         case int() | float():
             return abs(value)
         case str() | list() | dict():
@@ -85,16 +88,16 @@ def cmd_load(cfg: Config, args: list[str]) -> int:
     if done.rc != 0:
         cli.say(f"LOAD UNREACHABLE {flotilla}")
         return 4
-    docs = json_stream(done.out)
+    # jq's reading, document by document: the rows of each print before the next is parsed, so a
+    # payload cut short prints what came before the cut, then the refusal; and a number prints as
+    # the payload spelled it (literals=True), as jq 1.8 prints one it did not compute with.
     try:
-        if docs is None:
-            raise JqError("the payload does not parse")
-        for doc in docs:
+        for doc in json_docs(done.out, literals=True):
             for machine in each(idx(doc, "machines")):
                 for key, endpoint in to_entries(idx(machine, "endpoints")):
                     if idx(endpoint, "kind") == "unix":
                         cli.say(load_line(machine, key, endpoint))
-    except JqError:
+    except (JqError, JsonStreamError):
         cli.say(f"LOAD: unexpected payload from {flotilla}/api/fleet")
         return 1
     return 0

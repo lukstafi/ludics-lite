@@ -18,9 +18,10 @@ from ludics.fleetworker.__main__ import usage_text
 from ludics.fleetworker.config import load_config
 from ludics.fleetworker.gate import uri
 from ludics.fleetworker.preflight import siblings_of, slots_report
-from ludics.fleetworker.supervision import head_age, load_line, pr_rows, wave_issues
+from ludics.fleetworker.supervision import each, head_age, length, load_line, pr_rows, wave_issues
 from ludics.fleetworker.workers import feeder_wait_ok, preflight_note, valid_name
-from ludics.prreview.jqsem import JqError
+from ludics.prreview.core import JsonStreamError, json_docs, json_stream
+from ludics.prreview.jqsem import JqError, jstr, tojson
 
 SCRIPT = "/repo/issue-wave/scripts/fleet-worker.sh"
 ROSTER = "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
@@ -139,6 +140,27 @@ class Load(unittest.TestCase):
             load_line({"name": "mac"}, "studio", endpoint),
             "mac\tstudio\tok=true\tcpu5=12.5%\tgpu5=-%\tdune=?\tclaude=2\tcodex=0\tgpu=-",
         )
+
+    def test_numbers_print_as_the_payload_spelled_them(self) -> None:
+        # jq 1.8 prints a number it did not compute with as its literal, in decNumber's spelling.
+        (doc,) = json_docs('[1E+2, 1e2, 3.50, -0, 1.5e3, 0.0000001, 1E1000, 12.0, 7, -0.0]', literals=True)
+        self.assertEqual([jstr(n) for n in each(doc)], ["1E+2", "1E+2", "3.50", "-0", "1.5E+3", "1E-7", "1E+1000", "12.0", "7", "-0.0"])
+        self.assertEqual(tojson(doc), "[1E+2,1E+2,3.50,-0,1.5E+3,1E-7,1E+1000,12.0,7,-0.0]")
+        # length keeps a literal, its sign dropped, as jq 1.8's does; the default reading (every
+        # other port's) is unchanged.
+        (signed,) = json_docs("[-3.50, -0, -0.0, 1.10, -100000000000000000000001]", literals=True)
+        self.assertEqual([jstr(length(n)) for n in each(signed)], ["3.50", "0", "0.0", "1.10", "100000000000000000000001"])
+        self.assertEqual(jstr(next(json_docs("1E+2"))), "100.0")
+        (nested,) = json_docs('{"a": [3.50, {"b": -0}], "c": "\u00e9"}', literals=True)
+        self.assertEqual(tojson(nested), '{"a":[3.50,{"b":-0}],"c":"\u00e9"}')
+
+    def test_documents_before_a_cut_are_read_before_it_refuses(self) -> None:
+        docs = json_docs('{"a": 1} [2] {"b":', literals=True)
+        self.assertEqual(next(docs), {"a": 1})
+        self.assertEqual(next(docs), [2])
+        with self.assertRaises(JsonStreamError):
+            next(docs)
+        self.assertIsNone(json_stream('{"a": 1} {"b":'))
 
 
 @unittest.skipIf(shutil.which("bash") is None, "no bash")
