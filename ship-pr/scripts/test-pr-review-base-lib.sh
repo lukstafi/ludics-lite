@@ -176,6 +176,12 @@ jobs:
 # it back.
 TIP_AT_ROUND=""
 TIP_NEXT=""
+# The workflow list the moved tip answers with, when a case sets it: from the round TIP_NEXT is
+# served on, the list is WORKFLOWS_NEXT instead of WORKFLOWS_JSON -- a sibling merge that ADDED a
+# workflow. `base` re-reads the list only when the tip it observes moves, so this is how a case
+# pins that re-read (review round 6 of the August base --wait work). Its first workflow must be
+# WORKFLOWS_JSON's, which the round counter is keyed on.
+WORKFLOWS_NEXT=""
 # The first listed workflow's id, cached: it is read off WORKFLOWS_JSON, which a case sets after
 # reset_fixture, and every read that would compute it happens in a command substitution of its
 # own. Cleared with the rest of the fixture.
@@ -300,6 +306,7 @@ reset_fixture() {
   : >"$PAGINATE_LOG"
   TIP_AT_ROUND=""
   TIP_NEXT=""
+  WORKFLOWS_NEXT=""
   fixture_call_reset rounds
   rm -f "$FIRST_WID_CACHE"
   # The wait loop's clocks, for the one case that takes more than a single round.
@@ -335,7 +342,15 @@ gh() {
       response=$(jq -cn --arg sha "$TIP" '{sha: $sha}')
     fi
     ;;
-  "repos/$REPO/actions/workflows?per_page=100") response="$WORKFLOWS_JSON" ;;
+  # The repository itself, for the default branch a `base` with no branch named reads: this
+  # fixture's branch.
+  "repos/$REPO") response=$(jq -cn --arg b "$BRANCH" '{default_branch: $b}') ;;
+  "repos/$REPO/actions/workflows?per_page=100")
+    response="$WORKFLOWS_JSON"
+    if [ -n "$WORKFLOWS_NEXT" ] && [ -n "$TIP_AT_ROUND" ] && [ "$(rounds_polled)" -ge "$TIP_AT_ROUND" ]; then
+      response="$WORKFLOWS_NEXT"
+    fi
+    ;;
   "repos/$REPO/actions/workflows/"*"/runs?branch=$BRANCH&event=push&per_page=10")
     wid=${FIXTURE_ENDPOINT#*/actions/workflows/}
     wid=${wid%%/*}
@@ -654,6 +669,25 @@ test_at_round_moves_the_tip_inside_the_round_it_names() {
   assert_eq "$(tip_read)" "$SHA_C" "a move is cleared with the rest of the fixture"
 }
 
+# The moved tip's workflow list is served from the round the tip moves on, and only when a case
+# sets one: read the way `base` reads it, before the round's runs, the list of round two is the
+# successor's.
+test_the_workflow_list_follows_the_moved_tip() {
+  local q='[.workflows[].name] | join(" ")'
+  reset_fixture
+  at_round 1 "$SHA_B"
+  WORKFLOWS_NEXT=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"lint"}]')
+  assert_eq "$(fixture_gh "actions/workflows?per_page=100" --jq "$q")" "ci" "round one lists what the tip had"
+  runs_read 1
+  assert_eq "$(fixture_gh "actions/workflows?per_page=100" --jq "$q")" "ci lint" \
+    "the next read, after round one's runs, lists the successor's"
+  reset_fixture
+  at_round 1 "$SHA_B"
+  runs_read 1
+  assert_eq "$(fixture_gh "actions/workflows?per_page=100" --jq "$q")" "ci" \
+    "a moved tip with no list of its own keeps the list"
+}
+
 # A feed set from a round on answers from that round's read on — the read that OPENS the round,
 # so its tip read still belongs to it — and keeps answering until a later one takes over. A second
 # workflow's feed follows the same round, the per-id read serves the run as the round's feed has
@@ -848,6 +882,7 @@ tests=(
   test_the_grace_is_spent_once_on_the_first_read
   test_at_round_moves_the_tip_inside_the_round_it_names
   test_a_runs_feed_changes_on_the_round_it_names
+  test_the_workflow_list_follows_the_moved_tip
   test_the_runs_read_delay_is_round_ones_and_once
   test_an_aged_run_is_stamped_at_the_read
   test_a_compare_ends_at_its_head
