@@ -467,7 +467,10 @@ class GhSession:
             # gets one more try, and a write is never repeated.
             if quota_failure(first):
                 if budget is not None and in_scope:
-                    budget.quota_hit(args)
+                    unrecorded = budget.quota_hit(args)
+                    if unrecorded is not None:
+                        self._err_line = unrecorded
+                        return GhUnanswered()
                     if mode == "read" and budget.waiting():
                         if budget.hold_read() is not None:
                             continue
@@ -593,8 +596,9 @@ def repo_from_cwd(
             return "\n".join(lines)
     # Refused on quota, it is a hold like any other call's, and still no reason for the remote.
     if quota_failure(_first_line(done.stderr)):
-        if budget is not None and in_scope:
-            budget.quota_hit(["repo", "view"])
+        unrecorded = budget.quota_hit(["repo", "view"]) if budget is not None and in_scope else None
+        if unrecorded is not None:
+            fail(3, f"could not resolve the repository from the checkout: {unrecorded}.")
         fail(3, "could not resolve the repository from the checkout: gh repo view was refused on quota.",
              "Pass it as owner/name, or wait for the hold.")
     done = run("git", ["remote", "get-url", "origin"])

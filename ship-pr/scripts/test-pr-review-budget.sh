@@ -911,6 +911,22 @@ test_a_hold_inside_a_wait_is_one_line_and_no_exit() {
   assert_eq "$(cat "$MERGE_LOG")" "" "nothing merges from a checks read"
 }
 
+# --- ludics-lite#551: the budget's residuals ------------------------------------------------------
+
+# A first refusal whose hold the state directory cannot record (here: the entries' name is taken by
+# a file) is a state-directory error at once: no resend of the refused read, and a message naming
+# SHIP_PR_STATE_DIR, since every other process on the host goes on calling unheld.
+test_an_unrecordable_first_hold_is_a_state_directory_error() {
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 7200))
+  : >"$STATE_DIR/quota-holds"
+  run wait cmd_checks "$REPO#7" --wait=600
+  assert_eq "$(rc wait)" 3 "the refused read is UNKNOWN ($(err wait))"
+  assert_eq "$(requests | grep -c '^read ')" 1 "and it is not resent"
+  assert_contains "$(err wait)" "SHIP_PR_STATE_DIR" "naming the state directory"
+  assert_contains "$(err wait)" "could not be recorded" "as the hold that could not be recorded"
+}
+
 run_tests \
   test_a_quota_refusal_is_unknown_and_holds_every_caller \
   test_a_transport_failure_is_unknown_and_never_merges \
@@ -948,6 +964,7 @@ run_tests \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
+  test_an_unrecordable_first_hold_is_a_state_directory_error \
   -- "$@"
 exit "$?"
 }

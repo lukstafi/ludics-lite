@@ -93,7 +93,6 @@ GITHUB = "github.com"
 ENV_BUDGET_DIR = "LUDICS_PR_BUDGET_DIR"
 
 _DIGITS = re.compile(r"[0-9]+")
-__all__ = ["quota_failure"]  # core's, the session's reading of a failed call (see BOUNDARY)
 
 
 def pause(base: int, cap: int, prev: int | None, changed: bool) -> int:
@@ -676,37 +675,49 @@ class Budget:
             return f"quota hold: pid {lock.holder} is probing {hold.ep} for its recovery; no call was made"
         return None
 
-    def quota_hit(self, args: Sequence[str]) -> None:
+    def quota_hit(self, args: Sequence[str]) -> str | None:
         """``budget_quota_hit <gh args...>``: a call was refused on quota. Probe its endpoint and set
         the hold its headers name. A probe that answers sets the backoff hold all the same. Only one
         probe at a time, and none while a hold stands: requests in flight when the quota ran out
         come back refused together, and each probing would be the burst the hold exists to stop.
         Such a refusal adds its endpoint's backoff entry unprobed, which the gate probes in turn
-        once it has ended. A call whose endpoint cannot be told sets nothing."""
+        once it has ended. A call whose endpoint cannot be told sets nothing.
+
+        None once the hold is recorded (or there is nothing to record); otherwise why it is not: a
+        hold the state directory cannot take holds no other process, and resending the refused
+        call would only be another request during the incident (ludics-lite#551)."""
         if not self.dir:
-            return
+            return None
         ep = endpoint(args, self.env.get("GH_REPO", ""))
         if not ep:
-            return
+            return None
+        if self._quota_hit(ep):
+            return None
+        return (
+            f"{ep} was refused on quota, and the hold it calls for could not be recorded in"
+            f" {self.dir} (SHIP_PR_STATE_DIR), so no other process on this host is held by it; make"
+            " the state directory writable. The call is not repeated"
+        )
+
+    def _quota_hit(self, ep: str) -> bool:
         standing = self.hold_read()
         if standing is not None and standing.until > self.clock.now():
-            self.hold_set(ep, "unprobed")
-            return
+            return self.hold_set(ep, "unprobed")
         # The first refusal may be the state directory's first use.
         try:
             os.makedirs(self.dir, exist_ok=True)
         except OSError:
             pass
         if self.lock_take(self.probe_lock).rc != 0:
-            self.hold_set(ep, "unprobed")
-            return
+            return self.hold_set(ep, "unprobed")
         # Again under the lock: another refusal may have probed and set a hold meanwhile.
         standing = self.hold_read()
         if standing is not None and standing.until > self.clock.now():
-            self.hold_set(ep, "unprobed")
+            recorded = self.hold_set(ep, "unprobed")
         else:
-            self.hold_set(ep, self.probe(ep))
+            recorded = self.hold_set(ep, self.probe(ep))
         self._drop_probe_lock()
+        return recorded
 
     # --- the observer ---
 
