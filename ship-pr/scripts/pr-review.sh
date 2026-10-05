@@ -703,7 +703,7 @@ gh_retry() {
   GH_ERR=""
   while :; do
     # The polling budget's hold (see "the polling budget"): no call while one stands.
-    if ! budget_gate; then
+    if ! budget_gate "$mode"; then
       [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
       return 3
     fi
@@ -792,11 +792,15 @@ gh_err_line() {
 #     When it ends is read from the FAILING ENDPOINT's own response headers, by one `gh api -i`
 #     probe of that endpoint: Retry-After, or else X-RateLimit-Reset when X-RateLimit-Remaining
 #     is 0. It is never read from /rate_limit, which disagreed with the failing endpoint during
-#     the incident. A response with neither header holds for a minute, doubling on each repeat.
-#     Once the hold has ended, ONE process probes the same endpoint again, and the hold lifts only
-#     when that endpoint answers. A quota answer sets the next hold from its own headers.
-#     An observer (a command with a wait ceiling) waits a hold out within its ceiling, then
-#     repeats the read the quota stopped. Every other command returns 3 at once, without a call.
+#     the incident. A response with neither header holds for a minute, doubling on each repeat,
+#     and so does a probe that answers: it is a GET or GraphQL's viewer query, and a secondary
+#     limit on the refused operation itself need not show on it. A standing hold is only ever
+#     extended, never shortened, by a later refusal. Once the hold has ended, ONE process probes
+#     the same endpoint again, and the hold lifts only when that endpoint answers. A quota answer
+#     sets the next hold from its own headers. An observer (a command with a wait ceiling) waits a
+#     hold out within its ceiling, then repeats the READ the quota stopped. A write never waits,
+#     since it would act on reads the hold made stale, and every other command returns 3 at once,
+#     without a call.
 #  3. THE OBSERVER. One observer per PR and kind (review: `watch`; build: `checks --wait` and
 #     `merge --wait`). A second is refused with exit 2, naming the first's pid, rather than
 #     doubling the reads. A holder that is no longer running is replaced.
@@ -979,20 +983,30 @@ hold_read() {
 }
 
 # hold_set <endpoint> <probe verdict>: writes the hold a quota (or an unreadable probe) calls
-# for, replacing the file whole so no reader sees half a line.
+# for, replacing the file whole so no reader sees half a line. A standing hold is only ever
+# extended, never shortened: requests in flight when the quota ran out each come back here, and
+# the last of them must not cut short an earlier, longer reset (another bucket's, say). With no
+# reset in the headers the hold backs off: a minute, doubling from the last hold's length while
+# the quota keeps refusing, up to an hour. The last hold is remembered in quota-last once lifted,
+# for exactly that doubling.
 hold_set() {
-  local ep="$1" verdict="$2" now until len src prev=0
+  local ep="$1" verdict="$2" now until len src prev=0 last_until last_len
   now=$(budget_now)
-  ! hold_read || prev="$HOLD_LEN"
+  if hold_read; then
+    prev="$HOLD_LEN"
+  elif [ -f "$BUDGET_DIR/quota-last" ]; then
+    IFS=$'\t' read -r last_until _ last_len _ <"$BUDGET_DIR/quota-last" 2>/dev/null
+    case "$last_until$last_len" in
+    '' | *[!0-9]*) ;;
+    *) [ $((now - last_until)) -gt 3600 ] || prev="$last_len" ;;
+    esac
+  fi
   case "$verdict" in
   "quota "*)
     until="${verdict#quota }"
     src="its headers"
     ;;
-  *)
-    until=0
-    src=""
-    ;;
+  *) until=0 ;;
   esac
   if [ "$until" -gt "$now" ]; then
     len=$((until - now))
@@ -1003,26 +1017,60 @@ hold_set() {
     until=$((now + len))
     case "$verdict" in
     "quota "*) src="no header names its end; backing off" ;;
+    ok) src="a probe of another operation answered, so no header names this one's end; backing off" ;;
     *) src="the probe got no reading; backing off" ;;
     esac
+  fi
+  if [ -n "$HOLD_UNTIL" ] && [ "$HOLD_UNTIL" -gt "$now" ] && [ "$HOLD_UNTIL" -ge "$until" ]; then
+    return 0
   fi
   mkdir -p "$BUDGET_DIR" 2>/dev/null || return 1
   printf '%s\t%s\t%s\t%s\n' "$until" "$ep" "$len" "$src" >"$BUDGET_DIR/quota-hold.$$" &&
     mv -f "$BUDGET_DIR/quota-hold.$$" "$BUDGET_DIR/quota-hold"
 }
 
+# lock_take <dir>: status 0 once this process holds the lock <dir> (or already did), 1 while a live
+# process holds it, naming it in LOCK_HOLDER and LOCK_SINCE. A lock is a directory holding `owner`
+# (a pid, then the epoch it was taken). A holder that no longer runs is replaced, and so is a
+# directory still ownerless a second after it was first seen: its claimant died between the
+# mkdir and the write, and it would otherwise lock everyone out for good.
+lock_take() {
+  local dir="$1" holder seen=""
+  LOCK_HOLDER="" LOCK_SINCE=""
+  while ! mkdir "$dir" 2>/dev/null; do
+    holder=$(sed -n 1p "$dir/owner" 2>/dev/null)
+    [ "$holder" != "$$" ] || return 0
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+      LOCK_HOLDER="$holder"
+      LOCK_SINCE=$(sed -n 2p "$dir/owner" 2>/dev/null)
+      return 1
+    fi
+    if [ -z "$holder" ] && [ -z "$seen" ]; then
+      seen=1
+      sleep 1
+      continue
+    fi
+    seen=""
+    rm -rf "$dir"
+  done
+  printf '%s\n%s\n' "$$" "$(budget_now)" >"$dir/owner"
+}
+
 budget_at() { date -u -r "$1" '+%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%H:%M:%SZ' 2>/dev/null || printf 'epoch %s' "$1"; }
 
-# budget_gate: run before every call gh_retry makes. Returns 0 when no hold stands (lifting an
-# ended one first, by probing its endpoint), or 3 with GH_ERR saying why no call was made. Within
-# BUDGET_WAIT_UNTIL it waits a standing hold out instead, and says so once per hold.
+# budget_gate <read|write>: run before every call gh_retry makes. Returns 0 when no hold stands
+# (lifting an ended one first, by probing its endpoint), or 3 with GH_ERR saying why no call was
+# made. A READ within BUDGET_WAIT_UNTIL waits a standing hold out instead, and says so once per
+# hold. A write never waits: its caller read its preconditions just before it, and a write sent
+# minutes or hours later would act on reads the hold has made stale (a merge on its gate, a
+# review request over an approval that landed meanwhile).
 budget_gate() {
-  local now nap verdict noted="" holder
+  local mode="${1:-read}" now nap verdict noted=""
   [ -n "$BUDGET_DIR" ] || return 0
   while hold_read; do
     now=$(budget_now)
     if [ "$now" -lt "$HOLD_UNTIL" ]; then
-      if [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$now" -lt "$BUDGET_WAIT_UNTIL" ]; then
+      if [ "$mode" = read ] && [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$now" -lt "$BUDGET_WAIT_UNTIL" ]; then
         if [ "$noted" != "$HOLD_UNTIL" ]; then
           warn "quota hold: $HOLD_EP refused on quota; no call to GitHub until $(budget_at "$HOLD_UNTIL")" \
             "($HOLD_SRC). Waiting it out within this command's ceiling; nothing is concluded meanwhile."
@@ -1038,12 +1086,11 @@ budget_gate() {
       return 3
     fi
     # The hold has ended. One process probes its endpoint; the rest wait for that probe's answer.
-    if mkdir "$BUDGET_DIR/quota-probe" 2>/dev/null; then
-      printf '%s\n' "$$" >"$BUDGET_DIR/quota-probe/pid"
+    if lock_take "$BUDGET_DIR/quota-probe"; then
       verdict=$(budget_probe "$HOLD_EP")
       case "$verdict" in
       ok)
-        rm -f "$BUDGET_DIR/quota-hold"
+        mv -f "$BUDGET_DIR/quota-hold" "$BUDGET_DIR/quota-last" 2>/dev/null
         warn "quota hold lifted: $HOLD_EP answered again"
         ;;
       *) hold_set "$HOLD_EP" "$verdict" ;;
@@ -1051,16 +1098,11 @@ budget_gate() {
       rm -rf "$BUDGET_DIR/quota-probe"
       continue
     fi
-    holder=$(cat "$BUDGET_DIR/quota-probe/pid" 2>/dev/null)
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-      rm -rf "$BUDGET_DIR/quota-probe"
-      continue
-    fi
-    if [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$now" -lt "$BUDGET_WAIT_UNTIL" ]; then
+    if [ "$mode" = read ] && [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$now" -lt "$BUDGET_WAIT_UNTIL" ]; then
       sleep 5
       continue
     fi
-    GH_ERR="quota hold: another process is probing $HOLD_EP for its recovery; no call was made"
+    GH_ERR="quota hold: pid $LOCK_HOLDER is probing $HOLD_EP for its recovery; no call was made"
     printf '%s' "$GH_ERR" >"$GH_ERR_FILE" 2>/dev/null
     return 3
   done
@@ -1068,50 +1110,41 @@ budget_gate() {
 }
 
 # budget_quota_hit <gh args...>: a call was refused on quota. Probe its endpoint and set the hold
-# its headers name; an endpoint that answers the probe sets none.
+# its headers name. A probe that answers sets the backoff hold all the same: the probe is a GET,
+# or GraphQL's viewer query, and a secondary limit on the refused operation itself (a write, an
+# expensive query) need not show on it.
 budget_quota_hit() {
-  local ep verdict
+  local ep
   [ -n "$BUDGET_DIR" ] || return 0
   ep=$(budget_endpoint "$@")
   [ -n "$ep" ] || ep=graphql
-  verdict=$(budget_probe "$ep")
-  [ "$verdict" = ok ] || hold_set "$ep" "$verdict"
+  hold_set "$ep" "$(budget_probe "$ep")"
 }
 
 # observer_claim <kind>: take this PR's observer lock of <kind> for this process, or refuse with
-# exit 2. Re-entry from the same process is a no-op.
+# exit 2 before anything is read. Re-entry from the same process is a no-op.
 observer_claim() {
-  local kind="$1" dir key holder what stale_seen=""
+  local kind="$1" dir key
   [ -n "$BUDGET_DIR" ] || return 0
   key=$(printf '%s#%s.%s' "$REPO" "$PR_NUM" "$kind" | tr '/' '~')
   dir="$BUDGET_DIR/observers/$key"
   [ "$BUDGET_OBSERVER" != "$dir" ] || return 0
   mkdir -p "$BUDGET_DIR/observers" 2>/dev/null || die "cannot create $BUDGET_DIR/observers for the observer lock"
-  while ! mkdir "$dir" 2>/dev/null; do
-    holder=$(sed -n 1p "$dir/owner" 2>/dev/null)
-    what=$(sed -n 2p "$dir/owner" 2>/dev/null)
-    if [ "$holder" = "$$" ]; then
-      # This process's own claim, made from a subshell that could not hand it back.
-      BUDGET_OBSERVER="$dir"
-      return 0
-    fi
-    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-      die "PR $REPO#$PR_NUM already has a $kind observer: pid $holder${what:+, since $(budget_at "$what")}." \
-        "One observer per PR: wait on that one, or stop it, rather than reading the PR twice." \
-        "Nothing was read."
-    fi
-    if [ -z "$holder" ] && [ -z "${stale_seen:-}" ]; then
-      # Mid-creation: the claimant has made the directory and not yet written its owner.
-      stale_seen=1
-      sleep 1
-      continue
-    fi
-    # Gone, or a claimant that died before writing its owner: replace it.
-    stale_seen=""
-    rm -rf "$dir"
-  done
-  printf '%s\n%s\n' "$$" "$(budget_now)" >"$dir/owner"
+  lock_take "$dir" ||
+    die "PR $REPO#$PR_NUM already has a $kind observer: pid $LOCK_HOLDER${LOCK_SINCE:+, since $(budget_at "$LOCK_SINCE")}." \
+      "One observer per PR: wait on that one, or stop it, rather than reading the PR twice." \
+      "Nothing was read."
   BUDGET_OBSERVER="$dir"
+}
+
+# budget_observe <kind> <seconds>: this command is the PR's <kind> observer, waiting up to
+# <seconds>. Called before the command's first read, so a second observer reads nothing and a
+# hold standing at the start is waited out like any other.
+budget_observe() {
+  case "$2" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$2" -gt 0 ] || return 0
+  observer_claim "$1"
+  BUDGET_WAIT_UNTIL=$(($(budget_now) + $2))
 }
 
 observer_release() {
@@ -1153,8 +1186,11 @@ observer_release() {
 repo_from_cwd() {
   local url
   # `gh repo view` first: it honours remote.origin.gh-resolved, so a fork checkout keeps naming
-  # whichever repo gh already decided the PRs live in.
-  gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null | grep . && return 0
+  # whichever repo gh already decided the PRs live in. Not while a quota hold is on file, though:
+  # this call is not gh_retry's, so the hold's gate never sees it (see "the polling budget").
+  if ! hold_read; then
+    gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null | grep . && return 0
+  fi
   # ... but it rides GraphQL, so fall back to the origin remote, which answers the same question
   # locally and stays up when GraphQL does not.
   url=$(git remote get-url origin 2>/dev/null) || return 1
@@ -5395,10 +5431,13 @@ gate_checks() {
   local run_why="" run_info note pr_at="" base_sha="" head_ref="" current_sha waived_runs rname rid
   local last_sig="" sig last_pause=""
   # A `--wait` is the PR's build observer (see "the polling budget"): one at a time, and it may
-  # wait a quota hold out within its ceiling. A single read is neither.
+  # wait a quota hold out within its ceiling, the same ceiling as its own: both run from this
+  # timestamp, taken before the first read. A single read is neither.
+  started=$(date +%s)
+  deadline=$((started + wait_for))
   if [ "$wait_for" -gt 0 ]; then
     observer_claim build
-    BUDGET_WAIT_UNTIL=$(($(budget_now) + wait_for))
+    BUDGET_WAIT_UNTIL="$deadline"
   fi
   GATE_BASE=""
   WAIVED=$'\n'
@@ -5438,8 +5477,6 @@ gate_checks() {
     return 3
   fi
   CHECK_SHA="$sha" # what the verdict is ABOUT; merge binds to it
-  started=$(date +%s)
-  deadline=$((started + wait_for))
   beat=$started
   while :; do
     lines=$(build_checks "$sha")
@@ -5612,6 +5649,7 @@ cmd_checks() {
     shift
   done
   pr_arg "$pr"
+  budget_observe build "$wait_for"
   VERDICT=""
   if advisory_policy; then
     gate_checks "$PR_NUM" "$wait_for"
@@ -6770,6 +6808,8 @@ cmd_merge() {
       "same red on master before this branch existed'."
   fi
   pr_arg "$pr"
+  # A --wait is the PR's build observer from its first read on (see "the polling budget").
+  budget_observe build "$wait_for"
   # Read the body FIRST, before the merge-queue refusal and before a --wait that can run two hours.
   # Two reasons for the position. It is a fact about the PR and not about the build signal, so it is
   # owed to the refusal paths too -- a merge stopped by a red gate is a merge that will be re-run,

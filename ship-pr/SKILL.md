@@ -881,7 +881,8 @@ kind: a second `watch`, or a second `--wait` on a PR, exits 2 naming the first's
 that one rather than arming another. A call GitHub refuses on quota is exit 3, never a verdict, and
 it sets a hold for every `pr-review.sh` on the host. The hold ends where the failing endpoint's own
 headers say (never `/rate_limit`), and it lifts only when that endpoint answers a probe. An
-observer waits the hold out within its ceiling. Any other command exits 3 at once without calling.
+observer waits the hold out within its ceiling before a read (never before a write, which would act
+on stale reads). Any other command exits 3 at once without calling.
 So a quota exit 3 is not a reason to re-arm sooner: the next call waits for the same hold. The
 mechanism and its boundary are in `pr-review.sh` (*the polling budget*).
 

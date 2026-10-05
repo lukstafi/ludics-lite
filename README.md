@@ -857,8 +857,13 @@ quota is UNKNOWN (exit 3) and never merges. Its hold ends where the failing endp
 `checks` alike, sends no request at all. A quota answer to the run await is exit 3, not the "no
 such run" exit 2. A `--wait` waits the hold out and repeats the refused read only after a probe of
 that endpoint answers; a probe that still finds the quota out sets the next hold from its own
-headers. A second build observer of a PR is refused naming the first's pid, a dead holder is
-replaced, and while one process probes an ended hold the others send nothing. A still queue backs
+headers, and a probe that answers still sets the backoff hold (a secondary limit on the refused
+operation need not show on the probe's GET), doubling from the last one. A later refusal never
+shortens a standing hold, a write never waits one out, a hold at the start of a `--wait` counts
+toward its ceiling, and `base`'s `gh repo view` is skipped while one is on file. A second build
+observer of a PR is refused naming the first's pid before any read (the advisory list and the
+merge body included), a dead holder is replaced, while one process probes an ended hold the
+others send nothing, and a probe lock left without an owner is replaced after a second. A still queue backs
 off from the interval to the build cap with nothing printed per poll, a moving signal resets the
 pause, and a red still ends the wait at once. `test-pr-review-watch.sh` pins the same pause for a
 review window. A transport failure (a 502) stays exit 3 with no merge and sets no hold.
