@@ -53,6 +53,11 @@ jobs:
       # The fleet's pinned jq, as a native jq.exe, ahead of the image's Chocolatey one
       # (ludics-lite#508); the proof step below records its version and its line ending.
       - uses: ./.github/actions/setup-jq
+      # The subcommands ported to Python run through scripts/py, which needs a Python >= 3.12
+      # (ludics-lite#403); on Windows it finds `python`, or the `py` launcher.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Prove the platform from inside the suites' shell
         id: platform
         env:
@@ -74,6 +79,8 @@ jobs:
           *) echo "::error title=Git Bash platform proof failed::git --version is '$gv', not a Git for Windows build (.windows.)"; exit 1 ;;
           esac
           command -v jq || { echo '::error title=Git Bash platform proof failed::no jq on PATH'; exit 1; }
+          scripts/py -c 'import sys; print("scripts/py:     Python", sys.version.split()[0], "at", sys.executable)' ||
+            { echo '::error title=Git Bash platform proof failed::scripts/py found no Python >= 3.12'; exit 1; }
           # The pinned jq is a native jq.exe, which ends its lines CRLF, and a `$(jq -r ...)`
           # keeps the \r; pr-review.sh reads every jq through `jq_lf`, which probes for that once
           # (ludics-lite#335). Recorded here, so the day it changes is on the record.
