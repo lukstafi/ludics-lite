@@ -52,6 +52,7 @@ from ludics.prreview.ere import Advisory
 from ludics.prreview.gate import GateConfig, Gate, load_gate_config
 from ludics.prreview.workflows import Reads
 from ludics.prreview.checkruns import conclusion_class, newest_first
+from ludics.prreview.budget import pause
 from ludics.prreview.clock import Clock, FuncClock, age_of, clock_from_env
 from ludics.prreview.shtext import encode_ref, tab_fields
 from ludics.prreview.workflow_yaml import paths_ignore_covers, workflow_filter, workflow_keys
@@ -937,6 +938,16 @@ class Wait:
         branch = self.branch
         self.ebranch = encode_ref(branch)
         started = b.clock.now()
+        # A --wait is the branch's observer in the polling budget (ludics-lite#551): one per branch,
+        # refused before it reads the runs, and it waits a quota hold out within its ceiling.
+        budget = b.session.budget
+        if wait_for > 0 and budget is not None:
+            budget.base_claim(repo, branch)
+            budget.wait_from = started
+            budget.wait_until = started + wait_for
+        cap = budget.build_cap if budget is not None else knobs.checks_interval
+        last_sig = ""
+        last_pause: int | None = None
         beat = grace_from = started
         waited_note = ""
         no_tip_verdict = False
@@ -1037,8 +1048,19 @@ class Wait:
                      f" {rnd.uncovered} workflow(s)",
                      f"not yet judged at the tip, after {(now - started) // 60} min")
                 beat = now
+            # The budget's pause: the interval after a round that saw the branch move (its tip, its
+            # runs, what the round made of them), doubling toward the build cap while it sits still,
+            # and capped at what is left of the ceiling.
+            sig = "|".join((
+                tip, str(rnd.red), str(rnd.pend), str(rnd.inflight), str(rnd.uncovered),
+                str(rnd.red_at_tip), str(rnd.nogo_at_tip), str(rnd.norun), str(rnd.tip_unjudged),
+                " ".join(f"{r.run_id}:{r.status}:{r.conclusion}" for r in raw),
+            ))
+            sleep_for = pause(knobs.checks_interval, cap, last_pause, sig != last_sig)
+            last_sig = sig
+            last_pause = sleep_for
             remaining = started + wait_for - now
-            b.clock.sleep(min(knobs.checks_interval, remaining))
+            b.clock.sleep(min(sleep_for, remaining))
         return self.report(rnd, tip, waited_note, no_tip_verdict, interim_green)
 
     def read_runs(self, rnd: _Round) -> list[RunRow]:

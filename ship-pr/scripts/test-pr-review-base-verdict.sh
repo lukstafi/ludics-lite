@@ -473,6 +473,46 @@ test_a_wait_heartbeats_what_it_waits_on() {
     "the heartbeat names the runs in flight and the workflows not yet judged"
 }
 
+# `base --wait` is an observer of the polling budget like a PR's (ludics-lite#551): a branch whose
+# runs sit still backs off from the interval to the build cap rather than reading every interval,
+# and a second wait on the same branch is refused before it reads the runs. Subshell cases: each
+# keeps its clock (the script's test clock, which its own sleep advances and logs) and its state
+# directory to itself.
+test_a_still_base_wait_backs_off_to_the_build_cap() (
+  export SHIP_PR_TEST_CLOCK="$TEST_ROOT/clock"
+  date +%s >"$SHIP_PR_TEST_CLOCK"
+  sleep() {
+    printf '%s\n' "$1" >>"$TEST_ROOT/sleeps"
+    printf '%s\n' "$(($(cat "$SHIP_PR_TEST_CLOCK") + $1))" >"$SHIP_PR_TEST_CLOCK"
+  }
+  reset_fixture
+  : >"$TEST_ROOT/sleeps"
+  retune CHECKS_INTERVAL=60
+  BUILD_POLL_CAP=600
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{status:"in_progress", conclusion:null, head_sha:$c, id:6171}]')")
+  run_base --wait=1000
+  assert_eq "$BASE_RC" 4 "the ceiling ends the wait without a verdict ($BASE_OUTPUT)"
+  assert_eq "$(tr '\n' ' ' <"$TEST_ROOT/sleeps")" "60 120 240 480 100 " \
+    "an unchanged branch doubles the pause up to the cap, the last cut to the ceiling"
+)
+
+test_a_second_base_wait_on_a_branch_is_refused() (
+  local holder
+  reset_fixture
+  BUDGET_DIR="$TEST_ROOT/budget-state"
+  mkdir -p "$BUDGET_DIR/observers/example~repo@main.base"
+  command sleep 300 &
+  holder=$!
+  printf '%s\n%s\n' "$holder" "$(date +%s)" >"$BUDGET_DIR/observers/example~repo@main.base/owner"
+  run_base --wait=60
+  kill "$holder" 2>/dev/null || :
+  wait "$holder" 2>/dev/null || :
+  rm -rf "$BUDGET_DIR"
+  assert_eq "$BASE_RC" 2 "a second wait on the branch is refused ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "pid $holder" "naming the one already waiting"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d ' ')" 0 "having read nothing"
+)
+
 tests=(
   test_a_red_at_the_tip_ends_the_wait_at_once
   test_the_red_break_reconfirms_the_tip
@@ -486,6 +526,8 @@ tests=(
   test_a_slashed_branch_is_the_branch_when_the_repo_is_named
   test_a_branch_name_is_percent_encoded
   test_the_default_branch_is_read_when_none_is_named
+  test_a_still_base_wait_backs_off_to_the_build_cap
+  test_a_second_base_wait_on_a_branch_is_refused
   test_a_branch_no_workflow_ran_on_is_not_green
   test_a_workflow_the_moved_tip_added_is_read
   test_an_unreadable_list_or_runs_read_is_unknown

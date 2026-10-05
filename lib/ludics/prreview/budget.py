@@ -753,10 +753,20 @@ class Budget:
         """``observer_claim <kind>``: take this PR's observer lock of ``kind``, or refuse with exit 2
         before anything is read. Re-entry from the same process is a no-op. GitHub's names are
         case-insensitive and its numbers integers, so ``Owner/Repo#007`` is ``owner/repo#7``."""
-        if not self.dir:
-            return
         number = int(num) if _DIGITS.fullmatch(num) else num
         key = f"{repo}#{number}.{kind}".replace("/", "~").lower()
+        self._claim(key, kind, f"PR {repo}#{num}", "PR")
+
+    def base_claim(self, repo: str, branch: str) -> None:
+        """The observer lock of ``base --wait`` on a branch (ludics-lite#551): one per repository and
+        branch. The repository is case-insensitive and the branch is not (git's names are), so only
+        the repository is lowercased; ``/`` reads as ``~``, which no git ref can hold."""
+        key = f"{repo.lower()}@{branch}.base".replace("/", "~")
+        self._claim(key, "base", f"{repo} {branch}", "branch")
+
+    def _claim(self, key: str, kind: str, what: str, unit: str) -> None:
+        if not self.dir:
+            return
         observers = os.path.join(self.dir, "observers")
         directory = os.path.join(observers, key)
         if self.observer == directory:
@@ -769,8 +779,8 @@ class Budget:
         if lock.rc == 1:
             since = f", since {at(lock.since)}" if lock.since else ""
             die(
-                f"PR {repo}#{num} already has a {kind} observer: pid {lock.holder}{since}.",
-                "One observer per PR: wait on that one, or stop it, rather than reading the PR twice.",
+                f"{what} already has a {kind} observer: pid {lock.holder}{since}.",
+                f"One observer per {unit}: wait on that one, or stop it, rather than reading the {unit} twice.",
                 "Nothing was read.",
             )
         if lock.rc != 0:
