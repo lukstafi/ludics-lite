@@ -29,7 +29,8 @@
 #
 # Shell: bash 3.2 (macOS), bash 5, and Git Bash. No arrays-with-`set -u` pitfalls, no `local -n`.
 
-lib_dir=$(cd "$(dirname "$0")/.." && pwd -P)/lib
+# Physically before going up, so a path through a symlinked directory still lands in the checkout.
+lib_dir=$(CDPATH= cd -P "$(dirname "$0")" && cd -P .. && pwd -P)/lib
 
 windows=""
 case "$(uname -s 2>/dev/null)" in

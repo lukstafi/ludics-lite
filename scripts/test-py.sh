@@ -132,6 +132,12 @@ out=$("$PY" -c 'import ludics, os; print(os.path.dirname(os.path.realpath(ludics
 [ "$out" = "$ROOT/lib/ludics" ] && ok "the ludics package is importable from lib/" ||
   ko "import ludics: $out (want $ROOT/lib/ludics)"
 
+# Through a symlinked directory (how the skills reach a checkout), lib/ is still the checkout's.
+ln -s "$HERE" "$TMP/linked-scripts"
+out=$("$TMP/linked-scripts/py" -c 'import ludics, os; print(os.path.dirname(os.path.realpath(ludics.__file__)))' 2>&1)
+[ "$out" = "$ROOT/lib/ludics" ] && ok "run through a symlinked directory, it still finds the checkout's lib/" ||
+  ko "through a symlinked directory: $out (want $ROOT/lib/ludics)"
+
 # Nothing from the caller's cwd shadows a module: pr-review.sh runs from inside arbitrary project
 # checkouts. Without -P, a `json.py` in the cwd is what `import json` loads.
 mkdir -p "$TMP/project"

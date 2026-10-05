@@ -8501,7 +8501,10 @@ py_forward() { # <exec|call> <subcommand> <args...>
   local how="$1" py pair name state rc fn bridged=""
   local -a env_args=()
   shift
-  py="$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)/scripts/py"
+  # Physically, BEFORE going up: the skills call this file through a symlinked skill directory
+  # (~/.claude/skills/ship-pr -> <checkout>/ship-pr), and a logical `cd .../../..` would climb out
+  # of the link into ~/.claude/skills instead of into the checkout.
+  py="$(CDPATH= cd -P "$(dirname "${BASH_SOURCE[0]}")" && cd -P ../.. && pwd -P)/scripts/py"
   [ -x "$py" ] || die "$1 is served by Python since ludics-lite#403, and its runner $py is missing" \
     "or not executable: this copy of pr-review.sh is not inside a ludics-lite checkout. Run the" \
     "checkout's ship-pr/scripts/pr-review.sh. Nothing was read or written."

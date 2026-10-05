@@ -91,6 +91,18 @@ class Body(unittest.TestCase):
                     self.assertIn(says, done.stderr)
                     self.assertEqual(gh.calls(), [])
 
+    def test_the_skills_symlink_reaches_the_checkouts_python(self) -> None:
+        # How the skills call it: ~/.claude/skills/ship-pr is a symlink to <checkout>/ship-pr.
+        skills = os.path.join(self.dir, "skills")
+        os.mkdir(skills)
+        os.symlink(os.path.join(ROOT, "ship-pr"), os.path.join(skills, "ship-pr"))
+        linked = os.path.join(skills, "ship-pr", "scripts", "pr-review.sh")
+        with FakeTool("gh") as gh:
+            gh.script(Answer(0, "https://github.com/o/r/pull/7\n"))
+            done = self.run_cmd([linked], "o/r#7", self.file)
+            self.assertEqual((done.returncode, done.stderr), (0, ""))
+            self.assertEqual(len(gh.calls()), 1)
+
     def test_the_repo_comes_from_the_argument_before_the_environment(self) -> None:
         with FakeTool("gh") as gh:
             gh.script(Answer(0, "u\n"))
