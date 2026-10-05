@@ -182,6 +182,19 @@ test_the_readers_refuse_a_missing_or_malformed_pr() {
     set -e
     assert_eq "$rc" 1 "$sub with no PR is bash's parameter error"
     assert_contains "$out" "usage: $sub <pr>" "$sub names its usage"
+    # bash's own message, which names the script, its line and the parameter; the Python half
+    # cannot spell the first two, so the forwarder makes this refusal itself.
+    case "$out" in "$HELPER: line "[0-9]*": 1: usage: $sub <pr>"*) ;; *)
+      bail "$sub with no PR should be bash's \${1:?} message, got: $out" ;;
+    esac
+    set +e
+    out=$(env -u SHIP_PR_TEST_SOURCE_ONLY bash "$HELPER" "$sub" "" 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 1 "$sub with an empty PR is bash's parameter error too"
+    case "$out" in "$HELPER: line "[0-9]*": 1: usage: $sub <pr>"*) ;; *)
+      bail "$sub with an empty PR should be bash's \${1:?} message, got: $out" ;;
+    esac
     set +e
     out=$(env -u SHIP_PR_TEST_SOURCE_ONLY bash "$HELPER" "$sub" "$REPO#x" 2>&1)
     rc=$?

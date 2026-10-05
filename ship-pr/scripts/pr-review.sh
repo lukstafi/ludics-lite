@@ -8125,6 +8125,19 @@ PY_BRIDGE_COMMANDS=(gh git)
 
 py_ported() { case "$PY_PORTED" in *" ${1:-} "*) return 0 ;; esac; return 1; }
 
+# The usage refusal of a ported reader with no PR, made HERE: bash's own `${1:?}` message names this
+# script, the line and the parameter ("<script>: line N: 1: usage: status <pr>"), which the Python
+# cannot spell. Exit 1, as before the port; any other argument goes to the Python.
+py_usage() { # <subcommand> <its args...>
+  local sub="${1:-}"
+  shift
+  case "$sub" in
+  poll) : "${1:?usage: poll <pr> [watermark]}" ;;
+  status) : "${1:?usage: status <pr>}" ;;
+  rounds) : "${1:?usage: rounds <pr>}" ;;
+  esac
+}
+
 # This shell's state for the bridge: every function, every variable bash lets a script assign
 # (its own read-only and dynamic ones are left out; a declaration the source refuses anyway is
 # silenced there), and the two options a command substitution inherits, -u and pipefail. errexit is
@@ -8200,7 +8213,10 @@ main() {
   --repo=*) REPO="${1#--repo=}" && shift ;;
   esac
   # A subcommand ported to Python is exec'd there; see "the Python half" above.
-  if py_ported "${1:-}"; then py_forward exec "$@"; fi
+  if py_ported "${1:-}"; then
+    py_usage "$@"
+    py_forward exec "$@"
+  fi
 
   case "${1:-}" in
   poll) shift && cmd_poll "$@" ;;
