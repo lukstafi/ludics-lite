@@ -139,7 +139,6 @@ def _columns(text: str) -> int:
     return col
 
 
-# SHARED-CANDIDATE: MULTI_CLOSE_FILTER
 def scan(text: str, repo: str, plain: bool) -> list[Finding]:
     """``awk -v repo=<repo> [-v plain=1] "$MULTI_CLOSE_FILTER" <<<"$text"``: the findings, in order.
     ``plain`` reads a COMMIT MESSAGE, where an indented line is quoted, not skipped as code."""

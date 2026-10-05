@@ -1,103 +1,158 @@
-"""jq's value semantics, for the reads ported from pr-review.sh's jq programs.
+"""jq's semantics, as plain Python, for every read ported from one of pr-review.sh's jq programs.
 
-The shell read every feed with a jq program, and what a program did with a shape it could not take
-was part of the command's behaviour: it ERRORED, the caller saw the failure, and the read reported
-itself unread (``unknown``, exit 3 or 4) instead of rendering a value (ludics-lite#89). A Python
-port that read feeds with ``dict.get`` would answer those shapes instead. So the reads ported from
-those programs go through the helpers here, which do what jq 1.8 does (the fleet's jq, pinned in
-CI, ludics-lite#508):
+pr-review.sh asked every question of a feed in a jq program, and its answers -- which items are
+new, which row is the newest, what an interpolated field prints as -- are jq's: its ordering of
+mixed types, ``max_by`` keeping the LAST of equal maxima, ``//`` taking only null and false as
+missing, ``.a`` on a string being an ERROR rather than null, and a regex dialect (Oniguruma in
+Perl mode) whose ``\\z``, ``(?<name>...)`` and ``[[:space:]]`` are spelled differently here. The
+port keeps those answers, including the failures: a shape a jq program would have errored on raises
+``JqError``, and each caller turns that into the refusal the shell printed when its ``jq`` failed
+("... did not parse"), never into an empty answer.
 
-  - indexing ``.key`` of null is null, of an object its value, of anything else an error;
-  - ``a // b`` takes ``b`` when ``a`` is null or false, and does NOT swallow an error in ``a``;
-  - ``==``, ``<`` and the sorts use jq's total order: null < false < true < numbers < strings <
-    arrays < objects;
-  - the string builtins (``test``, ``startswith``, ``split``, ``sub``, ``capture``, ``contains``,
-    ``fromdateiso8601``) refuse a non-string input;
-  - ``max_by`` keeps the LAST of equal maxima, ``sort_by`` is stable, ``max`` of nothing is null;
-  - string interpolation and ``jq -r`` print a string as itself and anything else as JSON.
-
-Every failure is a ``JqError``; a caller catches it exactly where the shell's ``|| {...}`` stood.
+One module for every subcommand (ludics-lite#403's integration): the reads of ``poll``,
+``status``, ``rounds`` and ``watch``, and the clocks' ``fromdateiso8601``.
 """
 
 import calendar
 import json
 import re
+import time
 from collections.abc import Callable, Iterable, Sequence
-from functools import cmp_to_key
 
 from ludics.prreview.core import Json
 
 
 class JqError(Exception):
-    """What jq would have exited 5 on."""
+    """A jq program would have failed here (a type error, an unparseable date)."""
 
 
-def kind(v: Json) -> str:
-    """jq's ``type``."""
-    if v is None:
+# --- values ---------------------------------------------------------------------------------------
+
+
+def idx(value: Json, key: str) -> Json:
+    """jq's ``.key``: null on null, the member (or null) on an object, an error on anything else."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get(key)
+    raise JqError(f"cannot index {type_name(value)} with {key!r}")
+
+
+def path(value: Json, *keys: str | int) -> Json:
+    """``.a.b[0]...``: ``idx`` for a name, jq's ``.[n]`` for an integer (null past the end)."""
+    out = value
+    for key in keys:
+        if isinstance(key, str):
+            out = idx(out, key)
+        elif out is None:
+            return None
+        elif isinstance(out, list):
+            out = out[key] if -len(out) <= key < len(out) else None
+        else:
+            raise JqError(f"cannot index {type_name(out)} with a number")
+    return out
+
+
+def alt(value: Json, default: Json) -> Json:
+    """``value // default``: null and false are missing."""
+    return default if value is None or value is False else value
+
+
+def truthy(value: Json) -> bool:
+    return value is not None and value is not False
+
+
+def type_name(value: Json) -> str:
+    if value is None:
         return "null"
-    if isinstance(v, bool):
+    if isinstance(value, bool):
         return "boolean"
-    if isinstance(v, (int, float)):
+    if isinstance(value, (int, float)):
         return "number"
-    if isinstance(v, str):
+    if isinstance(value, str):
         return "string"
-    if isinstance(v, list):
+    if isinstance(value, list):
         return "array"
     return "object"
 
 
-def idx(v: Json, key: str) -> Json:
-    """``.key``."""
-    if v is None:
-        return None
-    if isinstance(v, dict):
-        return v.get(key)
-    raise JqError(f'Cannot index {kind(v)} with "{key}"')
+def as_list(value: Json) -> list[Json]:
+    """``.[]`` over an array, or ``$x[]``; an error on anything that is not one (objects are not
+    iterated by any program this port replaces)."""
+    if isinstance(value, list):
+        return value
+    raise JqError(f"cannot iterate over {type_name(value)}")
 
 
-def nth(v: Json, i: int) -> Json:
-    """``.[i]`` for a number ``i``."""
-    if v is None:
-        return None
-    if isinstance(v, list):
-        return v[i] if -len(v) <= i < len(v) else None
-    raise JqError(f"Cannot index {kind(v)} with number")
+def string(value: Json) -> str:
+    """A value a program required to be a string (``startswith``, ``test``, ``split``)."""
+    if isinstance(value, str):
+        return value
+    raise JqError(f"{type_name(value)} is not a string")
 
 
-def truthy(v: Json) -> bool:
-    return v is not None and v is not False
+def startswith(value: Json, prefix: Json) -> bool:
+    if not isinstance(value, str) or not isinstance(prefix, str):
+        raise JqError("startswith() requires string inputs")
+    return value.startswith(prefix)
 
 
-def alt(v: Json, default: Json) -> Json:
-    """``v // default`` for a single-valued ``v``."""
-    return v if truthy(v) else default
+def login_is(item: Json, reviewer: str) -> bool:
+    """``select((.user.login // "") | startswith($rev))``, the reviewer filter every feed uses."""
+    return startswith(alt(path(item, "user", "login"), ""), reviewer)
 
 
-def path(v: Json, *keys: str) -> Json:
-    """``.a.b.c``."""
-    for key in keys:
-        v = idx(v, key)
-    return v
+def body_of(item: Json) -> str:
+    """``(.body // "")``, required to be a string by whatever reads it next."""
+    return string(alt(idx(item, "body"), ""))
 
 
-# --- order -----------------------------------------------------------------------------------------
+# --- printing -------------------------------------------------------------------------------------
+
+
+def number_text(value: int | float) -> str:
+    if isinstance(value, int):
+        return str(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        return "null" if value != value else ("1.7976931348623157e+308" if value > 0 else "-1.7976931348623157e+308")
+    return json.dumps(value)
+
+
+def tojson(value: Json) -> str:
+    """jq's ``tojson``/``-c``: compact, keys in their order, non-ASCII as itself."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def jstr(value: Json) -> str:
+    """What ``"\\(x)"`` and ``-r`` print for a value: a string as itself, anything else as JSON."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return number_text(value)
+    return tojson(value)
+
+
+# --- ordering ---------------------------------------------------------------------------------------
 
 _RANK = {"null": 0, "boolean": 1, "number": 3, "string": 4, "array": 5, "object": 6}
 
 
-def _rank(v: Json) -> int:
-    if v is True:
+def _rank(value: Json) -> int:
+    if value is True:
         return 2
-    return _RANK[kind(v)]
+    return _RANK[type_name(value)]
 
 
 def cmp(a: Json, b: Json) -> int:
-    """jq's ``jv_cmp``: a total order over every JSON value."""
+    """jq's total order: null < false < true < numbers < strings < arrays < objects."""
     ra, rb = _rank(a), _rank(b)
     if ra != rb:
         return -1 if ra < rb else 1
-    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
         return (a > b) - (a < b)
     if isinstance(a, str) and isinstance(b, str):
         return (a > b) - (a < b)
@@ -108,35 +163,41 @@ def cmp(a: Json, b: Json) -> int:
                 return c
         return (len(a) > len(b)) - (len(a) < len(b))
     if isinstance(a, dict) and isinstance(b, dict):
-        ka: list[Json] = list(sorted(a))
-        kb: list[Json] = list(sorted(b))
-        c = cmp(ka, kb)
+        ka, kb = sorted(a), sorted(b)
+        c = cmp(list[Json](ka), list[Json](kb))
         if c:
             return c
-        for key in sorted(a):
-            c = cmp(a[key], b[key])
+        for k in ka:
+            c = cmp(a[k], b[k])
             if c:
                 return c
         return 0
-    return 0  # null, false, true: one value each
-
-
-def eq(a: Json, b: Json) -> bool:
-    return cmp(a, b) == 0
+    return 0
 
 
 def gt(a: Json, b: Json) -> bool:
     return cmp(a, b) > 0
 
 
+def ge(a: Json, b: Json) -> bool:
+    return cmp(a, b) >= 0
+
+
+def lt(a: Json, b: Json) -> bool:
+    return cmp(a, b) < 0
+
+
 def sort_by[T](items: Iterable[T], key: Callable[[T], Json]) -> list[T]:
-    keyed = [(key(item), item) for item in items]
-    keyed.sort(key=cmp_to_key(lambda x, y: cmp(x[0], y[0])))
-    return [item for _, item in keyed]
+    """``sort_by(f)``: stable, in jq's order."""
+    import functools
+
+    keyed = [(key(x), x) for x in items]
+    keyed.sort(key=functools.cmp_to_key(lambda p, q: cmp(p[0], q[0])))
+    return [x for _, x in keyed]
 
 
 def max_by[T](items: Sequence[T], key: Callable[[T], Json]) -> T | None:
-    """``max_by(f)``: the LAST of equal maxima; None (jq's null) for no items."""
+    """``max_by(f)``: the LAST of the greatest, None for an empty array."""
     best: T | None = None
     best_key: Json = None
     first = True
@@ -147,165 +208,80 @@ def max_by[T](items: Sequence[T], key: Callable[[T], Json]) -> T | None:
     return best
 
 
-def jmax(items: Sequence[Json]) -> Json:
-    """``max``."""
-    return max_by(items, lambda v: v)
+def jmax(values: Sequence[Json]) -> Json:
+    """``max``: null for an empty array."""
+    return max_by(values, lambda v: v)
 
 
-def unique(items: Sequence[Json]) -> list[Json]:
+def unique(values: Iterable[Json]) -> list[Json]:
     out: list[Json] = []
-    for v in sort_by(items, lambda v: v):
-        if not out or not eq(out[-1], v):
+    for v in sort_by(values, lambda v: v):
+        if not out or cmp(out[-1], v) != 0:
             out.append(v)
     return out
 
 
-# --- printing --------------------------------------------------------------------------------------
+def member(values: Sequence[Json], value: Json) -> bool:
+    """``$array | index($x)`` used as a test: is an element equal to it."""
+    return any(cmp(v, value) == 0 and type_name(v) == type_name(value) for v in values)
 
 
-def tojson(v: Json) -> str:
-    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+# --- regular expressions ----------------------------------------------------------------------------
+
+# Oniguruma's [[:space:]] under UTF-8: the White_Space property, not Python's isspace (which also
+# takes the four information separators U+001C-U+001F).
+SPACE = "\t\n\x0b\x0c\r \x85\xa0  -     　"
 
 
-def pretty(v: Json) -> str:
-    """jq's default output (no ``-c``): an array or object over several lines, indented by two."""
-    if isinstance(v, (list, dict)) and v:
-        return json.dumps(v, ensure_ascii=False, indent=2)
-    return tojson(v)
+def onig(pattern: str, flags: int = 0) -> re.Pattern[str]:
+    """Compile a pattern written in jq's dialect: ``(?<name>`` is ``(?P<name>``, ``\\z`` is
+    ``\\Z``, and ``[:space:]`` inside a bracket is the White_Space set. ``^``, ``$`` and ``.``
+    already mean what they mean there (string start; end or before a final newline; no newline)."""
+    p = pattern.replace("(?<", "(?P<").replace("\\z", "\\Z").replace("[:space:]", SPACE)
+    return re.compile(p, flags)
 
 
-def text(v: Json) -> str:
-    """String interpolation ``\\(v)`` and ``tostring``: a string as itself, the rest as JSON."""
-    return v if isinstance(v, str) else tojson(v)
+def test(text: Json, rx: re.Pattern[str]) -> bool:
+    return rx.search(string(text)) is not None
 
 
-def add_str(a: str, b: Json) -> str:
-    """``"..." + b``: a string, or null (which adds nothing); anything else is an error."""
-    if b is None:
-        return a
-    if isinstance(b, str):
-        return a + b
-    raise JqError(f"string and {kind(b)} cannot be added")
+def capture_first(text: Json, rx: re.Pattern[str]) -> dict[str, str | None] | None:
+    """``[capture(re)] | first``: the first match's named groups, or None."""
+    m = rx.search(string(text))
+    return None if m is None else m.groupdict()
 
 
-def captured(outputs: Iterable[str]) -> str:
-    """What ``x=$(jq -r ...)`` holds: each output on its own line, trailing newlines dropped."""
-    return "".join(o + "\n" for o in outputs).rstrip("\n")
-
-
-# --- strings ---------------------------------------------------------------------------------------
-
-
-def _string(v: Json, what: str) -> str:
-    if isinstance(v, str):
-        return v
-    raise JqError(f"{kind(v)} ({tojson(v)}) {what}")
-
-
-def test(v: Json, pattern: re.Pattern[str]) -> bool:
-    return pattern.search(_string(v, "cannot be matched, as it is not a string")) is not None
-
-
-def startswith(v: Json, prefix: Json) -> bool:
-    if isinstance(v, str) and isinstance(prefix, str):
-        return v.startswith(prefix)
-    raise JqError("startswith() requires string inputs")
-
-
-def contains(v: Json, needle: str) -> bool:
-    if isinstance(v, str):
-        return needle in v
-    raise JqError(f"{kind(v)} ({tojson(v)}) and string cannot have their containment checked")
-
-
-def split(v: Json, sep: str) -> list[str]:
-    """``split("sep")``: jq splits an empty string into NO parts."""
-    s = _string(v, "cannot be split")
-    return [] if s == "" else s.split(sep)
-
-
-def sub(v: Json, pattern: re.Pattern[str], repl: str) -> str:
-    """``sub(re; "literal")``: the first match only."""
-    s = _string(v, "cannot be matched, as it is not a string")
-    return pattern.sub(lambda _m: repl, s, count=1)
-
-
-def capture(v: Json, pattern: re.Pattern[str]) -> dict[str, Json] | None:
-    """``[capture(re)] | first``: the named groups of the first match, or None (no output)."""
-    match = pattern.search(_string(v, "cannot be matched, as it is not a string"))
-    return None if match is None else dict(match.groupdict())
-
-
-def capture_all(v: Json, pattern: re.Pattern[str]) -> list[dict[str, Json]]:
+def capture_all(text: Json, rx: re.Pattern[str]) -> list[dict[str, str | None]]:
     """``[capture(re; "g")]``."""
-    s = _string(v, "cannot be matched, as it is not a string")
-    return [dict(m.groupdict()) for m in pattern.finditer(s)]
+    return [m.groupdict() for m in rx.finditer(string(text))]
 
 
-def head_slice(v: Json, n: int) -> Json:
-    """``.[0:n]``: a string by code points, an array by elements, null as null."""
-    if v is None:
-        return None
-    if isinstance(v, (str, list)):
-        return v[0:n]
-    raise JqError(f"Cannot index {kind(v)} with object")
+def sub_once(text: Json, rx: re.Pattern[str], repl: str) -> str:
+    """``sub(re; s)`` with a literal replacement."""
+    return rx.sub(lambda _m: repl, string(text), count=1)
 
+
+# --- dates ------------------------------------------------------------------------------------------
 
 _ISO = re.compile(r"([0-9]{1,4})-([0-9]{1,2})-([0-9]{1,2})T([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})Z")
 
 
-def fromdateiso8601(v: Json) -> int:
-    """``fromdateiso8601``: jq's strptime of ``%Y-%m-%dT%H:%M:%SZ``, whole string, UTC.
+def fromdateiso8601(text: Json) -> int:
+    """jq's ``fromdateiso8601``: strptime ``%Y-%m-%dT%H:%M:%SZ`` and timegm, whole string, UTC.
 
-    Like the C strptime under it, a field may be written without its leading zero, and a value
-    out of its field's range (a 13th month, a 25th hour) does not parse; a fraction of a second
-    does not either."""
-    s = _string(v, "cannot be parsed as a date")
+    Like the C strptime under it, a field may be written without its leading zero, a value out of
+    its field's range (a 13th month, a 25th hour) does not parse, and neither does a fraction of a
+    second; timegm normalizes an out-of-range day. Seconds go to 60, as macOS's strptime reads
+    them (glibc's also takes 61; GitHub never sends either)."""
+    s = string(text)
     m = _ISO.fullmatch(s)
     if m is None:
         raise JqError(f'date "{s}" does not match format "%Y-%m-%dT%H:%M:%SZ"')
-    year, month, day, hour, minute, second = (int(g) for g in m.groups())
-    if not (1 <= month <= 12 and 1 <= day <= 31 and hour <= 23 and minute <= 59 and second <= 60):
+    y, mo, d, h, mi, se = (int(g) for g in m.groups())
+    if not (1 <= mo <= 12 and 1 <= d <= 31 and h <= 23 and mi <= 59 and se <= 60):
         raise JqError(f'date "{s}" does not match format "%Y-%m-%dT%H:%M:%SZ"')
-    return calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
+    return calendar.timegm((y, mo, d, h, mi, se, 0, 0, 0))
 
 
-# [[:space:]] as jq's Oniguruma reads it in a UTF-8 string: Unicode White_Space, which is NOT
-# Python's \s (that adds \x1c-\x1f).
-WS = "\t\n\x0b\x0c\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000"
-NONSPACE = re.compile(f"[^{WS}]")
-TRAILING_SPACE = re.compile(f"[{WS}]+\\Z")
-
-
-def bash_read(line: str, count: int, ws: str = "\t") -> list[str]:
-    """``IFS=<ws> read -r a b c <<<"$line"``, for an IFS of whitespace characters only: the first
-    line, leading and trailing IFS stripped, fields split on RUNS of IFS, the last variable taking
-    the rest."""
-    s = line.split("\n", 1)[0].strip(ws)
-    out: list[str] = []
-    for _ in range(count - 1):
-        cut = next((i for i, c in enumerate(s) if c in ws), len(s))
-        out.append(s[:cut])
-        s = s[cut:].lstrip(ws)
-    out.append(s)
-    return out
-
-
-def bash_read_delim(line: str, count: int, delim: str) -> list[str]:
-    """``IFS=<delim> read -r a b c <<<"$line"`` for ONE non-whitespace delimiter: every delimiter
-    separates (empty fields kept), the last variable takes the rest, and a rest that is one field
-    and a trailing delimiter loses the delimiter, as bash's read does."""
-    parts = line.split("\n", 1)[0].split(delim, count - 1)
-    parts += [""] * (count - len(parts))
-    rest = parts[-1]
-    if rest.endswith(delim) and delim not in rest[:-1]:
-        parts[-1] = rest[:-1]
-    return parts
-
-
-def tsv(fields: Sequence[str]) -> str:
-    """``@tsv`` over strings."""
-    return "\t".join(
-        f.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
-        for f in fields
-    )
+def todate(epoch: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))

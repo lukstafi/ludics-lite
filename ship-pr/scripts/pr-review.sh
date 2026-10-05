@@ -1017,10 +1017,11 @@ snapshot_has() { # <kind> <pr>
   [ "$(cat "$SNAP.$1.pr" 2>/dev/null)" = "$2" ]
 }
 
-# The feeds poll read this round are written by the Python (`Snapshot.put_feeds` in
-# lib/ludics/prreview/reads.py, ludics-lite#403), in this format: the comments and the reviews as
-# JSON arrays, then the `.feeds.pr` marker LAST, so a write that fails partway leaves no snapshot
-# at all rather than one missing a feed.
+# The feeds poll read this round were written here, in this format: the comments and the reviews
+# as JSON arrays, then the `.feeds.pr` marker LAST, so a write that fails partway leaves no
+# snapshot at all rather than one missing a feed. The Python watch keeps its round snapshot in
+# memory (lib/ludics/prreview/feeds.py), so these files serve only the shell round, which no
+# subcommand runs any more (ludics-lite#403).
 
 # The head read watch_round made AFTER those feeds, with the fields pr_head_read sets. head_err is
 # a whole error line and may contain anything, so each field gets its own file rather than sharing
@@ -1213,7 +1214,7 @@ SUMMARY_ROW_INSTANT_DEF='def instant: sub("Z$"; "") | (if test("\\.") then . els
 
 # The clock every age is read from: the epoch second. With SHIP_PR_TEST_CLOCK naming a file, that
 # file IS the clock (one epoch second in it), which the Python watch's sleeps advance instead of
-# waiting (lib/ludics/prreview/watch_clock.py), so a fixture suite drives a watch's window, its
+# waiting (lib/ludics/prreview/clock.py), so a fixture suite drives a watch's window, its
 # graces and the ages it reads through the environment (ludics-lite#403). Unset, which is every
 # real run, it is the system clock.
 clock_now() {
@@ -2372,8 +2373,8 @@ count_token() { # <review_rounds result>
   esac
 }
 
-# Served by Python since ludics-lite#403 (lib/ludics/prreview/rounds.py). review_rounds,
-# rounds_line and count_token above stay for `watch`, which is still shell.
+# Served by Python since ludics-lite#403 (lib/ludics/prreview/rounds.py, counting through
+# state.py's review_rounds, which `watch` and `status` count with too).
 cmd_rounds() { py_forward call rounds "$@"; }
 
 # --- open review threads under an approval (ludics-lite#289) ----------------------------------
@@ -2580,7 +2581,7 @@ cmd_status() { py_forward call status "$@"; }
 # this loop — is served by Python since ludics-lite#403: lib/ludics/prreview/watch.py (the loop,
 # the final poll before every verdict, the grace extensions, the once-per-head re-request of a
 # failed run), with the round's poll, state, open-thread check, round count and base-drift read
-# beside it in watch_poll.py, watch_state.py and watch_drift.py. The shell implementation and its
+# beside it in poll.py, state.py and drift.py. The shell implementation and its
 # comments, which carry the incident behind every rule there, are this file as of the port's
 # parent commit (`git show 14f2ca7:ship-pr/scripts/pr-review.sh`). Exit 0 something to act on,
 # 1 a quiet window, 3 not observed; the last stdout line is a watermark with poll's semantics. Run
@@ -3770,8 +3771,8 @@ warn_base_drift() {
 # and the gate itself (gate.py). Those modules carry the rationale and the review history the
 # shell's comments here carried; `git show e86cba3:ship-pr/scripts/pr-review.sh` has the shell as
 # it was. main() forwards it before reaching the case below; this stub is for a caller that sources
-# the script, as the fixture suites do. gate_checks and warn_base_drift stay in this file while
-# `base` (tip_pr_head_verdict) and `watch` (watch_drift_note) still read them.
+# the script, as the fixture suites do. `base` and `watch` read the same gate.py and drift.py, so
+# gate_checks and warn_base_drift here no longer serve any subcommand.
 cmd_merge() { py_forward call merge "$@"; }
 
 # A branch name is data, not URL structure: `release#1` and `release&one` are valid refs, but
@@ -4457,9 +4458,9 @@ head_within_paths_ignore() {
 }
 
 # `base` is served by lib/ludics/prreview/base.py (ludics-lite#403): the fold, the RED report, the
-# --wait loop, the pushless named sources and the interim. The paths-ignore helpers above stay
-# here for checks/merge's head recognition (head_within_paths_ignore); base.py carries its own port
-# of them, marked SHARED-CANDIDATE, and runs this file's gate_checks for a merged PR head's signal.
+# --wait loop, the pushless named sources and the interim. It reads the workflow files and the
+# paths-ignore walk through workflows.py and judges a merged PR head's signal through gate.py, the
+# same ports `checks` and `merge` use; the shell helpers above no longer serve any subcommand.
 cmd_base() { py_forward call base "$@"; }
 
 # --- the Python half (ludics-lite#403) -------------------------------------------------------------

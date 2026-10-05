@@ -52,7 +52,6 @@ def short_hostname() -> str:
     return socket.gethostname().split(".")[0]
 
 
-# SHARED-CANDIDATE: detect_local_box
 def detect_local_box(hostname_map: str, host: str) -> str:
     """The first ``<glob>=<box>`` pair whose glob matches the lowercased short host name."""
     lowered = host.lower()
@@ -65,13 +64,11 @@ def detect_local_box(hostname_map: str, host: str) -> str:
     return ""
 
 
-# SHARED-CANDIDATE: roster_words
 def roster_words(roster: str) -> list[str]:
     """A roster as a word SET, sorted: order, spacing, lines and repeats ignored (ludics-lite#329)."""
     return sorted(set(roster.split()))
 
 
-# SHARED-CANDIDATE: local_path
 def local_path(value: str, env: Mapping[str, str]) -> str:
     """A configured path expanded on THIS box: a leading literal ``$HOME/`` becomes HOME."""
     if value.startswith("$HOME/"):
@@ -149,13 +146,11 @@ class SpecError(Exception):
     """A malformed slot or token spec: the message is the refusal's reason."""
 
 
-# SHARED-CANDIDATE: in_roster
 def in_roster(cfg: Config, name: str) -> bool:
     """Is ``name`` an exact FLEET_BOXES entry?"""
     return name in cfg.boxes.split()
 
 
-# SHARED-CANDIDATE: box_spec_count
 def box_spec_count(cfg: Config, variable: str, spec: str, box: str, default: int) -> int:
     """The shared reader of the two ``<box>=<n>`` specs: the box's count, or ``default``."""
     found = default
@@ -170,12 +165,10 @@ def box_spec_count(cfg: Config, variable: str, spec: str, box: str, default: int
     return found
 
 
-# SHARED-CANDIDATE: box_correctness_slots
 def box_correctness_slots(cfg: Config, box: str) -> int:
     return box_spec_count(cfg, "FLEET_BOX_CORRECTNESS_SLOTS", cfg.slots, box, 1)
 
 
-# SHARED-CANDIDATE: box_gpu_tokens
 def box_gpu_tokens(cfg: Config, box: str) -> int:
     """How many of the box's slots may hold its GPU at once; one per slot where the spec is silent."""
     slots = box_correctness_slots(cfg, box)

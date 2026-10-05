@@ -139,7 +139,6 @@ def _anchor(cfg: Config, script: str, args: list[str], unreachable_line: str) ->
     return done.rc
 
 
-# SHARED-CANDIDATE: anchor_gate
 def anchor_gate(cfg: Config, verb: str, label: str, force: bool) -> int:
     """0 proceed, 1 refused (its line printed), 4 the anchor did not answer."""
     check_identity(cfg)

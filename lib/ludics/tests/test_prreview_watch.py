@@ -22,7 +22,7 @@ from ludics import proc
 from ludics.prreview.core import GhSession, Json, load_config
 from ludics.prreview.watch import _cut_f12, item_about_head, tmp_sweep_stale  # pyright: ignore[reportPrivateUsage]
 from ludics.prreview.clock import FileClock, age_of, fmt_age, freshest_age
-from ludics.prreview.watch_jq import (
+from ludics.prreview.jqsem import (
     JqError,
     cmp,
     fromdateiso8601,
@@ -32,8 +32,8 @@ from ludics.prreview.watch_jq import (
     onig,
     sort_by,
 )
-from ludics.prreview.watch_feeds import Ctx
-from ludics.prreview.watch_poll import (
+from ludics.prreview.feeds import Ctx
+from ludics.prreview.poll import (
     fold_codex_about,
     fold_inline,
     item_line,

@@ -22,7 +22,6 @@ from ludics.fleetworker.execution import (
     run_verdict,
     window_payload,
 )
-from ludics.fleetworker.__main__ import restore_caller_pythonpath
 from ludics.fleetworker.gate import integration_rows
 
 SHA = "a" * 40
@@ -149,20 +148,20 @@ class WindowPayload(unittest.TestCase):
 
 
 class CallerPythonpath(unittest.TestCase):
-    """The forwarder's note puts the caller's PYTHONPATH back for every child of the verb."""
+    """scripts/py's note puts the caller's PYTHONPATH back for every child of an entry point."""
 
     def test_the_note_restores_set_empty_and_unset(self) -> None:
-        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_FW_PYTHONPATH": "=/mine"}
-        restore_caller_pythonpath(env)
+        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_CALLER_PYTHONPATH": "=/mine"}
+        cli.restore_caller_environment(env)
         self.assertEqual(env, {"PYTHONPATH": "/mine"})
-        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_FW_PYTHONPATH": "="}
-        restore_caller_pythonpath(env)
+        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_CALLER_PYTHONPATH": "="}
+        cli.restore_caller_environment(env)
         self.assertEqual(env, {"PYTHONPATH": ""})
-        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_FW_PYTHONPATH": ""}
-        restore_caller_pythonpath(env)
+        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_CALLER_PYTHONPATH": ""}
+        cli.restore_caller_environment(env)
         self.assertEqual(env, {})
         env = {"PYTHONPATH": "/checkout/lib"}
-        restore_caller_pythonpath(env)
+        cli.restore_caller_environment(env)
         self.assertEqual(env, {"PYTHONPATH": "/checkout/lib"})
 
 

@@ -76,7 +76,6 @@ def registry_source() -> str:
     die(f"execution: missing helper {REGISTRY}")
 
 
-# SHARED-CANDIDATE: execution_listing
 def listing(cfg: Config) -> Done:
     """The anchor's whole registry as JSON (captured). ``list`` takes no lease and mutates nothing,
     so a worker with no coordinator identity may read it."""

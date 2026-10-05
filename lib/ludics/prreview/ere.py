@@ -27,3 +27,19 @@ def valid(pattern: str) -> bool:
     """``ere_valid``: does grep compile it -- anything but grep's status 2 for an empty input."""
     done = proc.run_tool("grep", ["-Eq", "--", pattern], stdin=b"")
     return done.rc != 2
+
+
+class Advisory:
+    """``is_advisory``: a name the advisory list says carries no build verdict, asked of grep
+    (``matches``). The one implementation for ``checks``, ``merge`` and ``base``. One process's
+    answers are kept: a wait loop asks the same names every round, and grep's answer for a pattern,
+    a name and an environment is fixed."""
+
+    def __init__(self, pattern: str) -> None:
+        self.pattern = pattern
+        self._seen: dict[str, bool] = {}
+
+    def __call__(self, name: str) -> bool:
+        if name not in self._seen:
+            self._seen[name] = matches(self.pattern, name)
+        return self._seen[name]

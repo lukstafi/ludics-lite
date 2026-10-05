@@ -132,7 +132,6 @@ class Merge:
     def drift(self) -> None:
         warn_base_drift(self.session, self.repo, self.num, self.config.stale_base)
 
-    # SHARED-CANDIDATE: refuse_merge_queue
     def refuse_merge_queue(self) -> None:
         """``refuse_merge_queue``: a close-out merge refuses a base with a merge queue (1), and one
         whose queue could not be read (3) -- the queue is GraphQL-only, and unread is not "no queue"."""
@@ -178,7 +177,6 @@ class Merge:
                 "with the record on the PR.",
             )
 
-    # SHARED-CANDIDATE: await_mergeable
     def await_mergeable(self, sleep: Callable[[float], None]) -> str:
         """``await_mergeable``: GitHub's recomputed answer, true or false; ``unknown`` when the read
         failed, ``null`` when it was still computing after eight reads five seconds apart."""

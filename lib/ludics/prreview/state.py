@@ -1,24 +1,24 @@
-"""The reviewer state `status` reports, ported from pr-review.sh's ``status_state`` and the
-functions around it (ludics-lite#403).
+"""The reviewer's state as `status` and every `watch` exit report it.
 
-  status_state      one line, ``<token>|<seconds>|<mergeability>|<detail>``: approved, reviewing,
-                    stalled, failed, expected, idle, nudged (a watch's pending request), unknown
-  status_line       that line rendered for a reader
-  approval_gate     an ``approved`` line checked for open review threads (#289): unresolved, or
-                    unknown when the thread read did not answer
-  threads_walk ...  the reviewThreads connection, paged to the end or refused
+Ported from pr-review.sh's ``status_state`` (the state machine over the reactions, the reviews,
+the comments and the head), ``status_line`` and ``conflict_note`` (its rendering), the open-thread
+check an approval passes through (``threads_walk``, ``unresolved_threads``, ``threads_named``,
+``approval_gate``, ``gated_state``) and ``review_rounds``/``count_token``. The shell's comments on
+each carry the incidents behind every comparison; the order of the reads and of the arms below is
+theirs, and it is load-bearing (the head is read AFTER the feeds; the comments BEFORE the reviews).
 
-The shell comments above each of these carry the incident behind every comparison; the order of
-the reads and of the arms below is theirs, and so is every message. Each feed is read through
-``jqsem``, so a shape the shell's jq refused is refused here at the same arm (``... did not
-parse``). The state line is a string because `watch` (still shell) and the suites read it as one.
+A state line was ``token|age|mergeability|detail``. Here it is ``State``; ``detail`` keeps the
+shell's string, with the leading ``|`` fields the ``failed``, ``nudged`` and ``unresolved`` tokens
+carry.
 """
 
-from collections.abc import Callable
+import os
 from dataclasses import dataclass
-from typing import assert_never
+from typing import Literal, assert_never
 
-from ludics.prreview import jqsem as jq
+from ludics.prreview import knobs
+from ludics.prreview.core import GhFailed, GhOk, GhUnanswered, Json
+from ludics.prreview.clock import age_of, age_text, fmt_age, freshest_age, newest
 from ludics.prreview.threads import (
     OpenThreads,
     WalkRejected,
@@ -27,287 +27,183 @@ from ludics.prreview.threads import (
     threads_named,
     unresolved_threads,
 )
-from ludics.prreview.core import (
-    GhFailed,
-    GhSession,
-    GhUnanswered,
-    Json,
-    ListOk,
-    ListResult,
-    ListUnparsed,
-    api_list,
-)
-from ludics.prreview.reads import (
-    CODE_REVIEW_ROW,
-    FRACTION_Z,
-    INIT_FAILURE,
-    INIT_FAILURE_ENV_ONLY,
-    INIT_FAILURE_REF,
-    NUDGE_BODY,
-    PLACEHOLDER,
-    PLACEHOLDER_TAG,
-    REQUEST,
-    REVIEWED_COMMIT,
-    RUNNING_ROW,
-    SUMMARY_COMPLETED_ROW,
-    SUMMARY_FAILED_ROW,
-    SUMMARY_ROW_STAMP,
-    VERDICT,
+from ludics.prreview.feeds import (
+    Ctx,
     Head,
-    age_of,
-    by_reviewer,
-    commit_date,
-    fmt_age,
-    freshest_age,
-    instant,
-    is_digits,
-    newest,
-    pr_head_read,
+    NotSubstantive,
+    ReadFailed,
+    feed,
+    state_comments,
+    state_head_read,
+    state_reviews,
     substantive_reviews,
 )
+from ludics.prreview.jqsem import (
+    JqError,
+    alt,
+    as_list,
+    body_of,
+    capture_all,
+    capture_first,
+    cmp,
+    fromdateiso8601,
+    ge,
+    gt,
+    idx,
+    jmax,
+    jstr,
+    login_is,
+    lt,
+    max_by,
+    onig,
+    sort_by,
+    startswith,
+    string,
+    sub_once,
+    unique,
+)
+from ludics.prreview.poll import REVIEWED_COMMIT_RE
 
-
-def _before(s: str) -> str:
-    """``${s%%|*}``."""
-    return s.split("|", 1)[0]
-
-
-def _after(s: str) -> str:
-    """``${s#*|}``: the whole string when it holds no ``|``."""
-    return s.split("|", 1)[1] if "|" in s else s
-
-
-# SHARED-CANDIDATE: state_tok
-def state_tok(line: str) -> str:
-    return _before(line)
-
-
-# SHARED-CANDIDATE: state_age
-def state_age(line: str) -> str:
-    return _before(_after(line))
-
-
-# SHARED-CANDIDATE: state_merge
-def state_merge(line: str) -> str:
-    return _before(_after(_after(line)))
-
-
-# SHARED-CANDIDATE: state_detail
-def state_detail(line: str) -> str:
-    return _after(_after(_after(line)))
-
-
-def _after_nudge(event: str, nudge_at: str) -> bool:
-    """``review_after_nudge``."""
-    return not nudge_at or event > nudge_at
+type Token = Literal[
+    "approved", "unresolved", "reviewing", "stalled", "failed", "expected", "idle", "nudged",
+    "unknown",
+]
 
 
 @dataclass(frozen=True)
-class StateConfig:
-    reviewer: str
-    stall: int
+class State:
+    tok: Token
+    age: int | None
+    merge: str
+    detail: str
+
+    def line(self) -> str:
+        return f"{self.tok}|{age_text(self.age)}|{self.merge}|{self.detail}"
 
 
-class _Reads:
-    """status_state's reads of one PR, each made at most once and in the shell's order."""
-
-    def __init__(self, session: GhSession, repo: str, pr: str) -> None:
-        self.session = session
-        self.repo = repo
-        self.pr = pr
-
-    def comments(self) -> ListResult:
-        return api_list(self.session, f"issues/{self.pr}/comments?per_page=100", self.repo)
-
-    def reviews(self) -> ListResult:
-        return api_list(self.session, f"pulls/{self.pr}/reviews?per_page=100", self.repo)
-
-    def head(self) -> Head:
-        return pr_head_read(self.session, self.repo, self.pr)
-
-    def commit_date(self, sha: str) -> str:
-        return commit_date(self.session, self.repo, sha)
+def unknown(merge: str, detail: str) -> State:
+    return State("unknown", None, merge, detail)
 
 
-def _items(result: ListResult) -> list[Json] | None:
+# --- the patterns (pr-review.sh's "reviewer state" constants) ----------------------------------------
+
+INIT_FAILURE_GIT_RE = (
+    r"\A[ \t]*Codex Review:[ \t]*Something went wrong\.[ \t]*Try again later by commenting"
+    r"[^\n]{0,4}@codex review"
+)
+INIT_FAILURE_ENV_RE = (
+    r"\A[ \t]*To use Codex here,[ \t]*\[?create an environment for this repo"
+    r"(?:\]\([^)[:space:]]*\))?\.?[[:space:]]*\z"
+)
+_INIT_FAILURE = onig(f"(?:{INIT_FAILURE_GIT_RE})|(?:{INIT_FAILURE_ENV_RE})")
+_INIT_FAILURE_ENV = onig(INIT_FAILURE_ENV_RE)
+_INIT_FAILURE_REF = onig(r"Provided git ref[^0-9a-f]*(?<s>[0-9a-f]{7,40})")
+_SUMMARY_COMPLETED_ROW = onig(
+    r'^\|[^|]*Code Review[^|]*\| *\u2705 \*\*Completed\*\* <relative-time datetime="(?<at>[^"]+)">'
+    r"[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|"
+)
+_SUMMARY_FAILED_ROW = onig(
+    r'^\|[^|]*Code Review[^|]*\| *\u26a0\ufe0f \*\*Failed\*\* <relative-time datetime="(?<at>[^"]+)">'
+    r"[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|"
+)
+_SUMMARY_ROW_STAMP = onig(r'datetime="(?<at>[^"]+)"[^|]*\| *`(?<sha>[0-9a-f]{7,40})` *\|')
+_CODE_REVIEW_ROW = onig(r"^\|[^|]*Code Review[^|]*\|")
+_RUNNING_ROW = onig(r"^\|[^|]*Code Review[^|]*\|[^|]*Running")
+_NO_FINDINGS = onig("[Dd]idn.t find any major issues")
+_NUDGE = onig(
+    "^@codex review[ \t\r\n]*(_\U0001f916 Addressed by an automated coding agent_)?[ \t\r\n]*$"
+)
+_REQUEST = onig("@codex[[:space:]]+review", 2)  # re.IGNORECASE
+_FRACTION_Z = onig(r"\.[0-9]+Z$")
+_TRAILING_Z = onig("Z$")
+_SUMMARY_TAG = "codex-pull-request-review-summary"
+
+
+def instant(at: Json) -> str:
+    """``SUMMARY_ROW_INSTANT_DEF``: a row's datetime padded to nine fractional digits, so the
+    string order is the time order."""
+    s = sub_once(at, _TRAILING_Z, "")
+    s = s if "." in s else s + "."
+    return (s + "000000000")[:29]
+
+
+def _commit_read(ctx: Ctx, sha: str) -> str:
+    """The head commit's committer date, or "" when the read failed."""
+    result = ctx.session.retry(
+        "read", ["api", f"repos/{ctx.repo}/commits/{sha}", "--jq", ".commit.committer.date"]
+    )
     match result:
-        case ListOk(items=items):
-            return items
-        case GhFailed() | GhUnanswered() | ListUnparsed():
-            return None
+        case GhOk(stdout=out):
+            return out
+        case GhFailed() | GhUnanswered():
+            return ""
         case _:
             assert_never(result)
 
 
-def _summaries(comments: list[Json], reviewer: str) -> list[Json]:
-    """``[.[] | reviewer | select((.body // "") | contains(<the summary tag>))]``."""
+def _after_nudge(event: str, nudge: str) -> bool:
+    """``review_after_nudge``: no request pending, or the event is newer than it."""
+    return not nudge or event > nudge
+
+
+def _is_summary(item: Json) -> bool:
+    return _SUMMARY_TAG in body_of(item)
+
+
+def _stamp_rows(body: str) -> list[dict[str, str | None] | None]:
     return [
-        c
-        for c in comments
-        if by_reviewer(c, reviewer) and jq.contains(jq.alt(jq.idx(c, "body"), ""), PLACEHOLDER_TAG)
+        capture_first(row, _SUMMARY_ROW_STAMP)
+        for row in body.split("\n")
+        if _CODE_REVIEW_ROW.search(row)
     ]
 
 
-def _newest_summary(summaries: list[Json]) -> Json:
-    return jq.max_by(summaries, lambda c: jq.alt(jq.idx(c, "updated_at"), jq.idx(c, "created_at")))
+def _newest_summary(comments: list[Json], reviewer: str) -> Json:
+    summaries = [c for c in comments if login_is(c, reviewer) and _is_summary(c)]
+    return max_by(summaries, lambda c: alt(idx(c, "updated_at"), idx(c, "created_at")))
 
 
-def _lines(body: Json) -> list[str]:
-    return jq.split(jq.alt(body, ""), "\n")
+def _short(sha: str) -> str:
+    return sha[:7]
 
 
-def _strip_fraction(at: Json) -> str:
-    return jq.sub(at, FRACTION_Z, "Z")
-
-
-def _evidence(comments: list[Json], reviews: list[Json], reviewer: str, head: str) -> str:
-    """The 👍 path's current-head evidence: ``<kind>|<at>|<unread Running rows>|<row sha>``."""
-    running: list[dict[str, Json] | None] = []
-    for c in _summaries(comments, reviewer):
-        for row in _lines(jq.idx(c, "body")):
-            if jq.test(row, RUNNING_ROW):
-                running.append(jq.capture(row, SUMMARY_ROW_STAMP))
-    newest_summary = _newest_summary(_summaries(comments, reviewer))
-    rows: list[dict[str, Json] | None] = []
-    if newest_summary is not None:
-        rows = [
-            jq.capture(row, SUMMARY_ROW_STAMP)
-            for row in _lines(jq.idx(newest_summary, "body"))
-            if jq.test(row, CODE_REVIEW_ROW)
-        ]
-    row_sha = ""
-    if rows and all(r is not None for r in rows):
-        known = [r for r in rows if r is not None]
-        best = jq.max_by(known, lambda r: instant(r.get("at")))
-        row_sha = jq.add_str("", None if best is None else best.get("sha"))
-    entries: list[dict[str, Json]] = []
-    for r in running:
-        if r is not None:
-            entries.append({**r, "kind": "running"})
-    for review in reviews:
-        if by_reviewer(review, reviewer) and not jq.eq(jq.idx(review, "submitted_at"), None):
-            entries.append(
-                {
-                    "sha": jq.alt(jq.idx(review, "commit_id"), ""),
-                    "at": jq.idx(review, "submitted_at"),
-                    "kind": "findings",
-                }
-            )
-    for c in comments:
-        if not by_reviewer(c, reviewer):
-            continue
-        stamps = jq.capture_all(jq.alt(jq.idx(c, "body"), ""), REVIEWED_COMMIT)
-        entries.append(
-            {
-                "sha": jq.alt(stamps[-1].get("s") if stamps else None, ""),
-                "at": jq.alt(jq.idx(c, "updated_at"), jq.idx(c, "created_at")),
-                "kind": "verdict" if jq.test(jq.alt(jq.idx(c, "body"), ""), VERDICT) else "findings",
-            }
-        )
-    current: list[dict[str, Json]] = []
-    for e in entries:
-        sha = e.get("sha")
-        if jq.eq(sha, "") or head == "":
-            continue
-        if not jq.startswith(head, sha):
-            continue
-        current.append({**e, "at": _strip_fraction(e.get("at"))})
-    best_entry = jq.max_by(current, lambda e: e.get("at"))
-    out = "|" if best_entry is None else f"{jq.text(best_entry.get('kind'))}|{jq.text(best_entry.get('at'))}"
-    unread = sum(1 for r in running if r is None)
-    return jq.add_str(f"{out}|{unread}|", row_sha)
-
-
-def _summary_verdict(comments: list[Json], reviewer: str) -> str:
-    """The newest summary's newest Code Review row as a Completed or Failed verdict:
-    ``completed|<at>|<sha>``, ``failed|<at>|<sha>``, or ``||``."""
-    newest_summary = _newest_summary(_summaries(comments, reviewer))
-    if newest_summary is None:
-        return "||"
-    rows: list[dict[str, Json] | None] = []
-    for row in _lines(jq.idx(newest_summary, "body")):
-        if not jq.test(row, CODE_REVIEW_ROW):
-            continue
-        stamp = jq.capture(row, SUMMARY_ROW_STAMP)
-        rows.append(None if stamp is None else {"at": stamp.get("at"), "row": row})
-    if not rows or any(r is None for r in rows):
-        return "||"
-    known = [r for r in rows if r is not None]
-    best = jq.max_by(known, lambda r: instant(r.get("at")))
-    assert best is not None
-    done = jq.capture(best.get("row"), SUMMARY_COMPLETED_ROW)
-    failed = jq.capture(best.get("row"), SUMMARY_FAILED_ROW)
-    if done is not None:
-        return f"completed|{_strip_fraction(done.get('at'))}|{jq.text(done.get('sha'))}"
-    if failed is not None:
-        return f"failed|{_strip_fraction(failed.get('at'))}|{jq.text(failed.get('sha'))}"
-    return "||"
-
-
-def _last_word_of_reviews(reviews: list[Json], reviewer: str) -> str:
-    """``<submitted_at>|<commit_id>`` of the reviewer's newest submitted review, or ``|``."""
-    spoken = [
-        r
+def _review_of_head_at(reviews: list[Json], reviewer: str, sha: str) -> str:
+    """The newest submitted review of exactly this head, or ""."""
+    ats = [
+        idx(r, "submitted_at")
         for r in reviews
-        if by_reviewer(r, reviewer) and not jq.eq(jq.idx(r, "submitted_at"), None)
+        if login_is(r, reviewer)
+        and idx(r, "submitted_at") is not None
+        and alt(idx(r, "commit_id"), "") == sha
     ]
-    ordered = jq.sort_by(spoken, lambda r: jq.idx(r, "submitted_at"))
-    if not ordered:
-        return "|"
-    last = ordered[-1]
-    return f"{jq.text(jq.idx(last, 'submitted_at'))}|{jq.text(jq.alt(jq.idx(last, 'commit_id'), ''))}"
+    return jstr(alt(jmax(ats), ""))
 
 
-def _reviews_of_head(reviews: list[Json], reviewer: str, sha: str) -> str:
-    """The newest submission time of a reviewer review of exactly this head, or empty."""
-    times = [
-        jq.idx(r, "submitted_at")
-        for r in reviews
-        if by_reviewer(r, reviewer)
-        and not jq.eq(jq.idx(r, "submitted_at"), None)
-        and jq.eq(jq.alt(jq.idx(r, "commit_id"), ""), sha)
-    ]
-    return jq.captured([jq.text(jq.alt(jq.jmax(times), ""))])
-
-
-# SHARED-CANDIDATE: status_state
-def status_state(
-    session: GhSession,
-    repo: str,
-    pr: str,
-    stall: int,
-    nudge_after: int | None = None,
-    reads: Callable[[GhSession, str, str], _Reads] = _Reads,
-) -> str:
-    """``status_state``: one state line, always (a read that failed is the ``unknown`` token).
-    ``nudge_after`` is a watch's issue-comment watermark (``watch_nudge_after``): with it, a
-    pending ``@codex review`` above it is identified and supersedes older evidence."""
-    rev = session.config.reviewer
-    io = reads(session, repo, pr)
-    mstate = "-"
-    reactions = _items(api_list(session, f"issues/{pr}/reactions?per_page=100", repo))
-    if reactions is None:
-        return f"unknown|-|-|the reactions API did not answer ({session.err_line()})"
+def status_state(ctx: Ctx, pr: str) -> State:
+    """``status_state <pr>``: one ``State``, never an exception for anything the API did -- an
+    unanswered read is the ``unknown`` token, which is NOT a state of the PR."""
+    session = ctx.session
+    rev = ctx.reviewer
+    grace_stall = ctx.stall
     try:
-        mine = [r for r in reactions if by_reviewer(r, rev)]
-        any_plus = any(jq.eq(jq.idx(r, "content"), "+1") for r in mine)
-        eyes = jq.jmax([jq.idx(r, "created_at") for r in mine if jq.eq(jq.idx(r, "content"), "eyes")])
-        plus = jq.jmax([jq.idx(r, "created_at") for r in mine if jq.eq(jq.idx(r, "content"), "+1")])
-        line = jq.add_str(jq.add_str(jq.text(any_plus) + "|", jq.alt(eyes, "")) + "|", jq.alt(plus, ""))
-    except jq.JqError:
-        return "unknown|-|-|the reactions feed did not parse"
-    line = line.rstrip("\n")
-    plus_flag = _before(line)
-    line = _after(line)
-    eyes_at = _before(line)
-    plus_at = _after(line)
+        reactions = feed(ctx, f"issues/{pr}/reactions?per_page=100")
+    except ReadFailed:
+        return unknown("-", f"the reactions API did not answer ({session.err_line()})")
+    try:
+        mine = [r for r in reactions if login_is(r, rev)]
+        plus = any(idx(r, "content") == "+1" for r in mine)
+        # `"|" + (max // "")`: a newest stamp that is not a string fails the program.
+        eyes_at = string(alt(jmax([idx(r, "created_at") for r in mine if idx(r, "content") == "eyes"]), ""))
+        plus_at = string(alt(jmax([idx(r, "created_at") for r in mine if idx(r, "content") == "+1"]), ""))
+    except JqError:
+        return unknown("-", "the reactions feed did not parse")
 
+    mstate = "-"
     comments: list[Json] = []
     comments_loaded = False
     reviews: list[Json] = []
     reviews_loaded = False
-    head = Head("", "-", "", "")
-    head_loaded = False
+    head: Head | None = None
     head_at = ""
     head_at_read = False
     nudge_at = ""
@@ -315,186 +211,138 @@ def status_state(
     stale_plus_at = ""
     stale_note = ""
 
-    if nudge_after is not None:
-        got = _items(io.comments())
-        if got is None:
-            return f"unknown|-|-|the comments API did not answer ({session.err_line()})"
-        comments = got
+    if ctx.nudge_after is not None:
+        try:
+            comments = state_comments(ctx, pr)
+        except ReadFailed:
+            return unknown("-", f"the comments API did not answer ({session.err_line()})")
         comments_loaded = True
         try:
-            pending = [
-                {"id": jq.idx(c, "id"), "at": jq.idx(c, "created_at")}
-                for c in comments
-                if jq.gt(jq.idx(c, "id"), nudge_after)
-                and jq.test(jq.alt(jq.idx(c, "body"), ""), NUDGE_BODY)
-            ]
-            last = jq.max_by(pending, lambda p: p["at"])
-            nudge_line = jq.captured(
-                ["|" if last is None else f"{jq.text(last['id'])}|{jq.text(last['at'])}"]
-            )
-        except jq.JqError:
-            return "unknown|-|-|the pending-request comments feed did not parse"
-        nudge_id = _before(nudge_line)
-        nudge_at = _after(nudge_line)
-        if not is_digits(age_of(nudge_at)):
+            requests: list[tuple[Json, Json]] = []
+            for c in comments:
+                if gt(idx(c, "id"), ctx.nudge_after) and _NUDGE.search(body_of(c)):
+                    requests.append((idx(c, "id"), idx(c, "created_at")))
+            latest = max_by(requests, lambda r: r[1])
+        except JqError:
+            return unknown("-", "the pending-request comments feed did not parse")
+        if latest is not None:
+            nudge_id, nudge_at = jstr(latest[0]), jstr(latest[1])
+        if age_of(nudge_at, ctx.clock.time()) is None:
             nudge_at = ""
 
-    # The 👍 path (#146, #418): a reaction carries no commit, so it is checked against the
-    # current head's Running row and against the head's arrival.
-    if plus_flag == "true" and _after_nudge(plus_at, nudge_at):
+    if plus and _after_nudge(plus_at, nudge_at):
         if not comments_loaded:
-            got = _items(io.comments())
-            if got is not None:
-                comments = got
+            try:
+                comments = state_comments(ctx, pr)
                 comments_loaded = True
-            else:
+            except ReadFailed:
                 comments = []
-        got = _items(io.reviews())
-        if got is not None:
-            reviews = got
-            reviews_loaded = True
-        else:
-            reviews = []
-        substantive = substantive_reviews(session, repo, pr, reviews)
-        if substantive is None:
-            return f"unknown|-|{mstate}|the review comments API did not establish substantive reviews"
-        reviews = substantive
-        head = io.head()
-        mstate = head.mstate
-        head_loaded = True
         try:
-            evidence = _evidence(comments, reviews, rev, head.sha)
-        except jq.JqError:
-            return f"unknown|-|{mstate}|the current-head review evidence did not parse"
-        evidence_kind, evidence_at, running_unread, row_sha = jq.bash_read_delim(evidence, 4, "|")
-        if running_unread != "0":
-            return (
-                f"unknown|-|{mstate}|a {rev} Code Review row matched the Running test but not the"
-                " SUMMARY_ROW_STAMP_RE, so the running round could not be read"
+            reviews = state_reviews(ctx, pr)
+            reviews_loaded = True
+        except ReadFailed:
+            reviews = []
+        try:
+            reviews = substantive_reviews(ctx, pr, reviews)
+        except NotSubstantive:
+            return unknown(mstate, "the review comments API did not establish substantive reviews")
+        head = state_head_read(ctx, pr)
+        mstate = head.mstate
+        try:
+            kind, ev_at, running_unread, row_sha = _evidence(comments, reviews, rev, head.sha)
+        except JqError:
+            return unknown(mstate, "the current-head review evidence did not parse")
+        if running_unread != 0:
+            return unknown(
+                mstate,
+                f"a {rev} Code Review row matched the Running test but not the"
+                " SUMMARY_ROW_STAMP_RE, so the running round could not be read",
             )
-        if evidence_at and evidence_at > plus_at:
-            if evidence_kind == "running":
-                age = age_of(evidence_at)
-                if is_digits(age) and int(age) >= stall:
-                    return (
-                        f"stalled|{age}|{mstate}|{rev} Code Review Running for head {head.sha[:7]}"
-                        f" at {evidence_at}"
-                    )
-                return (
-                    f"reviewing|{age}|{mstate}|{rev} Code Review Running for head {head.sha[:7]}"
-                    f" at {evidence_at}"
-                )
-            if evidence_kind == "findings":
-                return (
-                    f"idle|{age_of(evidence_at)}|{mstate}|{rev} posted findings for head"
-                    f" {head.sha[:7]} at {evidence_at}"
+        if ev_at and ev_at > plus_at:
+            if kind == "running":
+                age = age_of(ev_at, ctx.clock.time())
+                detail = f"{rev} Code Review Running for head {_short(head.sha)} at {ev_at}"
+                if age is not None and age >= grace_stall:
+                    return State("stalled", age, mstate, detail)
+                return State("reviewing", age, mstate, detail)
+            if kind == "findings":
+                return State(
+                    "idle", age_of(ev_at, ctx.clock.time()), mstate,
+                    f"{rev} posted findings for head {_short(head.sha)} at {ev_at}",
                 )
         if head.sha:
             if row_sha:
                 if not head.sha.startswith(row_sha):
-                    stale_note = f"the 👍 at {plus_at} is for {row_sha[:7]}, per {rev}'s summary"
+                    stale_note = f"the 👍 at {plus_at} is for {_short(row_sha)}, per {rev}'s summary"
             else:
-                head_at = io.commit_date(head.sha)
+                head_at = _commit_read(ctx, head.sha)
                 head_at_read = True
-                if age_of(head_at) != "-" and plus_at < head_at:
+                if age_of(head_at, ctx.clock.time()) is not None and plus_at < head_at:
                     stale_note = (
-                        f"the 👍 at {plus_at} predates head {head.sha[:7]}'s commit date {head_at}"
+                        f"the 👍 at {plus_at} predates head {_short(head.sha)}'s commit date {head_at}"
                     )
         if not stale_note:
-            return f"approved|-|{mstate}|👍 from {rev}"
+            return State("approved", None, mstate, f"👍 from {rev}")
         stale_plus_at = plus_at
 
-    # The comments BEFORE the reviews (#439's read order).
     if not comments_loaded:
-        got = _items(io.comments())
-        if got is None:
-            return f"unknown|-|{mstate}|the comments API did not answer ({session.err_line()})"
-        comments = got
+        try:
+            comments = state_comments(ctx, pr)
+        except ReadFailed:
+            return unknown(mstate, f"the comments API did not answer ({session.err_line()})")
         comments_loaded = True
         reviews_loaded = False
 
     if not reviews_loaded:
-        got = _items(io.reviews())
-        if got is None:
-            return f"unknown|-|{mstate}|the reviews API did not answer ({session.err_line()})"
-        substantive = substantive_reviews(session, repo, pr, got)
-        if substantive is None:
-            return f"unknown|-|{mstate}|the review comments API did not establish substantive reviews"
-        reviews = substantive
+        try:
+            reviews = state_reviews(ctx, pr)
+        except ReadFailed:
+            return unknown(mstate, f"the reviews API did not answer ({session.err_line()})")
+        try:
+            reviews = substantive_reviews(ctx, pr, reviews)
+        except NotSubstantive:
+            return unknown(mstate, "the review comments API did not establish substantive reviews")
 
     try:
-        rev_line = jq.captured([_last_word_of_reviews(reviews, rev)])
-    except jq.JqError:
-        return f"unknown|-|{mstate}|the reviews feed did not parse"
-    rev_at = _before(rev_line)
-    rev_sha = _after(rev_line)
-
-    try:
-        spoken = [
-            jq.idx(c, "created_at")
-            for c in comments
-            if by_reviewer(c, rev) and not jq.test(jq.alt(jq.idx(c, "body"), ""), PLACEHOLDER)
-        ]
-        com_at = jq.captured([jq.text(jq.alt(jq.jmax(spoken), ""))])
-    except jq.JqError:
-        return f"unknown|-|{mstate}|the comments feed did not parse"
-
-    try:
-        verdicts: list[dict[str, Json]] = []
-        for c in comments:
-            if not by_reviewer(c, rev) or not jq.test(jq.alt(jq.idx(c, "body"), ""), VERDICT):
-                continue
-            stamp = jq.capture(jq.alt(jq.idx(c, "body"), ""), REVIEWED_COMMIT)
-            verdicts.append(
-                {
-                    "at": jq.alt(jq.idx(c, "updated_at"), jq.idx(c, "created_at")),
-                    "sha": jq.alt(None if stamp is None else stamp.get("s"), ""),
-                }
-            )
-        ordered = jq.sort_by(verdicts, lambda v: v["at"])
-        vline = jq.captured(
-            ["|" if not ordered else f"{jq.text(ordered[-1]['at'])}|{jq.text(ordered[-1]['sha'])}"]
+        submitted = sort_by(
+            [r for r in reviews if login_is(r, rev) and idx(r, "submitted_at") is not None],
+            lambda r: idx(r, "submitted_at"),
         )
-    except jq.JqError:
-        return f"unknown|-|{mstate}|the verdict comments feed did not parse"
-    verd_at = _before(vline)
-    verd_sha = _after(vline)
+        last_review = submitted[-1] if submitted else None
+        rev_at = jstr(idx(last_review, "submitted_at")) if last_review is not None else ""
+        rev_sha = jstr(alt(idx(last_review, "commit_id"), "")) if last_review is not None else ""
+    except JqError:
+        return unknown(mstate, "the reviews feed did not parse")
 
     try:
-        done_line = jq.captured([_summary_verdict(comments, rev)])
-    except jq.JqError:
-        return f"unknown|-|{mstate}|the summary comments feed did not parse"
-    done_kind = _before(done_line)
-    done_line = _after(done_line)
-    done_at = _before(done_line)
-    done_sha = _after(done_line)
+        com_at = jstr(alt(jmax([
+            idx(c, "created_at") for c in comments if login_is(c, rev) and not _is_summary(c)
+        ]), ""))
+    except JqError:
+        return unknown(mstate, "the comments feed did not parse")
 
     try:
-        words = [
-            c
+        verdicts = [
+            (alt(idx(c, "updated_at"), idx(c, "created_at")), _first_stamp(c))
             for c in comments
-            if by_reviewer(c, rev) and not jq.test(jq.alt(jq.idx(c, "body"), ""), PLACEHOLDER)
+            if login_is(c, rev) and _NO_FINDINGS.search(body_of(c))
         ]
-        ordered_words = jq.sort_by(words, lambda c: jq.idx(c, "created_at"))
-        last_word = ordered_words[-1] if ordered_words else None
-        if last_word is None or not jq.test(jq.alt(jq.idx(last_word, "body"), ""), INIT_FAILURE):
-            fline = "||"
-        else:
-            body = jq.alt(jq.idx(last_word, "body"), "")
-            ref = jq.capture(body, INIT_FAILURE_REF)
-            fline = jq.add_str(
-                f"{jq.text(jq.idx(last_word, 'created_at'))}|",
-                jq.alt(None if ref is None else ref.get("s"), ""),
-            ) + ("|env" if jq.test(body, INIT_FAILURE_ENV_ONLY) else "|git")
-        fline = jq.captured([fline])
-    except jq.JqError:
-        return f"unknown|-|{mstate}|the initialization-failure comments feed did not parse"
-    fail_at = _before(fline)
-    fline = _after(fline)
-    fail_ref = _before(fline)
-    fail_kind = _after(fline)
+        verdict = sort_by(verdicts, lambda v: v[0])
+        verd_at = jstr(verdict[-1][0]) if verdict else ""
+        verd_sha = jstr(verdict[-1][1]) if verdict else ""
+    except JqError:
+        return unknown(mstate, "the verdict comments feed did not parse")
 
-    # A new explicit request supersedes older evidence uniformly.
+    try:
+        done_kind, done_at, done_sha = _done_row(comments, rev)
+    except JqError:
+        return unknown(mstate, "the summary comments feed did not parse")
+
+    try:
+        fail_at, fail_ref, fail_kind = _init_failure(comments, rev)
+    except JqError:
+        return unknown(mstate, "the initialization-failure comments feed did not parse")
+
     if not _after_nudge(eyes_at, nudge_at):
         eyes_at = ""
     if not _after_nudge(rev_at, nudge_at):
@@ -507,44 +355,31 @@ def status_state(
         fail_at, fail_ref, fail_kind = "", "", ""
     last_spoke = newest(rev_at, com_at, stale_plus_at)
 
-    if not head_loaded:
-        head = io.head()
+    if head is None:
+        head = state_head_read(ctx, pr)
         mstate = head.mstate
     head_sha = head.sha
 
-    # A no-findings verdict naming the current head outranks a live-looking 👀.
-    if verd_sha and head_sha and (not eyes_at or verd_at > eyes_at):
-        if head_sha.startswith(verd_sha):
-            return (
-                f"approved|-|{mstate}|{rev} posted a no-findings verdict for head {head_sha[:7]}"
-                f" at {verd_at}"
-            )
+    if verd_sha and head_sha and (not eyes_at or verd_at > eyes_at) and head_sha.startswith(verd_sha):
+        return State(
+            "approved", None, mstate,
+            f"{rev} posted a no-findings verdict for head {_short(head_sha)} at {verd_at}",
+        )
 
-    # A round the summary marks Completed on the current head, silent since its 👀 (#439).
     if (
-        done_kind == "completed"
-        and done_sha
-        and head_sha
-        and eyes_at
-        and done_at > eyes_at
-        and (not last_spoke or last_spoke < eyes_at)
+        done_kind == "completed" and done_sha and head_sha and eyes_at and done_at > eyes_at
+        and (not last_spoke or last_spoke < eyes_at) and head_sha.startswith(done_sha)
     ):
-        if head_sha.startswith(done_sha):
-            return (
-                f"approved|-|{mstate}|{rev}'s summary marks head {head_sha[:7]}'s Code Review"
-                f" Completed at {done_at}, with nothing posted since its 👀 at {eyes_at} (no 👍"
-                " was given)"
-            )
+        return State(
+            "approved", None, mstate,
+            f"{rev}'s summary marks head {_short(head_sha)}'s Code Review Completed at {done_at},"
+            f" with nothing posted since its 👀 at {eyes_at} (no 👍 was given)",
+        )
 
-    # A reviewer RUN the summary marks Failed on the current head (#453).
     if (
-        done_kind == "failed"
-        and done_sha
-        and head_sha
-        and plus_flag != "true"
-        and age_of(done_at) != "-"
-        and _after_nudge(done_at, nudge_at)
-        and (not eyes_at or eyes_at < done_at)
+        done_kind == "failed" and done_sha and head_sha and not plus
+        and age_of(done_at, ctx.clock.time()) is not None
+        and _after_nudge(done_at, nudge_at) and (not eyes_at or eyes_at < done_at)
     ):
         if head_sha.startswith(done_sha):
             if eyes_at:
@@ -554,9 +389,9 @@ def status_state(
                 if not (not last_spoke or last_spoke < done_at):
                     done_kind = ""
                 try:
-                    rev_head_at = _reviews_of_head(reviews, rev, head_sha)
-                except jq.JqError:
-                    return f"unknown|-|{mstate}|the reviews feed did not parse for the failed run's head"
+                    rev_head_at = _review_of_head_at(reviews, rev, head_sha)
+                except JqError:
+                    return unknown(mstate, "the reviews feed did not parse for the failed run's head")
                 if rev_head_at:
                     done_kind = ""
         else:
@@ -565,134 +400,192 @@ def status_state(
         done_kind = ""
     if done_kind == "failed":
         if not head_at_read:
-            head_at = io.commit_date(head_sha)
+            head_at = _commit_read(ctx, head_sha)
             head_at_read = True
-        floor = ""
-        if age_of(head_at) != "-":
-            floor = head_at
-        if head.created and age_of(head.created) != "-":
+        floor = head_at if age_of(head_at, ctx.clock.time()) is not None else ""
+        if head.created and age_of(head.created, ctx.clock.time()) is not None:
             floor = newest(floor, head.created)
         try:
-            requested: list[Json] = []
-            for c in comments:
-                if by_reviewer(c, rev):
-                    continue
-                if not jq.test(jq.alt(jq.idx(c, "body"), ""), REQUEST):
-                    continue
-                requested.append(jq.alt(jq.idx(c, "created_at"), ""))
-            after_row = any(jq.cmp(t, done_at) >= 0 for t in requested)
-            before_row = jq.jmax(
-                [t for t in requested if jq.cmp(t, floor) >= 0 and jq.cmp(t, done_at) < 0]
-            )
-            req_line = jq.captured([f"{jq.text(after_row)}|{jq.text(jq.alt(before_row, ''))}"])
-        except jq.JqError:
-            return f"unknown|-|{mstate}|the review-request comments feed did not parse"
-        req_after = _before(req_line)
-        req_before = _after(req_line)
-        if req_after != "true":
+            asked = [
+                alt(idx(c, "created_at"), "")
+                for c in comments
+                if not login_is(c, rev) and _REQUEST.search(body_of(c))
+            ]
+            req_after = any(ge(a, done_at) for a in asked)
+            req_before = jstr(alt(jmax([a for a in asked if ge(a, floor) and lt(a, done_at)]), ""))
+        except JqError:
+            return unknown(mstate, "the review-request comments feed did not parse")
+        if not req_after:
+            age = age_of(done_at, ctx.clock.time())
             if req_before:
-                return (
-                    f"failed|{age_of(done_at)}|{mstate}|{head_sha[:7]}|run-again|{rev}'s summary"
-                    f" marks head {head_sha[:7]}'s Code Review Failed at {done_at}, after the"
-                    f" '@codex review' request at {req_before} on this head, with no review of it"
-                    " and no 👍"
+                return State(
+                    "failed", age, mstate,
+                    f"{_short(head_sha)}|run-again|{rev}'s summary marks head {_short(head_sha)}'s"
+                    f" Code Review Failed at {done_at}, after the '@codex review' request at"
+                    f" {req_before} on this head, with no review of it and no 👍",
                 )
-            return (
-                f"failed|{age_of(done_at)}|{mstate}|{head_sha[:7]}|run|{rev}'s summary marks head"
-                f" {head_sha[:7]}'s Code Review Failed at {done_at}, with no review of it, no 👍,"
-                " and no '@codex review' on it since it arrived"
+            return State(
+                "failed", age, mstate,
+                f"{_short(head_sha)}|run|{rev}'s summary marks head {_short(head_sha)}'s Code Review"
+                f" Failed at {done_at}, with no review of it, no 👍, and no '@codex review' on it"
+                " since it arrived",
             )
 
-    # In flight only while the 👀 is newer than everything the reviewer has said.
     if eyes_at and eyes_at > last_spoke:
-        age = age_of(eyes_at)
-        if is_digits(age) and int(age) >= stall:
-            return f"stalled|{age}|{mstate}|👀 from {rev} at {eyes_at} with nothing posted since"
-        spoke = f" ({last_spoke})" if last_spoke else ""
-        return f"reviewing|{age}|{mstate}|👀 from {rev} at {eyes_at}, newer than its last word{spoke}"
+        age = age_of(eyes_at, ctx.clock.time())
+        if age is not None and age >= grace_stall:
+            return State("stalled", age, mstate, f"👀 from {rev} at {eyes_at} with nothing posted since")
+        since = f" ({last_spoke})" if last_spoke else ""
+        return State("reviewing", age, mstate, f"👀 from {rev} at {eyes_at}, newer than its last word{since}")
 
     if not head_sha:
-        return f"unknown|-|unread|the pulls API did not answer for the head SHA ({head.err})"
+        return unknown("unread", f"the pulls API did not answer for the head SHA ({head.err})")
 
-    # The round that never started (#78, #421).
     fail_head = ""
     if fail_at and fail_ref:
         if head_sha.startswith(fail_ref):
-            fail_head = f"for ref {fail_ref[:7]}"
+            fail_head = f"for ref {_short(fail_ref)}"
     elif fail_at and fail_kind == "env":
         if not head_at_read:
-            head_at = io.commit_date(head_sha)
+            head_at = _commit_read(ctx, head_sha)
             head_at_read = True
         if (
-            age_of(head_at) != "-"
-            and fail_at > head_at
-            and (not head.created or (age_of(head.created) != "-" and fail_at > head.created))
+            age_of(head_at, ctx.clock.time()) is not None and fail_at > head_at
+            and (not head.created or (age_of(head.created, ctx.clock.time()) is not None and fail_at > head.created))
         ):
-            fail_head = f"after head {head_sha[:7]}'s commit date {head_at}"
+            fail_head = f"after head {_short(head_sha)}'s commit date {head_at}"
     if fail_head:
         try:
-            rev_head_at = _reviews_of_head(reviews, rev, head_sha)
-        except jq.JqError:
-            return f"unknown|-|{mstate}|the reviews feed did not parse for the failed head"
+            rev_head_at = _review_of_head_at(reviews, rev, head_sha)
+        except JqError:
+            return unknown(mstate, "the reviews feed did not parse for the failed head")
         if not rev_head_at or fail_at > rev_head_at:
-            return (
-                f"failed|{age_of(fail_at)}|{mstate}|{head_sha[:7]}|{fail_kind}|{rev} reported an"
-                f" initialization failure at {fail_at} {fail_head}"
+            return State(
+                "failed", age_of(fail_at, ctx.clock.time()), mstate,
+                f"{_short(head_sha)}|{fail_kind}|{rev} reported an initialization failure at"
+                f" {fail_at} {fail_head}",
             )
 
-    # A verdict naming the current head, no older than the reviewer's last word.
-    if verd_sha and not verd_at < last_spoke:
-        if head_sha.startswith(verd_sha):
-            return (
-                f"approved|-|{mstate}|{rev} posted a no-findings verdict for head {head_sha[:7]}"
-                f" at {verd_at}"
-            )
+    if verd_sha and not verd_at < last_spoke and head_sha.startswith(verd_sha):
+        return State(
+            "approved", None, mstate,
+            f"{rev} posted a no-findings verdict for head {_short(head_sha)} at {verd_at}",
+        )
 
     if rev_sha == head_sha:
-        return f"idle|{age_of(last_spoke)}|{mstate}|{rev} reviewed head {head_sha[:7]} at {rev_at}"
+        return State(
+            "idle", age_of(last_spoke, ctx.clock.time()), mstate, f"{rev} reviewed head {_short(head_sha)} at {rev_at}"
+        )
 
     if not head_at_read:
-        head_at = io.commit_date(head_sha)
+        head_at = _commit_read(ctx, head_sha)
     if nudge_at:
-        return (
-            f"nudged|{freshest_age(nudge_at, head_at, head.created)}|{mstate}|{nudge_id}|fresh"
-            " review nudge; waiting for pickup"
+        return State(
+            "nudged", freshest_age(nudge_at, head_at, head.created, now=ctx.clock.time()), mstate,
+            f"{nudge_id}|fresh review nudge; waiting for pickup",
         )
-    last = f"; {rev} last reviewed {rev_sha[:7]} at {rev_at}" if rev_sha else ""
+    last = f"; {rev} last reviewed {_short(rev_sha)} at {rev_at}" if rev_sha else ""
     stale = f"; {stale_note}" if stale_note else ""
-    return (
-        f"expected|{freshest_age(head_at, head.created, last_spoke, eyes_at, nudge_at)}|{mstate}|no"
-        f" 👀 in flight and no review of head {head_sha[:7]}{last}{stale}"
+    return State(
+        "expected", freshest_age(head_at, head.created, last_spoke, eyes_at, nudge_at, now=ctx.clock.time()), mstate,
+        f"no 👀 in flight and no review of head {_short(head_sha)}{last}{stale}",
     )
 
 
-# --- open review threads under an approval (ludics-lite#289) --------------------------------------
-
-def approval_gate(session: GhSession, repo: str, pr: str, line: str, cap: int) -> str:
-    """``approval_gate``: an ``approved`` line checked for open review threads (threads.py)."""
-    if state_tok(line) != "approved":
-        return line
-    found = unresolved_threads(session, repo, pr, cap)
-    match found:
-        case WalkRejected(line=why) | WalkUnread(line=why):
-            return (
-                f"unknown|-|{state_merge(line)}|{why}, so whether open review threads stand under"
-                f" this approval ({state_detail(line)}) is unknown"
-            )
-        case OpenThreads(rows=rows):
-            if not rows:
-                return line
-            n, shown = threads_named(rows)
-            return f"unresolved|-|{state_merge(line)}|{n}|{state_detail(line)}|{shown}"
-        case _:
-            assert_never(found)
+def _first_stamp(c: Json) -> str:
+    """``[(.body // "") | capture($rc).s] | first // ""``."""
+    m = capture_first(body_of(c), REVIEWED_COMMIT_RE)
+    return jstr(alt(m["s"] if m is not None else None, ""))
 
 
-# --- rendering ------------------------------------------------------------------------------------
+def _evidence(
+    comments: list[Json], reviews: list[Json], rev: str, head_sha: str
+) -> tuple[str, str, int, str]:
+    """The 👍 path's read of the current head's newest evidence: (kind, at, the Running rows the
+    stamp pattern could not read, the commit of the newest summary's newest Code Review row)."""
+    mine = [c for c in comments if login_is(c, rev)]
+    summaries = [c for c in mine if _SUMMARY_TAG in body_of(c)]
+    running: list[dict[str, str | None] | None] = []
+    for c in summaries:
+        for row in body_of(c).split("\n"):
+            if _RUNNING_ROW.search(row):
+                running.append(capture_first(row, _SUMMARY_ROW_STAMP))
+    newest_summary = max_by(summaries, lambda c: alt(idx(c, "updated_at"), idx(c, "created_at")))
+    rows = [] if newest_summary is None else _stamp_rows(body_of(newest_summary))
+    row_sha = ""
+    if rows and all(r is not None for r in rows):
+        best = max_by([r for r in rows if r is not None], lambda r: instant(r["at"]))
+        row_sha = jstr(best["sha"]) if best is not None else ""
+    candidates: list[tuple[Json, Json, str]] = []
+    for r in running:
+        if r is not None:
+            candidates.append((r["sha"], r["at"], "running"))
+    for r in reviews:
+        if login_is(r, rev) and idx(r, "submitted_at") is not None:
+            candidates.append((alt(idx(r, "commit_id"), ""), idx(r, "submitted_at"), "findings"))
+    for c in mine:
+        stamps = capture_all(body_of(c), REVIEWED_COMMIT_RE)
+        sha: Json = alt(stamps[-1]["s"] if stamps else None, "")
+        kind = "verdict" if _NO_FINDINGS.search(body_of(c)) else "findings"
+        candidates.append((sha, alt(idx(c, "updated_at"), idx(c, "created_at")), kind))
+    current: list[tuple[str, str]] = []
+    for sha, at, kind in candidates:
+        if sha != "" and head_sha != "" and startswith(head_sha, sha):
+            current.append((sub_once(at, _FRACTION_Z, "Z"), kind))
+    best_ev = max_by(current, lambda e: e[0])
+    unread = sum(1 for r in running if r is None)
+    if best_ev is None:
+        return "", "", unread, row_sha
+    return best_ev[1], best_ev[0], unread, row_sha
 
 
-# SHARED-CANDIDATE: conflict_note
-def conflict_note(merge: str, repo: str, num: str) -> str:
+def _done_row(comments: list[Json], rev: str) -> tuple[str, str, str]:
+    """The newest summary's newest Code Review row, when it is the allowlisted Completed or Failed
+    shape: (kind, at with its fraction cut, sha), or empty fields."""
+    newest_summary = _newest_summary(comments, rev)
+    if newest_summary is None:
+        return "", "", ""
+    rows: list[tuple[str, str] | None] = []
+    for row in body_of(newest_summary).split("\n"):
+        if not _CODE_REVIEW_ROW.search(row):
+            continue
+        stamp = capture_first(row, _SUMMARY_ROW_STAMP)
+        rows.append(None if stamp is None else (jstr(stamp["at"]), row))
+    if not rows or any(r is None for r in rows):
+        return "", "", ""
+    best = max_by([r for r in rows if r is not None], lambda r: instant(r[0]))
+    assert best is not None
+    done = capture_first(best[1], _SUMMARY_COMPLETED_ROW)
+    if done is not None:
+        return "completed", sub_once(done["at"], _FRACTION_Z, "Z"), jstr(done["sha"])
+    failed = capture_first(best[1], _SUMMARY_FAILED_ROW)
+    if failed is not None:
+        return "failed", sub_once(failed["at"], _FRACTION_Z, "Z"), jstr(failed["sha"])
+    return "", "", ""
+
+
+def _init_failure(comments: list[Json], rev: str) -> tuple[str, str, str]:
+    """The reviewer's newest non-placeholder comment, when it is the initialization failure:
+    (created_at, the ref it names or "", "env" | "git")."""
+    words = sort_by(
+        [c for c in comments if login_is(c, rev) and not _is_summary(c)],
+        lambda c: idx(c, "created_at"),
+    )
+    if not words:
+        return "", "", ""
+    last = words[-1]
+    body = body_of(last)
+    if not _INIT_FAILURE.search(body):
+        return "", "", ""
+    ref = capture_first(body, _INIT_FAILURE_REF)
+    kind = "env" if _INIT_FAILURE_ENV.search(body) else "git"
+    return jstr(idx(last, "created_at")), jstr(alt(ref["s"] if ref is not None else None, "")), kind
+
+
+# --- the rendering ----------------------------------------------------------------------------------
+
+
+def conflict_note(merge: str, repo: str, pr: str) -> str:
     match merge:
         case "dirty":
             return (
@@ -708,101 +601,215 @@ def conflict_note(merge: str, repo: str, num: str) -> str:
             )
         case "unknown":
             return (
-                "mergeability NOT YET COMPUTED (mergeable_state=unknown, GitHub recomputes it after"
-                " every push): a conflict this push caused would not show yet — re-read status in"
-                " a minute"
+                "mergeability NOT YET COMPUTED (mergeable_state=unknown, GitHub recomputes it"
+                " after every push): a conflict this push caused would not show yet — re-read"
+                " status in a minute"
             )
         case "draft":
             return (
                 "DRAFT (mergeable_state=draft): a draft cannot be merged and no reviewer action"
-                f" lands it — mark it ready (gh pr ready {num or '<pr>'} --repo {repo}) when it is;"
+                f" lands it — mark it ready (gh pr ready {pr or '<pr>'} --repo {repo}) when it is;"
                 " the review rounds still count"
             )
         case _:
             return ""
 
 
-# SHARED-CANDIDATE: status_line
-def status_line(line: str, repo: str, num: str) -> str:
-    """``status_line``: the state line rendered. ``num`` is PR_NUM, empty when unknown."""
-    tok = state_tok(line)
-    age = state_age(line)
-    detail = state_detail(line)
-    if tok == "nudged":
-        detail = _after(detail)
-    merge = state_merge(line)
-    conflict = conflict_note(merge, repo, num)
+def status_line(state: State, repo: str, pr: str) -> str:
+    detail = state.detail
+    if state.tok == "nudged":
+        detail = detail.split("|", 1)[1] if "|" in detail else detail
+    conflict = conflict_note(state.merge, repo, pr)
     c = f"; {conflict}" if conflict else ""
-    pr = num or "<pr>"
-    match tok:
+    p = pr or "<pr>"
+    age = fmt_age(state.age)
+    match state.tok:
         case "approved":
             return f"approved ({detail}){c}"
         case "unresolved":
-            rest = _after(detail)
+            count, _, frest = detail.partition("|")
+            approval, _, names = frest.partition("|") if "|" in frest else (frest, "", frest)
             return (
-                f"approved ({_before(rest)}) BUT {_before(detail)} review thread(s) still UNRESOLVED"
-                f" — NOT a clean approval, and `merge` refuses it: {_after(rest)}."
-                f" {threads_advice(repo, num)}{c}"
+                f"approved ({approval}) BUT {count} review thread(s) still UNRESOLVED — NOT a"
+                f" clean approval, and `merge` refuses it: {names}. {threads_advice(repo, pr)}{c}"
             )
         case "reviewing":
-            return f"reviewing — {detail}, running {fmt_age(age)} — wait it out{c}"
+            return f"reviewing — {detail}, running {age} — wait it out{c}"
         case "stalled":
             return (
-                f"STALLED — {detail} for {fmt_age(age)}, longer than a round takes. FIRST read the"
-                " PR feed yourself (retry --read pr view <pr> --comments): a verdict may have landed"
-                " as a comment or a 👍 this state machine missed. Only if the feed truly has nothing"
-                " for the current head, nudge with a '@codex review' comment — knowing a re-request"
+                f"STALLED — {detail} for {age}, longer than a round takes. FIRST read the PR feed"
+                " yourself (retry --read pr view <pr> --comments): a verdict may have landed as a"
+                " comment or a 👍 this state machine missed. Only if the feed truly has nothing for"
+                " the current head, nudge with a '@codex review' comment — knowing a re-request"
                 f" CLEARS the reviewer's existing 👍{c}"
             )
         case "failed":
-            fsha = _before(detail)
-            frest = _after(detail)
-            fkind = _before(frest)
-            frest = _after(frest)
-            standing = f"This is not a round — {frest}, standing for {fmt_age(age)}{c}"
+            fsha, _, frest = detail.partition("|") if "|" in detail else (detail, "", detail)
+            fkind, _, frest = frest.partition("|") if "|" in frest else (frest, "", frest)
             match fkind:
                 case "run":
                     return (
                         f"reviewer's run FAILED on head {fsha} — no review and no 👍, so a"
                         " '@codex review' re-request clears nothing: `watch` posts it itself, once"
                         " per head, and keeps watching; outside a watch, post it (pr-review.sh"
-                        f" comment {repo}#{pr} '@codex review'). {standing}"
+                        f" comment {repo}#{p} '@codex review'). This is not a round — {frest},"
+                        f" standing for {age}{c}"
                     )
                 case "run-again":
                     return (
-                        f"reviewer's run FAILED AGAIN on head {fsha} after a '@codex review' request"
-                        " on it — not re-requested a second time: read the PR feed (retry --read pr"
-                        " view <pr> --comments) for anything the reviewer said, then push a new head"
-                        " (an amend suffices: git commit --amend --no-edit && git push"
-                        f" --force-with-lease) or hand it to the maintainer. {standing}"
+                        f"reviewer's run FAILED AGAIN on head {fsha} after a '@codex review'"
+                        " request on it — not re-requested a second time: read the PR feed (retry"
+                        " --read pr view <pr> --comments) for anything the reviewer said, then"
+                        " push a new head (an amend suffices: git commit --amend --no-edit && git"
+                        " push --force-with-lease) or hand it to the maintainer. This is not a"
+                        f" round — {frest}, standing for {age}{c}"
                     )
                 case "env":
                     return (
                         f"reviewer FAILED at initialization on head {fsha} — nudge it once with a"
-                        f" '@codex review' comment (pr-review.sh comment {repo}#{pr} '@codex"
+                        f" '@codex review' comment (pr-review.sh comment {repo}#{p} '@codex"
                         ' review\'); the connector answered "To use Codex here, create an'
-                        ' environment for this repo", which has cleared on one nudge before. If the'
-                        " nudge draws the same answer, the environment is the maintainer's to set"
-                        " up (https://chatgpt.com/codex/cloud/settings/environments) — no push of"
-                        f" yours fixes it. {standing}"
+                        ' environment for this repo", which has cleared on one nudge before. If'
+                        " the nudge draws the same answer, the environment is the maintainer's to"
+                        " set up (https://chatgpt.com/codex/cloud/settings/environments) — no push"
+                        f" of yours fixes it. This is not a round — {frest}, standing for {age}{c}"
                     )
                 case _:
                     return (
                         f"reviewer FAILED at initialization on head {fsha} — nudge it once with a"
-                        f" '@codex review' comment (pr-review.sh comment {repo}#{pr} '@codex"
-                        " review'); if the SAME head fails again, push a new head instead (an amend"
-                        " suffices: git commit --amend --no-edit && git push --force-with-lease),"
-                        " since the reviewer's clone is behind, not your push — the ref it could not"
-                        f" fetch is one the PR and git ls-remote both serve. {standing}"
+                        f" '@codex review' comment (pr-review.sh comment {repo}#{p} '@codex"
+                        " review'); if the SAME head fails again, push a new head instead (an"
+                        " amend suffices: git commit --amend --no-edit && git push"
+                        " --force-with-lease), since the reviewer's clone is behind, not your push"
+                        " — the ref it could not fetch is one the PR and git ls-remote both serve."
+                        f" This is not a round — {frest}, standing for {age}{c}"
                     )
         case "expected" | "nudged":
-            return f"review EXPECTED but not started — {detail}; due for {fmt_age(age)}{c}"
+            return f"review EXPECTED but not started — {detail}; due for {age}{c}"
         case "idle":
-            if merge in ("dirty", "draft"):
+            if state.merge in ("dirty", "draft"):
                 return f"nothing in flight — {detail}, and no 👍; {conflict}"
             return f"nothing in flight — {detail}, and no 👍; the next move is yours{c}"
         case "unknown":
             return f"UNKNOWN — {detail}; this is NOT 'not approved', retry{c}"
         case _:
-            return f"unrecognised state '{tok}' — treat as unknown and retry"
+            assert_never(state.tok)
+
+
+# --- open review threads under an approval (ludics-lite#289) -----------------------------------------
+
+def threads_page_cap() -> int:
+    """THREADS_PAGE_CAP (knobs.threads_page_cap)."""
+    return knobs.threads_page_cap(os.environ)
+
+
+def approval_gate(ctx: Ctx, pr: str, state: State) -> State:
+    """``approval_gate``: an ``approved`` state checked for open review threads (threads.py)."""
+    if state.tok != "approved":
+        return state
+    read = unresolved_threads(ctx.session, ctx.repo, pr, threads_page_cap())
+    match read:
+        case WalkRejected(line=reason) | WalkUnread(line=reason):
+            return unknown(
+                state.merge,
+                f"{reason}, so whether open review threads stand under this approval"
+                f" ({state.detail}) is unknown",
+            )
+        case OpenThreads(rows=rows):
+            if not rows:
+                return state
+            n, shown = threads_named(rows)
+            return State("unresolved", None, state.merge, f"{n}|{state.detail}|{shown}")
+        case _:
+            assert_never(read)
+
+
+def gated_state(ctx: Ctx, pr: str) -> State:
+    return approval_gate(ctx, pr, status_state(ctx, pr))
+
+
+# --- review rounds ------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Rounds:
+    """``review_rounds``'s "count|detail": ``count`` is None for unknown."""
+
+    count: int | None
+    detail: str
+
+    def token(self) -> str:
+        """``count_token``."""
+        return "unknown" if self.count is None else str(self.count)
+
+
+def review_rounds(
+    ctx: Ctx, pr: str, round_gap: int, icap: int | None = None, rcap: int | None = None
+) -> Rounds:
+    rev = ctx.reviewer
+    try:
+        raw = state_reviews(ctx, pr)
+    except ReadFailed:
+        return Rounds(None, f"the reviews API did not answer ({ctx.session.err_line()})")
+    try:
+        raw = substantive_reviews(ctx, pr, raw)
+    except NotSubstantive:
+        return Rounds(None, "the review comments API did not establish substantive reviews")
+    try:
+        comments = state_comments(ctx, pr)
+    except ReadFailed:
+        return Rounds(None, f"the comments API did not answer ({ctx.session.err_line()})")
+    try:
+        events: list[tuple[Json, int]] = []
+        for r in raw:
+            if not login_is(r, rev):
+                continue
+            if rcap is not None and not ge(rcap, alt(idx(r, "id"), 0)):
+                continue
+            if idx(r, "submitted_at") is None:
+                continue
+            if idx(r, "state") not in ("COMMENTED", "CHANGES_REQUESTED"):
+                continue
+            events.append((alt(idx(r, "commit_id"), ""), fromdateiso8601(idx(r, "submitted_at"))))
+        for c in as_list(comments):
+            if not login_is(c, rev):
+                continue
+            if icap is not None and not ge(icap, alt(idx(c, "id"), 0)):
+                continue
+            body = body_of(c)
+            if _SUMMARY_TAG in body or _NO_FINDINGS.search(body) or _INIT_FAILURE.search(body):
+                continue
+            stamp = capture_first(body, REVIEWED_COMMIT_RE)
+            sha: Json = alt(stamp["s"] if stamp is not None else None, "comment")
+            events.append((sha, fromdateiso8601(idx(c, "created_at"))))
+        n = 0
+        cur: Json = None
+        t = 0
+        for sha, when in sort_by(events, lambda e: e[1]):
+            if not _same_head(sha, cur) or when - t > round_gap:
+                n += 1
+                cur = sha
+            t = when
+    except JqError:
+        return Rounds(None, "the reviews feed did not parse")
+    try:
+        heads: list[Json] = [
+            alt(idx(r, "commit_id"), "")
+            for r in raw
+            if login_is(r, rev)
+            and idx(r, "submitted_at") is not None
+            and idx(r, "state") in ("COMMENTED", "CHANGES_REQUESTED")
+        ]
+        head_count = str(len([h for h in unique(heads) if h != ""]))
+    except JqError:
+        head_count = "?"
+    return Rounds(n, f"{n} round(s) of {rev} findings over {head_count} head(s)")
+
+
+def _same_head(a: Json, b: Json) -> bool:
+    if cmp(a, b) == 0:
+        return True
+    if a is None or b is None or a == "" or b == "":
+        return False
+    return startswith(a, b) or startswith(b, a)
 

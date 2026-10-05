@@ -41,14 +41,12 @@ from ludics.prreview.core import (
     pr_arg,
 )
 from ludics.prreview.reply import split_ids
+from ludics.prreview.jqsem import JqError, idx, jstr
 from ludics.prreview.threads import (
-    JqError,
     PageVerdict,
     WalkDone,
     WalkRejected,
     WalkUnread,
-    jq_field,
-    jq_text,
     thread_id,
     threads_walk,
 )
@@ -96,7 +94,7 @@ def find_thread(session: GhSession, repo: str, pr: str, comment_id: str, *, cap:
         try:
             names = [(node, thread_id(node)) for node in nodes]
             hits = [
-                Found(jq_text(jq_field(node, "id")), jq_text(jq_field(node, "isResolved")))
+                Found(jstr(idx(node, "id")), jstr(idx(node, "isResolved")))
                 for node, name in names
                 if name == wanted
             ]

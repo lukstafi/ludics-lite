@@ -30,7 +30,12 @@
 #                program it runs, so a check of [[:space:]] (lib/ludics/prreview/space.py) and a
 #                child's own locale would differ from the shell's (-X utf8 already covers streams);
 #   PYTHONPATH   exactly this checkout's lib/ (the package `ludics`), replacing any inherited one,
-#                since the rewrite is standard-library only and nothing else belongs on the path.
+#                since the rewrite is standard-library only and nothing else belongs on the path;
+#   LUDICS_CALLER_PYTHONPATH
+#                the caller's own PYTHONPATH (`=<value>` when it was set, empty when not), which the
+#                entry point puts back before it runs anything (ludics.cli.restore_caller_environment),
+#                so a command it runs -- a batch under `fleet-worker.sh execution slot`, a hook, a
+#                fixture -- sees the caller's environment, not the `ludics` package.
 #
 # Shell: bash 3.2 (macOS), bash 5, and Git Bash. No arrays-with-`set -u` pitfalls, no `local -n`.
 
@@ -126,9 +131,10 @@ fi
 if [ -n "$windows" ] && command -v cygpath >/dev/null 2>&1; then
   lib_dir=$(cygpath -w "$lib_dir")
 fi
+if [ -n "${PYTHONPATH+set}" ]; then LUDICS_CALLER_PYTHONPATH="=$PYTHONPATH"; else LUDICS_CALLER_PYTHONPATH=""; fi
 PYTHONPATH="$lib_dir"
 PYTHONCOERCECLOCALE=0
-export PYTHONPATH PYTHONCOERCECLOCALE
+export PYTHONPATH PYTHONCOERCECLOCALE LUDICS_CALLER_PYTHONPATH
 
 if [ -n "$chosen_arg" ]; then
   exec "$chosen_cmd" "$chosen_arg" -X utf8 -P "$@"

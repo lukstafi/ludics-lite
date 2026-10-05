@@ -12,6 +12,7 @@ One shell detail is kept on purpose: dropping a round (``snapshot_drop``) emptie
 ARMED, so a review's comments read after the drop are still cached for the rest of that round.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import assert_never
 
@@ -25,8 +26,10 @@ from ludics.prreview.core import (
     ListUnparsed,
     api_list,
 )
-from ludics.prreview.clock import Clock
-from ludics.prreview.watch_jq import (
+from ludics.prreview import knobs
+from ludics.prreview.clock import Clock, clock_from_env
+from ludics.prreview.shtext import tab_fields
+from ludics.prreview.jqsem import (
     JqError,
     as_list,
     body_of,
@@ -53,7 +56,6 @@ class Head:
 
 
 @dataclass
-# SHARED-CANDIDATE: snapshot_arm snapshot_drop snapshot_off snapshot_put_feeds snapshot_put_head snapshot_has
 class Snapshot:
     armed: bool = False
     feeds_pr: str = ""
@@ -125,6 +127,14 @@ class ReadFailed(Exception):
     """A feed read failed: ``api_list``'s nonzero status. The caller words what it means."""
 
 
+def outside_watch(session: GhSession, repo: str, nudge_after: int | None = None) -> Ctx:
+    """The reads' context for ``status``, ``rounds`` and ``poll``: no round snapshot (never
+    armed), the clock SHIP_PR_TEST_CLOCK names, STALL as the shell resolved it."""
+    env = os.environ
+    return Ctx(session, repo, session.config.reviewer, clock_from_env(env), knobs.review_clocks(env)[1],
+               nudge_after=nudge_after)
+
+
 def feed(ctx: Ctx, path: str) -> list[Json]:
     """``api_list``: the whole feed, or ``ReadFailed``."""
     result = api_list(ctx.session, path, ctx.repo)
@@ -137,52 +147,27 @@ def feed(ctx: Ctx, path: str) -> list[Json]:
             assert_never(result)
 
 
-# SHARED-CANDIDATE: state_comments
 def state_comments(ctx: Ctx, pr: str) -> list[Json]:
     if ctx.snap.has_feeds(pr):
         return ctx.snap.comments
     return feed(ctx, f"issues/{pr}/comments?per_page=100")
 
 
-# SHARED-CANDIDATE: state_reviews
 def state_reviews(ctx: Ctx, pr: str) -> list[Json]:
     if ctx.snap.has_feeds(pr):
         return ctx.snap.reviews
     return feed(ctx, f"pulls/{pr}/reviews?per_page=100")
 
 
-def ifs_read(line: str, count: int, ifs: str = "\t") -> list[str]:
-    """``IFS=<whitespace> read -r a b c``: leading and trailing separators dropped, a run of them
-    one separator, the last variable taking the rest of the line."""
-    rest = line.split("\n", 1)[0].strip(ifs)
-    out: list[str] = []
-    for _ in range(count - 1):
-        if not rest:
-            out.append("")
-            continue
-        i = 0
-        while i < len(rest) and rest[i] not in ifs:
-            i += 1
-        out.append(rest[:i])
-        rest = rest[i:].lstrip(ifs)
-    out.append(rest)
-    return out
+# pr_head_read's projection: the head, the mergeability and the PR's creation, one read.
+HEAD_JQ = '[(.head.sha // "-"), (.mergeable_state // "-"), (.created_at // "-")] | @tsv'
 
 
-# SHARED-CANDIDATE: pr_head_read
 def pr_head_read(ctx: Ctx, pr: str) -> Head:
-    result = ctx.session.retry(
-        "read",
-        [
-            "api",
-            f"repos/{ctx.repo}/pulls/{pr}",
-            "--jq",
-            '[(.head.sha // "-"), (.mergeable_state // "-"), (.created_at // "-")] | @tsv',
-        ],
-    )
+    result = ctx.session.retry("read", ["api", f"repos/{ctx.repo}/pulls/{pr}", "--jq", HEAD_JQ])
     match result:
         case GhOk(stdout=line):
-            sha, mstate, created = ifs_read(line, 3)
+            sha, mstate, created = tab_fields(line, 3)
             return Head(
                 sha="" if sha == "-" else sha,
                 mstate=mstate or "-",
@@ -195,7 +180,6 @@ def pr_head_read(ctx: Ctx, pr: str) -> Head:
             assert_never(result)
 
 
-# SHARED-CANDIDATE: state_head_read
 def state_head_read(ctx: Ctx, pr: str) -> Head:
     if ctx.snap.has_head(pr) and ctx.snap.head is not None:
         h = ctx.snap.head
@@ -203,7 +187,6 @@ def state_head_read(ctx: Ctx, pr: str) -> Head:
     return pr_head_read(ctx, pr)
 
 
-# SHARED-CANDIDATE: review_comments
 def review_comments(ctx: Ctx, pr: str, review_id: str) -> list[Json]:
     """A review's own comments endpoint, read at most once per round for a given review: only a
     read that answered is cached, so a failure is never served as a review with no findings."""
@@ -242,7 +225,6 @@ def _fixed_reply(comment: Json) -> bool:
     return sub_once(body, _TRAILING_SPACE, "") in CONNECTOR_FIXED_REPLIES
 
 
-# SHARED-CANDIDATE: substantive_reviews
 def substantive_reviews(ctx: Ctx, pr: str, raw: list[Json]) -> list[Json]:
     """The reviews feed minus the empty-bodied COMMENTED envelopes whose own comments carry no
     finding: none at all (#88), or only the connector's fixed thread replies (#472)."""

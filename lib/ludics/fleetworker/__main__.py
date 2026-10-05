@@ -12,9 +12,7 @@ log, unstick, close, ls, load, prs -- is still fleet-worker.sh's own.
 """
 
 import os
-import signal
 import sys
-from collections.abc import MutableMapping
 
 from ludics import cli
 from ludics.fleetworker import execution, gate, lease
@@ -33,26 +31,7 @@ PORTED = (
 )
 
 
-# The forwarder's note of the caller's PYTHONPATH: ``=<value>`` when it was set, empty when not.
-CALLER_PYTHONPATH = "LUDICS_FW_PYTHONPATH"
-
-
-def restore_caller_pythonpath(env: MutableMapping[str, str]) -> None:
-    """Put back the PYTHONPATH scripts/py replaced with the checkout's lib/ (fleet-worker.sh's
-    forwarder notes it), so every child -- a batch under ``execution slot``/``hold`` above all --
-    runs in the caller's environment. This process's own path was fixed at startup; a run not
-    through the forwarder has no note, and keeps what it has."""
-    saved = env.pop(CALLER_PYTHONPATH, None)
-    if saved is None:
-        return
-    if saved.startswith("="):
-        env["PYTHONPATH"] = saved[1:]
-    else:
-        env.pop("PYTHONPATH", None)
-
-
 def dispatch(argv: list[str]) -> int:
-    restore_caller_pythonpath(os.environ)
     if not argv:
         die("usage: python -m ludics.fleetworker <fleet-worker.sh path> <verb> [args...]")
     cfg = load_config(argv[0], os.environ)
@@ -82,26 +61,11 @@ def dispatch(argv: list[str]) -> int:
             )
 
 
-def die_of_sigpipe() -> int:
-    """A reader that went away: end as the shell did, killed by SIGPIPE (a caller's pipefail reads
-    141), with no traceback. Python ignores SIGPIPE and raises BrokenPipeError instead, and would
-    end in a traceback and exit 120 from the flush at shutdown."""
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, sys.stdout.fileno())  # the interpreter's final flush must not fail again
-    os.close(devnull)
-    if hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGPIPE)
-    return 128 + 13
-
-
 def main() -> int:
-    try:
-        rc = cli.main_guard(PROG, dispatch, sys.argv[1:])
-        sys.stdout.flush()
-    except BrokenPipeError:
-        return die_of_sigpipe()
-    return rc
+    # The caller's PYTHONPATH comes back before anything runs (cli.main), so a batch under
+    # `execution slot`/`hold` sees the environment it was given; a reader that goes away ends the
+    # verb by SIGPIPE, as it ended the shell (cli.die_of_sigpipe).
+    return cli.main(PROG, dispatch)
 
 
 if __name__ == "__main__":

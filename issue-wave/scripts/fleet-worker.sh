@@ -242,10 +242,10 @@ set -uo pipefail
 # CHECKOUT line below does. Forwarded before any configuration is read here: the Python reads the
 # same environment itself. An `execution slot` keeps its pid through every hop (each is an exec),
 # so the pid a caller holds is still the batch's own.
-# The caller's PYTHONPATH rides along in LUDICS_FW_PYTHONPATH (`=<value>` when set, empty when
-# unset): scripts/py replaces PYTHONPATH with the checkout's lib/, and the Python puts the caller's
-# back before it runs anything, so a batch under `execution slot`/`hold` sees the environment it was
-# given -- a wrapper must not change a batch's verdict, nor hand it the `ludics` package.
+# The caller's PYTHONPATH rides along: scripts/py replaces PYTHONPATH with the checkout's lib/ and
+# notes the caller's in LUDICS_CALLER_PYTHONPATH, which the Python puts back before it runs
+# anything (ludics.cli), so a batch under `execution slot`/`hold` sees the environment it was given
+# -- a wrapper must not change a batch's verdict, nor hand it the `ludics` package.
 # One exception stays in this shell: `execution slot --probe` is answered below, before any
 # interpreter is looked for (THE PROBE WITHOUT PYTHON, at cmd_execution_slot_probe).
 case "${1:-}" in
@@ -257,8 +257,6 @@ case "${1:-}" in
       done
     fi
     if [ -z "$fw_probe" ]; then
-      if [ -n "${PYTHONPATH+set}" ]; then LUDICS_FW_PYTHONPATH="=$PYTHONPATH"; else LUDICS_FW_PYTHONPATH=""; fi
-      export LUDICS_FW_PYTHONPATH
       exec "$(CDPATH='' cd -P "$(dirname "$0")/../.." 2>/dev/null && pwd -P)/scripts/py" -m ludics.fleetworker "$0" "$@"
     fi ;;
 esac
@@ -2444,8 +2442,6 @@ cmd_execution_slot_probe() {
     shift
   done
   if [ -z "$probe" ]; then
-    if [ -n "${PYTHONPATH+set}" ]; then LUDICS_FW_PYTHONPATH="=$PYTHONPATH"; else LUDICS_FW_PYTHONPATH=""; fi
-    export LUDICS_FW_PYTHONPATH
     exec "$CHECKOUT/scripts/py" -m ludics.fleetworker "$0" execution "${all[@]}"
   fi
   [ -z "$bg" ] || die "execution slot: --probe takes no --bg; it runs nothing"

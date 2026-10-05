@@ -23,22 +23,6 @@ from ludics.postmergecleanup.options import PROG
 # stays alive beside it, and one whose working directory is the session would keep Windows from
 # renaming the session into its archive (ludics-lite#393).
 CALLER_CWD = "LUDICS_CALLER_CWD"
-# The caller's LC_CTYPE, handed over by the forwarder: empty when it was unset, else ``=value``.
-# Python's C-locale coercion (PEP 538) exports LC_CTYPE=C.UTF-8 before any of this runs; the shell
-# helper's children never saw that, and its ``printf %q`` read the caller's locale.
-CALLER_LC_CTYPE = "LUDICS_CALLER_LC_CTYPE"
-
-
-def restore_caller_locale() -> None:
-    handed = os.environ.pop(CALLER_LC_CTYPE, None)
-    if handed is None:
-        return
-    if handed.startswith("="):
-        os.environ["LC_CTYPE"] = handed[1:]
-    else:
-        os.environ.pop("LC_CTYPE", None)
-
-
 class Signalled(BaseException):
     def __init__(self, signum: int) -> None:
         super().__init__(signum)
@@ -60,7 +44,6 @@ def scrub_git_environment() -> bool:
 
 
 def run(argv: list[str]) -> int:
-    restore_caller_locale()
     caller_cwd = os.environ.pop(CALLER_CWD, "")
     if caller_cwd and not system.chdir(caller_cwd):
         raise cli.Exit(1, f"could not return to the caller's working directory: {caller_cwd}")
@@ -78,7 +61,7 @@ def main() -> int:
         if signum is not None:
             signal.signal(signum, on_signal)
     try:
-        return cli.main_guard(PROG, run, sys.argv[1:])
+        return cli.main(PROG, run)
     except (Signalled, KeyboardInterrupt) as stop:
         signum = stop.signum if isinstance(stop, Signalled) else int(signal.SIGINT)
         if os.name != "nt":

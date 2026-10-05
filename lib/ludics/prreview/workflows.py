@@ -31,7 +31,6 @@ from ludics.prreview.shtext import (
 
 CONTENTS_DIR_CAP_DEFAULT = 1000
 IGNORE_MAX_COMMITS_DEFAULT = 20
-# SHARED-CANDIDATE: HEAD_INERT_EVENTS
 HEAD_INERT_EVENTS = ("workflow_call", "merge_group")
 
 @dataclass(frozen=True)
@@ -62,7 +61,6 @@ class Reads:
         result = self.session.retry("read", args)
         return result.stdout if isinstance(result, GhOk) else None
 
-    # SHARED-CANDIDATE: workflow_path
     def workflow_path(self, wid: str) -> str | None:
         wpath = self.read(["api", f"repos/{self.repo}/actions/workflows/{wid}", "--jq", '.path // ""'])
         if wpath is None:
@@ -71,7 +69,6 @@ class Reads:
             return None
         return wpath
 
-    # SHARED-CANDIDATE: workflow_body
     def workflow_body(self, path: str, ref: str) -> str | None:
         body = self.read(
             [
@@ -83,7 +80,6 @@ class Reads:
         )
         return body if body else None
 
-    # SHARED-CANDIDATE: workflow_files_at
     def workflow_files_at(self, ref: str) -> list[str] | None:
         raw = self.read(
             [
@@ -104,7 +100,6 @@ class Reads:
         files = [line for line in raw.split("\n") if re.search(r"\.ya?ml$", line)]
         return files or None
 
-    # SHARED-CANDIDATE: commit_files
     def commit_files(self, sha: str) -> list[str] | None:
         raw = self.read(
             [
@@ -122,7 +117,6 @@ class Reads:
             return None
         return nonempty_lines(raw.replace("\t", "\n"))
 
-    # SHARED-CANDIDATE: range_files
     def range_files(self, vsha: str, tip: str) -> list[str] | None:
         cap = self.limits.ignore_max_commits
         cmp = self.read(
@@ -175,7 +169,6 @@ class Reads:
             return None
         return [f for f in out if f]
 
-    # SHARED-CANDIDATE: providers_are_actions_only
     def providers_are_actions_only(self) -> bool:
         sample = self.read(
             [
@@ -217,7 +210,6 @@ class Reads:
         return seen > 0
 
 
-# SHARED-CANDIDATE: head_within_paths_ignore
 def head_within_paths_ignore(reads: Reads, pr: str, head: str, base: str, ref: str) -> str | None:
     """``head_within_paths_ignore``: the names of the workflows that explain why NO run can be
     created for this PR head (the settle line's PATHS_IGNORE_WHY), or None when that is not

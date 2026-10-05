@@ -41,11 +41,8 @@ MINGW* | MSYS* | CYGWIN*)
   cd / || exit 1
   ;;
 esac
-# Python coerces a C locale (PEP 538) by exporting LC_CTYPE=C.UTF-8, which Git, its hooks and the
-# helper's %q rendering would all read; the caller's LC_CTYPE goes over to be restored: empty when
-# it was unset, else `=` and its value.
-LUDICS_CALLER_LC_CTYPE="${LC_CTYPE+=}${LC_CTYPE-}"
-export LUDICS_CALLER_LC_CTYPE
+# The caller's LC_CTYPE reaches Git, its hooks and the helper's %q rendering untouched: scripts/py
+# turns Python's C-locale coercion (PEP 538) off for every entry point (PYTHONCOERCECLOCALE=0).
 exec "$py" -m ludics.postmergecleanup "$@"
 exit "$?"
 }

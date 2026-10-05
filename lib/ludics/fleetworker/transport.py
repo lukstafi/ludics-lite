@@ -47,18 +47,15 @@ class Done:
         return self.rc == UNREACHABLE
 
 
-# SHARED-CANDIDATE: is_local
 def is_local(cfg: Config, box: str) -> bool:
     return box == "local" or (cfg.local_box != "" and box == cfg.local_box)
 
 
-# SHARED-CANDIDATE: fleet_name
 def fleet_name(cfg: Config, box: str) -> str:
     """A configured box as a fleet name: ``local`` is this box's own name, when it has one."""
     return cfg.local_box if box == "local" and cfg.local_box else box
 
 
-# SHARED-CANDIDATE: emit_var
 def emit_var(name: str, value: str) -> str:
     """A far-side assignment: a leading literal ``$HOME/`` stays expandable there, the rest quoted."""
     if value.startswith("$HOME/"):
@@ -101,7 +98,6 @@ release_lock() { rm -f "$1/pid" "$1/start"; rmdir "$1" 2>/dev/null; }
 """
 
 
-# SHARED-CANDIDATE: prelude
 def prelude(cfg: Config, box: str) -> str:
     """What every far-side script here starts with: BOX is the name the coordinator addressed the
     box by, so every line it prints is greppable by that name."""
@@ -146,7 +142,6 @@ def run(
     return Done(proc.returncode, text)
 
 
-# SHARED-CANDIDATE: run_on
 def run_on(cfg: Config, box: str, script: str, args: Sequence[str], *, capture: bool = False) -> Done:
     """Run ``script`` (on stdin) on the box, ``args`` as its $1..: a local ``bash -s`` here, ``bash -s``
     over ssh for any other box, its arguments quoted for the remote login shell (bash on every box)."""

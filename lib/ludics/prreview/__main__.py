@@ -102,7 +102,7 @@ def dispatch(argv: list[str]) -> int:
 
 
 def main() -> int:
-    return cli.main_guard(PROG, dispatch, sys.argv[1:])
+    return cli.main(PROG, dispatch)
 
 
 if __name__ == "__main__":

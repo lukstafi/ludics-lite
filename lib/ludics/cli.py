@@ -8,8 +8,9 @@ name the way the shell printed it, and the status.
 
 import io
 import os
+import signal
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from typing import NoReturn
 
 
@@ -62,29 +63,61 @@ def note(prog: str, text: str) -> None:
 
 
 def main_guard(prog: str, run: Callable[[list[str]], int], argv: list[str]) -> int:
-    """Run ``run(argv)``; an ``Exit`` from anywhere inside becomes its message and status."""
+    """Run ``run(argv)``; an ``Exit`` from anywhere inside becomes its message and status. stdout is
+    flushed before the status is returned, so a reader that went away is noticed here, where it
+    ends the command as it ended the shell's ``printf`` (``die_of_sigpipe``)."""
     setup_streams()
     try:
         try:
-            return run(argv)
+            rc = run(argv)
         except Exit as end:
             if end.message:
                 sys.stdout.flush()
                 sys.stderr.write(end.message + "\n" if end.raw else f"{prog}: {end.message}\n")
                 sys.stderr.flush()
-            return end.rc
+            rc = end.rc
+        sys.stdout.flush()
+        return rc
     except BrokenPipeError:
-        return broken_pipe(prog)
+        return die_of_sigpipe()
 
 
-def broken_pipe(prog: str) -> int:
-    """stdout's reader closed early (``| head -1``). The shell's ``printf`` died of SIGPIPE there:
-    exit 141 (128 + 13), never a status this CLI gives a meaning -- 1 says the API rejected the
-    call. stdout is pointed at the null device so the interpreter's own flush at exit cannot fail
-    a second time with a traceback."""
+def die_of_sigpipe() -> int:
+    """stdout's reader went away (``| head -1``): end as the shell's ``printf`` did, killed by
+    SIGPIPE -- the caller's ``$?`` (or pipefail) reads 141, and nothing is printed. Python ignores
+    SIGPIPE and raises BrokenPipeError instead, and would end in a traceback and exit 120 from its
+    flush at shutdown; 1 would be worse, since this CLI says the API rejected a call with it. stdout
+    is pointed at the null device first so no later flush can fail again. Where there is no
+    SIGPIPE (Windows), the status is returned instead."""
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, sys.stdout.fileno())
     os.close(devnull)
-    sys.stderr.write(f"{prog}: printf: write error: Broken pipe\n")
-    sys.stderr.flush()
-    return 141
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGPIPE)
+    return 128 + 13
+
+
+# scripts/py's note of the caller's PYTHONPATH: ``=<value>`` when it was set, empty when not.
+CALLER_PYTHONPATH = "LUDICS_CALLER_PYTHONPATH"
+
+
+def restore_caller_environment(env: MutableMapping[str, str]) -> None:
+    """Put back the PYTHONPATH scripts/py replaced with the checkout's lib/, so every program an
+    entry point runs -- a batch under ``fleet-worker.sh execution slot``, git's hooks, a fixture's
+    gh -- sees the caller's environment, not the ``ludics`` package. This process's own path was
+    fixed at startup. A run not through scripts/py has no note, and keeps what it has."""
+    saved = env.pop(CALLER_PYTHONPATH, None)
+    if saved is None:
+        return
+    if saved.startswith("="):
+        env["PYTHONPATH"] = saved[1:]
+    else:
+        env.pop("PYTHONPATH", None)
+
+
+def main(prog: str, run: Callable[[list[str]], int]) -> int:
+    """An entry point's ``main``: the caller's environment back, then ``run`` under ``main_guard``
+    with this process's arguments."""
+    restore_caller_environment(os.environ)
+    return main_guard(prog, run, sys.argv[1:])

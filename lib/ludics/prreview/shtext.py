@@ -17,10 +17,11 @@ from ludics.prreview.core import Json
 
 
 def tab_fields(line: str, n: int) -> list[str]:
-    """``IFS=$'\\t' read -r f1 .. fn <<<"$line"``: tab is IFS WHITESPACE, so leading and trailing
-    tabs are dropped and a run of them is one delimiter; the last field takes the rest of the line
-    (its inner tabs kept). Always ``n`` fields, the missing ones empty."""
-    rest = line.strip("\t")
+    """``IFS=$'\\t' read -r f1 .. fn <<<"$line"``: read takes the first line only; tab is IFS
+    WHITESPACE, so leading and trailing tabs are dropped and a run of them is one delimiter; the last
+    field takes the rest of the line (its inner tabs kept). Always ``n`` fields, the missing ones
+    empty. The one port of that read, for every subcommand."""
+    rest = line.split("\n", 1)[0].strip("\t")
     out: list[str] = []
     for _ in range(n - 1):
         if not rest:
@@ -77,7 +78,6 @@ def placeholder(field: str) -> str:
     return "" if field in ("", "-") else field
 
 
-# SHARED-CANDIDATE: encode_ref
 def encode_ref(ref: str) -> str:
     """``encode_ref``: a branch name as data in a REST path or query -- every byte outside
     ``[a-zA-Z0-9._~/-]`` percent-encoded, upper-case hex, ``/`` kept literal."""

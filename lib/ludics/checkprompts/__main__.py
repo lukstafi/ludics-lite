@@ -130,7 +130,7 @@ def run(argv: list[str]) -> int:
 
 
 def main() -> int:
-    return cli.main_guard(PROG, run, sys.argv[1:])
+    return cli.main(PROG, run)
 
 
 if __name__ == "__main__":

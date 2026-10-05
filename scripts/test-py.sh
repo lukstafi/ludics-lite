@@ -40,7 +40,8 @@ ko() {
 }
 
 # fake <path> <version> <probe exit>: an "interpreter" that answers the probe with <version> and
-# <probe exit>, and otherwise logs its arguments (one per line) and PYTHONPATH to <path>.log.
+# <probe exit>, and otherwise logs its arguments (one per line) and PYTHONPATH to <path>.log, and
+# the caller's PYTHONPATH as scripts/py noted it to <path>.caller.
 fake() {
   mkdir -p "$(dirname "$1")"
   cat >"$1" <<EOF
@@ -50,6 +51,7 @@ if [ "\$1" = -c ]; then
   exit $3
 fi
 { for a in "\$@"; do printf 'arg:%s\n' "\$a"; done; printf 'PYTHONPATH:%s\n' "\$PYTHONPATH"; } >"$1.log"
+printf 'caller:%s\n' "\${LUDICS_CALLER_PYTHONPATH-unset}" >"$1.caller"
 exit 0
 EOF
   chmod +x "$1"
@@ -115,6 +117,19 @@ case "$(cat "$TMP/bin/newer.log" 2>/dev/null)" in
 *"PYTHONPATH:$ROOT/lib") ok "an inherited PYTHONPATH is replaced by lib/" ;;
 *) ko "PYTHONPATH was not exactly lib/: $(cat "$TMP/bin/newer.log" 2>/dev/null)" ;;
 esac
+# ...and noted, so the entry point can put it back for the programs it runs (ludics.cli): `=` and
+# the value when it was set (empty included), nothing at all when it was not.
+[ "$(cat "$TMP/bin/newer.caller" 2>/dev/null)" = "caller:=$TMP/elsewhere" ] &&
+  ok "the caller's PYTHONPATH is noted for the entry point" ||
+  ko "the caller's PYTHONPATH note: $(cat "$TMP/bin/newer.caller" 2>/dev/null)"
+LUDICS_PY_CANDIDATES="$TMP/bin/newer" PYTHONPATH="" "$PY" -c x >/dev/null 2>&1
+[ "$(cat "$TMP/bin/newer.caller" 2>/dev/null)" = "caller:=" ] &&
+  ok "an empty PYTHONPATH is noted as set and empty" ||
+  ko "an empty PYTHONPATH's note: $(cat "$TMP/bin/newer.caller" 2>/dev/null)"
+(unset PYTHONPATH; LUDICS_PY_CANDIDATES="$TMP/bin/newer" "$PY" -c x >/dev/null 2>&1)
+[ "$(cat "$TMP/bin/newer.caller" 2>/dev/null)" = "caller:" ] &&
+  ok "an unset PYTHONPATH is noted as unset" ||
+  ko "an unset PYTHONPATH's note: $(cat "$TMP/bin/newer.caller" 2>/dev/null)"
 
 # The built-in list on this box: a real interpreter >= 3.12 is found.
 out=$("$PY" -c 'import sys; print(sys.version_info >= (3, 12))' 2>&1)

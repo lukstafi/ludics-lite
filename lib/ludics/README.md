@@ -26,8 +26,12 @@ porters: where code goes, how a subcommand is forwarded, and how to check it.
 
 ```
 scripts/py                       the interpreter wrapper: the first Python >= 3.12, run as
-                                 `-X utf8 -P` with PYTHONPATH=lib (scripts/test-py.sh)
-lib/ludics/cli.py                shared by every entry point: Exit, main_guard, say/emit/note
+                                 `-X utf8 -P` with PYTHONPATH=lib, the caller's own PYTHONPATH
+                                 noted in LUDICS_CALLER_PYTHONPATH (scripts/test-py.sh)
+lib/ludics/cli.py                shared by every entry point: Exit, main (the caller's
+                                 PYTHONPATH back, then main_guard), main_guard (an Exit's message
+                                 and status; a closed stdout ends the command by SIGPIPE, 141, as
+                                 it ended the shell's printf), say/emit/note
 lib/ludics/proc.py               run_tool and the shell bridge
 lib/ludics/prreview/core.py      pr-review.sh's prelude: fail/die/warn, Config, GhSession
                                  (gh_retry and its classification), parse_ref/pr_arg,
@@ -37,6 +41,25 @@ lib/ludics/prreview/__main__.py  the dispatcher: `scripts/py -m ludics.prreview 
 lib/ludics/<script>/             the next script's package (e.g. checkprompts/, fleetworker/),
                                  with its own __main__.py
 lib/ludics/tests/test_*.py       unittest suites (fake.py: a fake tool first on PATH)
+```
+
+The helpers more than one `pr-review.sh` subcommand reads are ported once, in a module of their own:
+
+```
+prreview/jqsem.py          jq's value semantics, order and regex dialect, for every ported jq program
+prreview/shtext.py         the shell's readings of text (`IFS=$'\t' read`, `${x#*$'\n'}`), encode_ref
+prreview/clock.py          the clock (SHIP_PR_TEST_CLOCK) and newest/age_of/freshest_age/fmt_age
+prreview/knobs.py          the source-time constants beyond the core's, one forward name each
+prreview/feeds.py          the feeds, the round snapshot, pr_head_read, substantive_reviews
+prreview/state.py          status_state, status_line, approval_gate, gated_state, review_rounds
+prreview/poll.py           cmd_poll (poll, and every watch round)
+prreview/threads.py        the review-threads walk and the open-thread gate (resolve, status, merge)
+prreview/drift.py          warn_base_drift (merge, watch)
+prreview/checkruns.py      conclusion_class, newest_first
+prreview/ere.py            the advisory list, asked of grep (is_advisory, ere_valid)
+prreview/gate.py           gate_checks (checks, merge, and base's merged-head source)
+prreview/workflows.py      the workflow-file reads and the paths-ignore walk (checks/merge, base)
+prreview/workflow_yaml.py  the narrow workflow-YAML readers and the glob translation
 ```
 
 A script other than `pr-review.sh` gets a sibling package, `lib/ludics/<script>/`, run as
@@ -80,17 +103,13 @@ that exports it drives either implementation; test-pr-review-watch.sh runs every
 
 ## Helpers shared across subcommands
 
-Port what your subcommand needs into **your own module**, even when another subcommand will need
-it too, and mark it on the line above the definition:
-
-```python
-# SHARED-CANDIDATE: status_state
-def status_state(...) -> ...:
-```
-
-naming the shell function it ports. Do not edit another porter's module or move code into
-`core.py` yourself: the integrator consolidates the candidates into core once the parallel ports
-land, which keeps concurrent ports from conflicting.
+A port needs a helper another port already has: import it from the module above (or from
+`core.py`), never port it a second time. During a wave of parallel ports, each porter ported what
+its subcommand needed into its own module and marked it `# SHARED-CANDIDATE: <shell function>`;
+the integration consolidated those into the modules above, one implementation each, and removed
+the markers. Two remain, in `postmergecleanup/`, on purpose (`git grep SHARED-CANDIDATE` lists
+them with their reasons): its `printf %q` (bash 5's rules, computed) beside `core.shell_quote`
+(which asks the running bash), and its signal-safe process runner beside `proc.run_tool`.
 
 ## Checking
 

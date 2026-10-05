@@ -18,13 +18,11 @@ from ludics.fleetworker.config import Config
 PROG = "fleet-worker.sh"
 
 
-# SHARED-CANDIDATE: die
 def die(*parts: str) -> NoReturn:
     """``die``: ``fleet-worker.sh: <message>`` on stderr, exit 2."""
     cli.exit_with(2, *parts)
 
 
-# SHARED-CANDIDATE: coordinator_id
 def coordinator_id(cfg: Config) -> str:
     env = cfg.env
     if env.get("FLEET_COORDINATOR"):
@@ -36,7 +34,6 @@ def coordinator_id(cfg: Config) -> str:
     return ""
 
 
-# SHARED-CANDIDATE: check_identity
 def check_identity(cfg: Config) -> str:
     """The identity, which is used verbatim as the token file's name, so it must be injective: no
     folding of characters. Refuses (exit 2) when there is none or it is unsafe."""
@@ -51,12 +48,10 @@ def check_identity(cfg: Config) -> str:
     return ident
 
 
-# SHARED-CANDIDATE: token_file
 def token_file(cfg: Config) -> str:
     return f"{cfg.path(cfg.state)}/tokens/{coordinator_id(cfg)}"
 
 
-# SHARED-CANDIDATE: my_token
 def my_token(cfg: Config) -> str:
     """``cat "$(token_file)"``: the token, trailing newlines dropped; empty when unreadable."""
     try:
@@ -66,7 +61,6 @@ def my_token(cfg: Config) -> str:
         return ""
 
 
-# SHARED-CANDIDATE: gen_uuid
 def gen_uuid() -> str:
     """A fresh lowercase UUID: a halt's identity, a lease token."""
     return str(uuid.uuid4())

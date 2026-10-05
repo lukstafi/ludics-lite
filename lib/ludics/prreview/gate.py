@@ -104,8 +104,8 @@ class RunSignal:
     reason: str
 
 
-# SHARED-CANDIDATE: gate_checks (with build_checks, summarize_checks, run_signal, apply_waiver):
-# `base`'s tip_pr_head_verdict judges a merged PR's head through the same gate.
+# `gate_checks` (with build_checks, summarize_checks, run_signal, apply_waiver), ported once: `checks`,
+# `merge`, and `base`'s tip_pr_head_verdict (a merged PR's head) judge through this gate.
 @dataclass
 class Gate:
     """One command's build gate. The attributes are the shell's globals of the same name, which
@@ -130,7 +130,7 @@ class Gate:
     check_lines: str = ""
     waive_mode: Literal["", "record", "apply"] = ""
     waived: set[str] = field(default_factory=lambda: set[str]())
-    _advisory_seen: dict[tuple[str, str], bool] = field(default_factory=lambda: dict[tuple[str, str], bool]())
+    _advisory: ere.Advisory | None = None
 
     def __post_init__(self) -> None:
         if not self.advisory:
@@ -138,15 +138,12 @@ class Gate:
 
     # --- the advisory list ---------------------------------------------------------------------------
 
-    # SHARED-CANDIDATE: is_advisory
     def is_advisory(self, name: str) -> bool:
-        """``is_advisory``: grep matches the name against the advisory ERE (a pattern grep refuses
-        matches nothing, as in the shell). One process's answers are kept: a wait loop asks the same
-        names every round, and grep's answer for a pattern, a name and an environment is fixed."""
-        key = (self.advisory, name)
-        if key not in self._advisory_seen:
-            self._advisory_seen[key] = ere.matches(self.advisory, name)
-        return self._advisory_seen[key]
+        """``is_advisory`` (ere.Advisory) under the list this gate holds now: ``advisory_policy``
+        may replace it with the repository's own."""
+        if self._advisory is None or self._advisory.pattern != self.advisory:
+            self._advisory = ere.Advisory(self.advisory)
+        return self._advisory(name)
 
     def advisory_policy(self) -> int:
         """``advisory_policy``: the advisory list from the repository's ADVISORY_FILE on its default
@@ -717,7 +714,6 @@ class Gate:
                 return 0
 
 
-# SHARED-CANDIDATE: advisory_parse
 def advisory_parse(text: str, where: str) -> str | None:
     """``advisory_parse``: the file's ERE lines joined by ``|`` (blank lines, ``#`` comments and a
     trailing CR aside), or None -- having said why -- for a file that is not such a list: no ERE

@@ -3,8 +3,8 @@ end to end (``scripts/py`` and the shell script's ``main``) with a fake gh BINAR
 
 The fixture suites (ship-pr/scripts/test-pr-review-base-*.sh) pin the command through the sourced
 function and the shell bridge; what is here pins what they cannot reach: the readers' boundaries
-one input at a time, the wait loop on a fake clock (no real sleeping), and the source-(a) gate run
-in the SOURCED script rather than in the bridge state, which is how production runs it.
+one input at a time, the wait loop on a fake clock (no real sleeping), and the source-(a) gate
+(gate.Gate) reading through the gh on PATH, which is how production runs it.
 """
 
 import io
@@ -20,9 +20,10 @@ from contextlib import redirect_stderr, redirect_stdout
 
 from ludics import cli, proc
 from ludics.prreview import base
+from ludics.prreview.ere import Advisory
 from ludics.prreview.workflow_yaml import glob_ere, paths_ignore_covers, workflow_filter, workflow_keys
 from ludics.prreview.checkruns import newest_first
-from ludics.prreview.shtext import encode_ref
+from ludics.prreview.shtext import encode_ref, tab_fields
 from ludics.prreview.clock import FuncClock
 from ludics.prreview.core import Config, GhRefusedOwn, GhSession
 
@@ -124,18 +125,18 @@ class Readers(unittest.TestCase):
                          "an untranslatable pattern fails the whole question, even beside a match")
 
     def test_the_advisory_ere_reads_posix_classes(self) -> None:
-        adv = base.Advisory("^(claude|Claude Code|github pages docs)$")
+        adv = Advisory("^(claude|Claude Code|github pages docs)$")
         self.assertTrue(adv("Claude Code"))
         self.assertFalse(adv("ci"))
-        self.assertTrue(base.Advisory("^[[:alpha:]]+ docs$")("pages docs"))
-        self.assertFalse(base.Advisory("(unclosed")("anything"), "an ERE grep refuses matches nothing")
+        self.assertTrue(Advisory("^[[:alpha:]]+ docs$")("pages docs"))
+        self.assertFalse(Advisory("(unclosed")("anything"), "an ERE grep refuses matches nothing")
 
     def test_the_advisory_ere_reads_grep_word_anchors(self) -> None:
         # grep -E (BSD and GNU) reads \< and \> as word anchors; Python's re reads literal < and >.
-        self.assertTrue(base.Advisory("\\<claude\\>")("claude review"))
-        self.assertTrue(base.Advisory("^claude\\>")("claude"))
-        self.assertFalse(base.Advisory("\\<claude\\>")("xclaude review"))
-        self.assertFalse(base.Advisory("^claude\\>")("claudex"))
+        self.assertTrue(Advisory("\\<claude\\>")("claude review"))
+        self.assertTrue(Advisory("^claude\\>")("claude"))
+        self.assertFalse(Advisory("\\<claude\\>")("xclaude review"))
+        self.assertFalse(Advisory("^claude\\>")("claudex"))
 
 
 def row(wid: str, concl: str, sha: str, rid: str, created: str = "2026-09-10T00:00:00Z",
@@ -159,7 +160,7 @@ class Folding(unittest.TestCase):
         self.assertEqual((f2.wfid, f2.vconcl), ("2", "success"))
 
     def test_records_are_read_as_bash_read_them(self) -> None:
-        self.assertEqual(base.ifs_tab_fields("\ta\t\tb\tc\td\te\t", 4), ["a", "b", "c", "d\te"])
+        self.assertEqual(tab_fields("\ta\t\tb\tc\td\te\t", 4), ["a", "b", "c", "d\te"])
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".tsv") as f:
             f.write(f"\n{C}\tpass\tw-1\t2026-09-26T09:00:00Z\n\n{C}\tfail\tw-2\t2026-09-26T10:00:00Z")
         try:
@@ -176,7 +177,8 @@ type Answer = str | tuple[int, str]
 
 class Endpoints:
     """A gh stand-in for GhSession: answers by the endpoint (the first argument after ``api`` that
-    is not an option or an option's value) and records every endpoint asked."""
+    is not an option or an option's value), applies a ``--jq`` filter with jq as gh does, and
+    records every endpoint asked."""
 
     def __init__(self, answers: dict[str, Answer]) -> None:
         self.answers = answers
@@ -185,23 +187,29 @@ class Endpoints:
     def __call__(self, name: str, args: Sequence[str]) -> proc.Completed:
         assert name == "gh" and args[0] == "api", args
         endpoint = ""
+        jq = ""
         skip = False
-        for arg in args[1:]:
+        for i, arg in enumerate(args[1:], 1):
             if skip:
                 skip = False
                 continue
             if arg in ("-H", "--jq", "-X"):
+                if arg == "--jq":
+                    jq = args[i + 1]
                 skip = True
                 continue
-            if arg.startswith("-"):
+            if arg.startswith("-") or endpoint:
                 continue
             endpoint = arg
-            break
         self.asked.append(endpoint)
         answer = self.answers.get(endpoint)
         if answer is None:
             return proc.Completed(1, "", f"gh: no fixture for {endpoint} (HTTP 404)\n")
         if isinstance(answer, str):
+            if jq:
+                done = subprocess.run(["jq", "-r", jq], input=answer, capture_output=True, text=True,
+                                      check=False)
+                return proc.Completed(done.returncode, done.stdout, done.stderr)
             return proc.Completed(0, answer + "\n", "")
         rc, err = answer
         return proc.Completed(rc, "", err)
@@ -240,7 +248,7 @@ KNOBS = {"SHIP_PR_BASE_ABSENT_GRACE": "300", "SHIP_PR_CHECKS_INTERVAL": "60",
 
 
 def base_run(answers: dict[str, Answer], args: list[str], *, clock: FakeClock | None = None,
-             shell: base.ShellRunner | None = None,
+             gate: base.GateRunner | None = None,
              knobs: dict[str, str] | None = None) -> tuple[int, str, str, Endpoints]:
     gh = Endpoints(answers)
     session = GhSession(config(), run=gh, sleep=lambda _s: None)
@@ -248,7 +256,7 @@ def base_run(answers: dict[str, Answer], args: list[str], *, clock: FakeClock | 
     env = dict(KNOBS, **(knobs or {}))
     with redirect_stdout(out), redirect_stderr(err):
         rc = cli.main_guard("pr-review.sh", lambda a: base.run(session, a, clock=clock or FakeClock(),
-                                                                shell=shell, env=env), args)
+                                                                gate=gate, env=env), args)
     return rc, out.getvalue(), err.getvalue(), gh
 
 
@@ -334,37 +342,37 @@ def pushless_world() -> dict[str, Answer]:
     })
 
 
-def gate_shell(verdict: str, line: str, *, refuse: str = "") -> base.ShellRunner:
-    def shell(name: str, args: Sequence[str]) -> proc.Completed:
-        scratch = args[5]
+def gate_stub(verdict: str, line: str, *, refuse: str = "") -> base.GateRunner:
+    """Source (a)'s gate, answered: its VERDICT and build-signal line, or a refusal of its own gh
+    call (which ends the command, as it ends the gate)."""
+    def gate(_num: str) -> base.GateSignal | None:
         if refuse:
-            with open(os.path.join(scratch, "refused"), "w", encoding="utf-8") as f:
-                f.write(refuse + "\n")
-        return proc.Completed(0, f"build signal {line}\n\n0\t{verdict}\n", "")
-    return shell
+            raise GhRefusedOwn(refuse)
+        return base.GateSignal(verdict, line)
+    return gate
 
 
 class NamedSources(unittest.TestCase):
     def test_a_clean_merge_of_a_green_head_judges_a_retired_workflow(self) -> None:
         rc, out, _, _ = base_run(pushless_world(), ["main"],
-                                 shell=gate_shell("green", "o/r#7 @eeeeeeee: green — 1 build checks passed"))
+                                 gate=gate_stub("green", "o/r#7 @eeeeeeee: green — 1 build checks passed"))
         self.assertEqual(rc, 0, out)
         self.assertIn(f"o/r main: green (tip {C[:8]}; ci judged by PR #7's head run (roll-forward rule))", out)
         self.assertIn("(roll-forward rule): o/r#7 @eeeeeeee: green — 1 build checks passed", out)
 
     def test_a_gate_verdict_outside_the_vocabulary_is_unknown(self) -> None:
-        rc, _, err, _ = base_run(pushless_world(), ["main"], shell=gate_shell("superseded", "x"))
+        rc, _, err, _ = base_run(pushless_world(), ["main"], gate=gate_stub("superseded", "x"))
         self.assertEqual(rc, 3)
         self.assertIn("could not read a verdict source for o/r main's tip", err)
 
-    def test_a_refusal_inside_the_shell_gate_ends_the_command_with_two(self) -> None:
+    def test_a_refusal_inside_the_gate_ends_the_command_with_two(self) -> None:
         message = "pr-review.sh: the installed gh refused this script's own call"
         with self.assertRaises(GhRefusedOwn):
             gh = Endpoints(pushless_world())
             b = base.Base(GhSession(config(), run=gh), base.load_knobs(KNOBS), "o/r",
-                          shell=gate_shell("green", "x", refuse=message))
+                          gate=gate_stub("green", "x", refuse=message))
             b.tip_pr_head_verdict("main", C, [])
-        rc, _, err, _ = base_run(pushless_world(), ["main"], shell=gate_shell("green", "x", refuse=message))
+        rc, _, err, _ = base_run(pushless_world(), ["main"], gate=gate_stub("green", "x", refuse=message))
         self.assertEqual((rc, err), (2, message + "\n"))
 
 
@@ -436,7 +444,7 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual((done.returncode, done.stderr), (0, ""))
                 self.assertEqual(done.stdout.splitlines()[0], f"o/r main: green (tip {C[:8]})")
 
-    def test_source_a_runs_the_checks_gate_in_the_sourced_script(self) -> None:
+    def test_source_a_runs_the_checks_gate_through_the_gh_on_path(self) -> None:
         answers = pushless_world()
         answers.update({
             "repos/o/r/pulls/7": json.dumps({"head": {"sha": H, "ref": "claude/topic"},

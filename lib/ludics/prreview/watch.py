@@ -41,9 +41,9 @@ from ludics.prreview.core import (
 )
 from ludics.prreview.clock import Clock, clock_from_env, fmt_age
 from ludics.prreview.drift import warn_base_drift
-from ludics.prreview.watch_feeds import Ctx, pr_head_read
-from ludics.prreview.watch_poll import poll
-from ludics.prreview.watch_state import (
+from ludics.prreview.feeds import Ctx, pr_head_read
+from ludics.prreview.poll import poll
+from ludics.prreview.state import (
     Rounds,
     State,
     approval_gate,
@@ -142,7 +142,6 @@ def item_about_head(stamp: str, head: str) -> bool:
     return head.startswith(stamp) or stamp.startswith(head)
 
 
-# SHARED-CANDIDATE: tmp_sweep_stale
 def tmp_sweep_stale(env: Mapping[str, str]) -> None:
     """Remove what a SIGKILLed run left in TMPDIR: every family keyed by an owning pid that is no
     longer alive, this user's only. A name with no pid in it names no owner and is left alone.

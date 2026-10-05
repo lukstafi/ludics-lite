@@ -7,9 +7,9 @@ paths-ignore settle (``range_files``, ``commit_files``, ``commits_ignored``,
 (``tip_pr_head_verdict``, ``tip_named_source``). The shell's comments carry the incident history
 of every rule here; this file keeps the load-bearing ones, and the shell region they came from
 (``cmd_base`` and the helpers above it, in ship-pr/scripts/pr-review.sh at c856bb0, the v2 branch
-point) is where to read the rest. The helpers ``base`` shares with ``checks``/``merge``
-(``range_files``, ``commit_files``, the workflow-file readers) are still served by shell for
-those subcommands; their ports here are marked SHARED-CANDIDATE.
+point) is where to read the rest. The helpers ``base`` shares with ``checks``/``merge`` -- the
+workflow-file readers, ``range_files`` and ``commit_files`` (workflows.Reads), the advisory list
+(ere.Advisory) and the gate itself (gate.Gate) -- are ported once, there.
 
 WHY ``base`` EXISTS, and why ``--wait``. The other half of ahrefs/ocannl#694: the confusion lands
 on whoever branches off a broken master, so the base's own CI is read before work starts, not
@@ -30,28 +30,30 @@ Stdout: the verdict line, then one line per workflow (and its notes). Exit: 0 gr
 green under --interim included); 1 red; 2 usage or configuration; 3 UNKNOWN (a read the verdict
 rests on failed); 4 no verdict (nothing ran, nothing judged the tip, or --wait ran out).
 
-One dependency stays shell: the merged PR head's build signal (source (a)) is ``gate_checks``,
-the ``checks`` subcommand's gate, which this unit does not port. It is run in the shell that
-defines it (``_shell_gate_checks``), exactly as ``tip_pr_head_verdict`` ran it, in a subshell with
-its stderr dropped. When ``checks`` is served by Python this becomes a call.
+The merged PR head's build signal (source (a)) is ``gate_checks``, the ``checks`` subcommand's
+gate (gate.Gate), run as ``tip_pr_head_verdict`` ran it: no wait, under this command's advisory
+list, its report captured and its stderr dropped.
 """
 
+import contextlib
+import io
 import math
 import os
 import re
 import sys
-import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Literal, assert_never
 
 from ludics import cli, proc
-from ludics.prreview import ere, jqsem
+from ludics.prreview import jqsem
 from ludics.prreview import knobs
+from ludics.prreview.ere import Advisory
+from ludics.prreview.gate import GateConfig, Gate, load_gate_config
+from ludics.prreview.workflows import Reads
 from ludics.prreview.checkruns import conclusion_class, newest_first
 from ludics.prreview.clock import FuncClock, age_of
-from ludics.prreview.shtext import encode_ref
+from ludics.prreview.shtext import encode_ref, tab_fields
 from ludics.prreview.workflow_yaml import paths_ignore_covers, workflow_filter, workflow_keys
 from ludics.prreview.core import (
     GhFailed,
@@ -72,10 +74,6 @@ from ludics.prreview.core import (
 # --- configuration --------------------------------------------------------------------------------
 
 _DEFAULT_ADVISORY = "^(claude|Claude Code|github pages docs)$"
-# How many commits the paths-ignore recognition reads one by one before it lets the grace answer.
-IGNORE_MAX_COMMITS = 20
-# How many entries the Contents API serves for a directory before it truncates.
-CONTENTS_DIR_CAP = 1000
 _DIGITS = re.compile(r"[0-9]+")
 _HEX = re.compile(r"[0-9a-f]+")
 
@@ -98,24 +96,6 @@ def load_knobs(env: Mapping[str, str]) -> Knobs:
     grace = knobs.absent_grace(env)
     timing = knobs.checks_timing(env)
     return Knobs(grace, timing.interval, timing.wait, timing.heartbeat, knobs.build_advisory(env))
-
-
-# --- the advisory list ------------------------------------------------------------------------------
-
-
-class Advisory:
-    """``is_advisory``: a name the list says carries no build verdict -- asked of ``grep -E`` itself,
-    as the shell asked it (ere.py says why a translation to ``re`` is not the same gate). One
-    process's answers are kept: the wait asks the same names every round."""
-
-    def __init__(self, pattern: str) -> None:
-        self._pattern = pattern
-        self._seen: dict[str, bool] = {}
-
-    def __call__(self, name: str) -> bool:
-        if name not in self._seen:
-            self._seen[name] = ere.matches(self._pattern, name)
-        return self._seen[name]
 
 
 # --- jq's renderings, which the shell's projections fixed -------------------------------------------
@@ -289,21 +269,6 @@ class Record:
         return "\t".join((self.sha, self.verdict, self.rid, self.when))
 
 
-def ifs_tab_fields(line: str, count: int) -> list[str]:
-    """``IFS=$'\\t' read -r a b c d``: tabs are IFS whitespace, so leading and trailing runs are
-    dropped and a run between fields is one separator; the last field keeps the rest."""
-    rest = line.strip("\t")
-    fields: list[str] = []
-    while len(fields) < count - 1 and rest:
-        head, sep, tail = rest.partition("\t")
-        fields.append(head)
-        rest = tail.lstrip("\t") if sep else ""
-    fields.append(rest)
-    while len(fields) < count:
-        fields.append("")
-    return fields
-
-
 _RECORD_SHA = re.compile(r"[0-9a-f]{40}")
 _RECORD_RID = re.compile(r"[A-Za-z0-9._-]+")
 _RECORD_WHEN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+Z-]+")
@@ -324,7 +289,7 @@ def load_records(path: str) -> list[Record]:
     records: list[Record] = []
     for index, line in enumerate(lines):
         last = index == len(lines) - 1
-        sha, verdict, rid, when = ifs_tab_fields(line, 4)
+        sha, verdict, rid, when = tab_fields(line, 4)
         # `read || [ -n "$rsha" ]`: an unterminated last line is a row when it has a first field.
         if last and not sha:
             continue
@@ -400,15 +365,16 @@ class Trigger:
 
 @dataclass(frozen=True)
 class GateSignal:
-    """What the shell's ``gate_checks`` left for ``tip_pr_head_verdict``: its VERDICT, its
-    ``build signal`` line, and the error line of its last failed read."""
+    """What ``gate_checks`` leaves for ``tip_pr_head_verdict``: its VERDICT and its ``build
+    signal`` line."""
 
     verdict: str
     line: str
-    err: str
 
 
-type ShellRunner = Callable[[str, Sequence[str]], proc.Completed]
+# ``gate_checks <pr> 0`` for source (a); None when it ended without a verdict. Injectable for the
+# unit tests, which judge the named sources without fixturing a whole gate.
+type GateRunner = Callable[[str], GateSignal | None]
 type Want = tuple[str, str]  # (workflow id, display name)
 
 
@@ -416,10 +382,6 @@ type Want = tuple[str, str]  # (workflow id, display name)
 
 
 # --- one `base` invocation --------------------------------------------------------------------------
-
-
-def _checkout() -> Path:
-    return Path(__file__).resolve().parents[3]
 
 
 @dataclass
@@ -471,17 +433,20 @@ class Base:
         repo: str,
         *,
         clock: FuncClock | None = None,
-        shell: ShellRunner | None = None,
+        gate_config: GateConfig | None = None,
+        gate: GateRunner | None = None,
         records: Sequence[Record] = (),
     ) -> None:
         self.session = session
         self.knobs = knobs
         self.repo = repo
         self.clock = clock if clock is not None else FuncClock()
-        self._shell: ShellRunner = shell if shell is not None else proc.run_tool
+        self.gate_config = gate_config if gate_config is not None else load_gate_config(os.environ)
+        self._gate: GateRunner = gate if gate is not None else self._gate_checks
         self.records = list(records)
         self.is_advisory = Advisory(knobs.advisory)
-        self._err_override: str | None = None
+        # The workflow-file readers and the paths-ignore walk, shared with checks/merge.
+        self.reads = Reads(session, repo, self.gate_config.limits, self.is_advisory)
         self._jobs_cache: dict[str, str] = {}
         self._trigger_cache: dict[str, Trigger] = {}
         self._ignore_cache: dict[str, bool] = {}
@@ -490,14 +455,10 @@ class Base:
 
     def gh(self, args: Sequence[str]) -> GhResult:
         """A READ through the session's retry policy."""
-        self._err_override = None
         return self.session.retry("read", args)
 
     def err_line(self) -> str:
-        """``gh_err_line``: the last failed read's first stderr line -- the shell gate's own, when
-        the last thing that read was the shell's ``gate_checks``."""
-        if self._err_override is not None:
-            return self._err_override
+        """``gh_err_line``: the last failed read's first stderr line (the gate's reads included)."""
         return self.session.err_line()
 
     def gh_json(self, args: Sequence[str]) -> Json | GhFailed | GhUnanswered:
@@ -609,44 +570,6 @@ class Base:
 
     # --- the workflow file ---
 
-    # SHARED-CANDIDATE: workflow_path
-    def workflow_path(self, wid: str) -> str | None:
-        """``workflow_path``: where that workflow's file lives -- one path, inside the repo."""
-        doc = self.gh_json(["api", f"repos/{self.repo}/actions/workflows/{wid}"])
-        if isinstance(doc, (GhFailed, GhUnanswered)):
-            return None
-        path = jq_raw(alt(get(doc, "path"), "")).rstrip("\n")
-        if not path or "\n" in path or "/../" in path or path.startswith("../") or path.startswith("/"):
-            return None
-        return path
-
-    # SHARED-CANDIDATE: workflow_body
-    def workflow_body(self, path: str, ref: str) -> str | None:
-        """``workflow_body``: the file's own text at that ref, under the raw media type."""
-        result = self.gh(["api", "-H", "Accept: application/vnd.github.raw",
-                          f"repos/{self.repo}/contents/{encode_ref(path)}?ref={ref}"])
-        match result:
-            case GhFailed() | GhUnanswered():
-                return None
-            case GhOk(stdout=body):
-                return body or None
-            case _:
-                assert_never(result)
-
-    # SHARED-CANDIDATE: workflow_files_at
-    def workflow_files_at(self, ref: str) -> list[str] | None:
-        """``workflow_files_at``: every YAML file directly under .github/workflows at that ref;
-        None when the listing is not whole (an error, nothing, or a directory at the cap)."""
-        doc = self.gh_json(["api", f"repos/{self.repo}/contents/.github/workflows?ref={ref}"])
-        if isinstance(doc, (GhFailed, GhUnanswered)) or not isinstance(doc, list):
-            return None
-        count = len(doc)
-        if count <= 0 or count >= CONTENTS_DIR_CAP:
-            return None
-        paths = [jq_raw(get(e, "path")) for e in doc if get(e, "type") == "file"]
-        yaml = [p for p in paths if re.search(r"\.ya?ml$", p)]
-        return yaml or None
-
     def push_trigger(self, wid: str, tip: str) -> Trigger | None:
         """``base_push_trigger``: does this workflow's file AT THE TIP declare ``push`` at all
         (ludics-lite#401)? None is UNKNOWN (exit 3 at the caller), not remembered: a transport
@@ -667,15 +590,15 @@ class Base:
         if hit is not None:
             return hit
         kind: Literal["push", "pushless", "unparsed", "absent"] = "unparsed"
-        path = self.workflow_path(wid)
+        path = self.reads.workflow_path(wid)
         if path is None:
             return None
-        body = self.workflow_body(path, tip)
+        body = self.reads.workflow_body(path, tip)
         if body is None:
             # The last read's own error: one that SUCCEEDED with an empty body cleared it.
             if "HTTP 404" not in self.session.err_line():
                 return None
-            files = self.workflow_files_at(tip)
+            files = self.reads.workflow_files_at(tip)
             if files is None or path in files:
                 return None
             kind, body = "absent", ""
@@ -688,62 +611,6 @@ class Base:
         return trigger
 
     # --- the paths-ignore settle ---
-
-    # SHARED-CANDIDATE: commit_files
-    def commit_files(self, sha: str) -> list[str] | None:
-        """``commit_files``: the paths ONE commit changed (a rename's both names), paginated;
-        None when the answer is not evidence -- empty, or 300 files or more."""
-        pages = self.gh_pages(["api", "--paginate", f"repos/{self.repo}/commits/{sha}?per_page=100"])
-        if isinstance(pages, (GhFailed, GhUnanswered)):
-            return None
-        rows: list[tuple[str, str]] = []
-        for page in pages:
-            for f in _items(get(page, "files")) or []:
-                rows.append((tsv(get(f, "filename")), tsv(alt(get(f, "previous_filename"), ""))))
-        if not 0 < len(rows) < 300:
-            return None
-        return [name for row in rows for name in row if name]
-
-    # SHARED-CANDIDATE: range_files
-    def range_files(self, vsha: str, tip: str) -> list[str] | None:
-        """``range_files``: every path changed on the FIRST-PARENT path from the judged commit up
-        to the tip, or None when the range is not evidence: not an ancestor (a force-push), longer
-        than the cap, a list the total does not match, a step off the listed range, a workflow
-        file touched anywhere in it."""
-        doc = self.gh_json(["api", f"repos/{self.repo}/compare/{vsha}...{tip}"
-                            f"?per_page={IGNORE_MAX_COMMITS}"])
-        if isinstance(doc, (GhFailed, GhUnanswered)):
-            return None
-        count = jq_raw(alt(get(doc, "total_commits"), 0))
-        behind = jq_raw(alt(get(doc, "behind_by"), -1))
-        rows: list[tuple[str, str]] = []
-        for c in _items(alt(get(doc, "commits"), [])) or []:
-            rows.append((tsv(get(c, "sha")), tsv(alt(get(alt(get(c, "parents"), []), 0, "sha"), "-"))))
-        if not _DIGITS.fullmatch(count) or behind != "0":
-            return None
-        total = int(count)
-        if not 0 < total <= IGNORE_MAX_COMMITS:
-            return None
-        if sum(1 for s, _ in rows if re.match(r"[0-9a-f]{7,}$", s)) != total:
-            return None
-        out: list[str] = []
-        sha = tip
-        steps = 0
-        while sha != vsha:
-            steps += 1
-            if steps > total:
-                return None
-            parent = next((p for s, p in rows if s == sha), "")
-            if parent in ("", "-"):
-                return None
-            files = self.commit_files(sha)
-            if files is None or any(f.startswith(".github/workflows/") for f in files):
-                return None
-            out.extend(files)
-            sha = parent
-        if steps == 0 or not out:
-            return None
-        return out
 
     def tip_within_paths_ignore(self, unrun: Sequence[tuple[str, str, str]], tip: str) -> str | None:
         """``tip_within_paths_ignore``: every workflow trailing the tip with no run at it is
@@ -763,7 +630,7 @@ class Base:
                 if trigger is not None and trigger.body:
                     pats = workflow_filter(trigger.body, "push", "paths-ignore") or []
                 if pats:
-                    files = self.range_files(vsha, tip)
+                    files = self.reads.range_files(vsha, tip)
                     hit = files is not None and paths_ignore_covers(pats, files)
                 self._ignore_cache[key] = hit
             if not hit:
@@ -773,35 +640,24 @@ class Base:
 
     # --- the named sources ---
 
-    def _shell_gate_checks(self, num: str) -> GateSignal | None:
-        """``gate_checks <num> 0``, run in the shell that defines it: the bridge state when the
-        caller sourced pr-review.sh (its fixture ``gh`` and its constants ride along), else the
-        script itself sourced without main. None when it ended without its trailer (an exit)."""
-        state = os.environ.get(proc.BRIDGE_STATE, "")
-        shell = os.environ.get(proc.BRIDGE_SHELL, "") if state else ""
-        script = (
-            '__src=$1 __state=$2 __dir=$3; shift 3\n'
-            'if [ -n "$__state" ]; then . "$__state" 2>/dev/null\n'
-            'else SHIP_PR_TEST_SOURCE_ONLY=1; . "$__src" || exit 97; trap - EXIT; fi\n'
-            'GH_ERR_FILE=$__dir/err GH_REFUSED_FILE=$__dir/refused GH_REFUSAL_PID="" REPO=$1 BUILD_ADVISORY=$2\n'
-            'gate_checks "$3" 0 2>/dev/null\n'
-            'printf \'\\n%s\\t%s\\n\' "$?" "${VERDICT:-}"\n'
-        )
-        src = str(_checkout() / "ship-pr" / "scripts" / "pr-review.sh")
-        with tempfile.TemporaryDirectory(prefix=f"pr-review-gate.{os.getpid()}.") as scratch:
-            done = self._shell(shell or "bash", ["-c", script, "gate_checks", src, state, scratch,
-                                                 self.repo, self.knobs.advisory, num])
-            err = _read_first_line(os.path.join(scratch, "err"))
-            refused = _read_text(os.path.join(scratch, "refused"))
-        self._err_override = err
-        if refused.strip():
-            raise GhRefusedOwn(refused.rstrip("\n"))
-        res = proc.substitution(done.stdout)
-        last = res.rsplit("\n", 1)[-1]
-        verdict = last.split("\t", 1)[1] if "\t" in last else last
-        line = next((ln[len("build signal "):] for ln in res.split("\n")
+    def _gate_checks(self, num: str) -> GateSignal | None:
+        """``gate_checks <num> 0``, as ``tip_pr_head_verdict`` ran it: no wait, under this
+        command's advisory list (BUILD_ADVISORY -- ``base`` never reads a repository's advisory
+        file), its report captured and its stderr dropped. None where the shell's subshell ended
+        without its trailer: the gate ended the command (a usage or configuration exit). A refusal
+        of the gate's own gh call (GhRefusedOwn) ends this command too, as it did."""
+        gate = Gate(self.session, self.repo, self.gate_config, clock=self.clock, advisory=self.knobs.advisory)
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                gate.check(num, 0)
+        except GhRefusedOwn:
+            raise
+        except cli.Exit:
+            return None
+        line = next((ln[len("build signal "):] for ln in out.getvalue().split("\n")
                      if ln.startswith("build signal ")), "")
-        return GateSignal(verdict, line, err)
+        return GateSignal(gate.verdict, line)
 
     def tip_pr_head_verdict(self, branch: str, sha: str, wants: Sequence[Want]) -> TipPr | None:
         """``tip_pr_head_verdict``, source (a): the tip is GitHub's own clean merge of one merged
@@ -839,7 +695,7 @@ class Base:
         if head != p1 or bref != branch:
             return TipPr("none", f"PR #{num} merged as the tip {s8}, but its head {head[:8]} is not the"
                          f" merge's second parent or it was merged into '{bref}', not '{branch}'")
-        signal = self._shell_gate_checks(num)
+        signal = self._gate(num)
         if signal is None:
             return None
         verdict: SourceVerdict
@@ -968,18 +824,6 @@ def _jq_order(value: Json) -> tuple[int, float | str]:
     return (5 if isinstance(value, list) else 6, _json_text(value))
 
 
-def _read_text(path: str) -> str:
-    try:
-        with open(path, "rb") as handle:
-            return proc.decode(handle.read())
-    except OSError:
-        return ""
-
-
-def _read_first_line(path: str) -> str:
-    return _read_text(path).split("\n", 1)[0]
-
-
 # --- the command ------------------------------------------------------------------------------------
 
 
@@ -1031,8 +875,9 @@ def parse_args(args: Sequence[str], repo: str, knobs: Knobs) -> Args:
 
 
 def run(session: GhSession, args: list[str], *, clock: FuncClock | None = None,
-        shell: ShellRunner | None = None, env: Mapping[str, str] | None = None) -> int:
-    knobs = load_knobs(os.environ if env is None else env)
+        gate: GateRunner | None = None, env: Mapping[str, str] | None = None) -> int:
+    environ = os.environ if env is None else env
+    knobs = load_knobs(environ)
     parsed = parse_args(args, session.config.repo, knobs)
     records = load_records(parsed.records) if parsed.records else []
     grace, interval = knobs.absent_grace, knobs.checks_interval
@@ -1051,7 +896,8 @@ def run(session: GhSession, args: list[str], *, clock: FuncClock | None = None,
     if not repo:
         die("base: name the repo — `base owner/name [branch]`, --repo, or REPO=.",
             "cwd inference only works from a checkout, and not from a background shell.")
-    base = Base(session, knobs, repo, clock=clock, shell=shell, records=records)
+    base = Base(session, knobs, repo, clock=clock, gate_config=load_gate_config(environ), gate=gate,
+                records=records)
     return Wait(base, parsed, records).run()
 
 

@@ -11,7 +11,6 @@ never judge it. The connection is read whole -- the rows reaching the ``totalCou
 states -- or the read is refused as unread, never taken for "none are open".
 """
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, assert_never
@@ -26,6 +25,8 @@ from ludics.prreview.core import (
     json_stream,
     shell_quote,
 )
+from ludics.prreview.jqsem import JqError, alt, idx, jstr
+from ludics.prreview.jqsem import path as jpath
 from ludics.prreview.shtext import tab_fields
 
 THREADS_QUERY = """query($owner:String!, $name:String!, $pr:Int!, $after:String) {
@@ -60,47 +61,11 @@ type WalkResult = WalkDone | WalkRejected | WalkUnread
 type PageVerdict = Literal["more", "stop", "unparsed"]
 
 
-class JqError(Exception):
-    """What jq would have failed on: a field read off a value that is not an object, an index off
-    one that is not an array."""
-
-
-def jq_field(value: Json, key: str) -> Json:
-    """jq's ``.key``: null passes through as null, an object answers, anything else is an error."""
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value.get(key)
-    raise JqError(key)
-
-
-def jq_first(value: Json) -> Json:
-    """jq's ``.[0]``: null for null or an empty array."""
-    if value is None:
-        return None
-    if isinstance(value, list):
-        return value[0] if value else None
-    raise JqError("0")
-
-
-def jq_alt(left: Json, right: Json) -> Json:
-    """jq's ``//``: the right side for null and false."""
-    return right if left is None or left is False else left
-
-
-def jq_text(value: Json) -> str:
-    """jq's ``tostring``, which string interpolation also applies: a string as itself, anything
-    else as its compact JSON."""
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
 def thread_id(node: Json) -> str:
     """THREAD_ID_JQ, ``((.comments.nodes[0] | .fullDatabaseId // .databaseId // "-") | tostring)``:
     a thread's name, its first comment's id, full width first. Raises ``JqError`` where jq erred."""
-    first = jq_first(jq_field(jq_field(node, "comments"), "nodes"))
-    return jq_text(jq_alt(jq_alt(jq_field(first, "fullDatabaseId"), jq_field(first, "databaseId")), "-"))
+    first = jpath(node, "comments", "nodes", 0)
+    return jstr(alt(alt(idx(first, "fullDatabaseId"), idx(first, "databaseId")), "-"))
 
 
 @dataclass(frozen=True)
@@ -124,8 +89,8 @@ def _connection(resp: str) -> tuple[dict[str, Json], _Meta] | None:
     nodes = conn.get("nodes")
     total = conn.get("totalCount")
     try:
-        has_next = jq_field(conn.get("pageInfo"), "hasNextPage")
-        cursor = jq_alt(jq_field(conn.get("pageInfo"), "endCursor"), "")
+        has_next = idx(conn.get("pageInfo"), "hasNextPage")
+        cursor = alt(idx(conn.get("pageInfo"), "endCursor"), "")
     except JqError:
         return None
     if not isinstance(nodes, list) or not isinstance(has_next, bool):
@@ -133,7 +98,7 @@ def _connection(resp: str) -> tuple[dict[str, Json], _Meta] | None:
     # "\(.totalCount)" must be digits alone: a bool is no number, and a float prints with a point.
     if not isinstance(total, int) or isinstance(total, bool) or total < 0:
         return None
-    return conn, _Meta(total, len(nodes), has_next, jq_text(cursor))
+    return conn, _Meta(total, len(nodes), has_next, jstr(cursor))
 
 
 def threads_walk(
@@ -231,11 +196,11 @@ def open_rows(conn: dict[str, Json]) -> list[str]:
     assert isinstance(nodes, list)
     rows: list[str] = []
     for node in nodes:
-        if jq_field(node, "isResolved") is True:
+        if idx(node, "isResolved") is True:
             continue
-        first = jq_first(jq_field(jq_field(node, "comments"), "nodes"))
-        author = jq_text(jq_alt(jq_field(jq_field(first, "author"), "login"), "-"))
-        path = jq_text(jq_alt(jq_field(node, "path"), "-"))
+        first = jpath(node, "comments", "nodes", 0)
+        author = jstr(alt(idx(idx(first, "author"), "login"), "-"))
+        path = jstr(alt(idx(node, "path"), "-"))
         rows.append("\t".join(_tsv_field(v) for v in (thread_id(node), author, path)))
     return rows
 

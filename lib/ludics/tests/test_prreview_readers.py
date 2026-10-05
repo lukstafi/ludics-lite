@@ -1,7 +1,9 @@
 """ludics.prreview's readers: poll, rounds, status, and the jq semantics they read feeds with.
 
 The shell suites (test-pr-review-status.sh, -rounds.sh, -watch.sh) are the conformance suite;
-these pin the logic underneath them directly, with gh replaced by a table of answers.
+these pin the logic underneath them directly, with gh replaced by a table of answers. Since the
+integration (ludics-lite#403) the readers and ``watch`` share one implementation (feeds.py,
+state.py, poll.py, jqsem.py), so these pin what both read.
 """
 
 import contextlib
@@ -13,8 +15,11 @@ from collections.abc import Callable, Sequence
 
 from ludics import proc
 from ludics.prreview import jqsem as jq
-from ludics.prreview import poll, reads, rounds, state
+from ludics.prreview import poll, rounds, state, status, threads
+from ludics.prreview.clock import FuncClock
 from ludics.prreview.core import GhSession, Json, json_stream, load_config
+from ludics.prreview.feeds import HEAD_JQ, Ctx
+from ludics.prreview.shtext import tab_fields
 
 REV = "chatgpt-codex-connector"
 BOT = REV + "[bot]"
@@ -23,6 +28,14 @@ HEAD = "a" * 40
 
 def iso(seconds_ago: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
+
+
+def tsv(fields: Sequence[str]) -> str:
+    """``@tsv`` over strings."""
+    return "\t".join(
+        f.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+        for f in fields
+    )
 
 
 class FakeGh:
@@ -50,12 +63,12 @@ class FakeGh:
 
     @staticmethod
     def _filter(expr: str, value: Json) -> str:
-        if expr == reads.HEAD_JQ:
-            fields = [jq.text(jq.alt(jq.path(value, *p), "-")) for p in (("head", "sha"),
+        if expr == HEAD_JQ:
+            fields = [jq.jstr(jq.alt(jq.path(value, *p), "-")) for p in (("head", "sha"),
                       ("mergeable_state",), ("created_at",))]
-            return jq.tsv(fields) + "\n"
+            return tsv(fields) + "\n"
         if expr == ".commit.committer.date":
-            return jq.text(jq.path(value, "commit", "committer", "date")) + "\n"
+            return jq.jstr(jq.path(value, "commit", "committer", "date")) + "\n"
         if expr == ".data.repository.pullRequest.reviewThreads":
             return json.dumps(jq.path(value, "data", "repository", "pullRequest", "reviewThreads")) + "\n"
         raise AssertionError(f"unexpected --jq {expr}")
@@ -65,6 +78,12 @@ def session(gh: FakeGh, **env: str) -> GhSession:
     base = {"REPO": "o/r", "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0"}
     base.update(env)
     return GhSession(load_config(base), run=gh, sleep=lambda _s: None)
+
+
+def ctx(gh: FakeGh, nudge_after: int | None = None, **env: str) -> Ctx:
+    """The reads' context outside a watch, on the wall clock, STALL 2400."""
+    s = session(gh, **env)
+    return Ctx(s, "o/r", s.config.reviewer, FuncClock(), 2400, nudge_after=nudge_after)
 
 
 def feeds(
@@ -112,10 +131,16 @@ def comment(cid: int, at: str, body: str, login: str = BOT) -> dict[str, Json]:
     return {"id": cid, "user": {"login": login}, "created_at": at, "updated_at": at, "body": body}
 
 
-def run_state(gh: FakeGh, nudge_after: int | None = None) -> str:
+def run_state(gh: FakeGh, nudge_after: int | None = None) -> state.State:
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
-        return state.status_state(session(gh), "o/r", "7", 2400, nudge_after)
+        return state.status_state(ctx(gh, nudge_after), "7")
+
+
+def gated(gh: FakeGh, st: state.State) -> state.State:
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        return state.approval_gate(ctx(gh), "7", st)
 
 
 # --- jq semantics ---------------------------------------------------------------------------------
@@ -136,14 +161,14 @@ class JqSemantics(unittest.TestCase):
     def test_order_is_jqs(self) -> None:
         values: list[Json] = [{"a": 1}, [1], "a", 2, True, False, None]
         self.assertEqual(jq.sort_by(values, lambda v: v), [None, False, True, 2, "a", [1], {"a": 1}])
-        self.assertFalse(jq.eq(1, True))
-        self.assertTrue(jq.eq(1, 1.0))
+        self.assertNotEqual(jq.cmp(1, True), 0)
+        self.assertEqual(jq.cmp(1, 1.0), 0)
         self.assertTrue(jq.gt("1", 5))
 
     def test_max_by_keeps_the_last_of_equals_and_none_of_nothing(self) -> None:
-        items = [{"k": 1, "n": "first"}, {"k": 1, "n": "second"}]
+        items: list[dict[str, Json]] = [{"k": 1, "n": "first"}, {"k": 1, "n": "last"}, {"k": 0, "n": "x"}]
         best = jq.max_by(items, lambda i: i["k"])
-        self.assertEqual(best, {"k": 1, "n": "second"})
+        self.assertEqual(best, {"k": 1, "n": "last"})
         nothing: list[Json] = []
         self.assertIsNone(jq.max_by(nothing, lambda i: i))
 
@@ -154,33 +179,29 @@ class JqSemantics(unittest.TestCase):
         with self.assertRaises(jq.JqError):
             jq.startswith(5, "x")
         with self.assertRaises(jq.JqError):
-            jq.test(7, jq.NONSPACE)
+            jq.test(7, jq.onig("[^[:space:]]"))
         with self.assertRaises(jq.JqError):
-            jq.head_slice(7, 7)
-        self.assertEqual(jq.head_slice("héllo wörld", 3), "hél")
+            poll.short(7)
+        self.assertEqual(poll.short("héllo wörld"), "héllo w")
 
     def test_fromdateiso8601_is_strptimes(self) -> None:
         self.assertEqual(jq.fromdateiso8601("2026-09-01T00:00:00Z"), 1788220800)
         self.assertEqual(jq.fromdateiso8601("2026-9-1T0:0:0Z"), 1788220800)
-        for bad in ("2026-09-01T00:00:00.5Z", " 2026-09-01T00:00:00Z", "2026-09-01T00:00:00Zx",
-                    "2026-13-01T00:00:00Z", "garbage"):
+        for bad in ("2026-09-01T00:00:00.5Z", "2026-13-01T00:00:00Z", "2026-09-01 00:00:00Z", "x"):
             with self.assertRaises(jq.JqError, msg=bad):
                 jq.fromdateiso8601(bad)
+        with self.assertRaises(jq.JqError):
+            jq.fromdateiso8601(5)
 
-    def test_bash_read(self) -> None:
-        self.assertEqual(jq.bash_read("a\t\tb\tc d\t", 3), ["a", "b", "c d"])
-        self.assertEqual(jq.bash_read("", 3), ["", "", ""])
-        self.assertEqual(jq.bash_read_delim("||0|", 4, "|"), ["", "", "0", ""])
-        self.assertEqual(jq.bash_read_delim("x|y|", 2, "|"), ["x", "y"])
-        self.assertEqual(jq.bash_read_delim("x|y|z|", 2, "|"), ["x", "y|z|"])
-
-    def test_split_of_empty_is_no_parts(self) -> None:
-        self.assertEqual(jq.split("", ","), [])
-        self.assertEqual(jq.split("a,b", ","), ["a", "b"])
+    def test_tab_fields(self) -> None:
+        self.assertEqual(tab_fields("a\t\tb\tc d\t", 3), ["a", "b", "c d"])
+        self.assertEqual(tab_fields("", 3), ["", "", ""])
+        self.assertEqual(tab_fields("a\tb\nc\td", 2), ["a", "b"])
 
     def test_space_is_unicode_white_space_not_pythons(self) -> None:
-        self.assertTrue(jq.test("\x1c", jq.NONSPACE))
-        self.assertFalse(jq.test("\xa0  \t", jq.NONSPACE))
+        nonspace = jq.onig("[^[:space:]]")
+        self.assertTrue(jq.test("\x1c", nonspace))
+        self.assertFalse(jq.test("\xa0\u3000\u2028\t", nonspace))
 
 
 # --- poll -----------------------------------------------------------------------------------------
@@ -188,11 +209,10 @@ class JqSemantics(unittest.TestCase):
 
 class PollItems(unittest.TestCase):
     def test_threads_at_one_anchor_fold_with_every_distinct_body(self) -> None:
-        a: dict[str, Json] = {"id": 900, "path": "a.sh", "line": 3, "body": "one",
-                              "user": {"login": BOT}, "original_commit_id": HEAD}
-        b: Json = {**a, "id": 901, "body": "two"}
-        c: Json = {**a, "id": 902, "body": "one"}
-        d: Json = {**a, "id": 903, "line": 4}
+        a: Json = {"id": 900, "path": "x", "line": 3, "body": "one"}
+        b: Json = {"id": 901, "path": "x", "line": 3, "body": "two"}
+        c: Json = {"id": 902, "path": "x", "line": 3, "body": "one"}
+        d: Json = {"id": 903, "path": "y", "line": 3, "body": "one"}
         folded = poll.fold_inline([a, d, b, c])
         self.assertEqual([poll.thread_list(f) for f in folded], ["900+901+902", "903"])
         self.assertEqual(poll.body_block(folded[0]), "[thread 900]\none\n[thread 901]\ntwo")
@@ -214,8 +234,8 @@ class PollItems(unittest.TestCase):
         self.assertEqual(poll.short(None), "-")
         self.assertEqual(poll.short(""), "-")
         self.assertEqual(poll.short(HEAD), "aaaaaaa")
-        body = "quotes `bbbbbbb`\n**Reviewed commit:** `ccccccc`\n**Reviewed commit:** `ddddddd`"
-        self.assertEqual(poll.item_stamp({"body": body}, reads.REVIEWED_COMMIT), "ddddddd")
+        body = "**Reviewed commit:** `ccccccc`\nlater **Reviewed commit:** `ddddddd1`"
+        self.assertEqual(poll.item_stamp({"body": body}), "ddddddd")
 
     def test_the_about_codex_block_folds_only_as_the_body_s_end(self) -> None:
         block = poll.CODEX_ABOUT_OPEN + "\ninterior\n</details>\n  "
@@ -227,10 +247,10 @@ class PollItems(unittest.TestCase):
 
 class PollRound(unittest.TestCase):
     def run_poll(self, gh: FakeGh, mark: str = "") -> tuple[int, str, str]:
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = poll.poll_round(session(gh), "o/r", "7", mark)
-        return rc, out.getvalue(), err.getvalue()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = poll.poll(ctx(gh), "7", mark)
+        return result.rc, result.text, err.getvalue()
 
     def test_a_round(self) -> None:
         gh = feeds(
@@ -288,7 +308,8 @@ class Rounds(unittest.TestCase):
     def count(self, reviews: Sequence[Json], comments: Sequence[Json] | None = None, gap: int = 900,
               icap: int | None = None, rcap: int | None = None) -> str:
         gh = feeds(reviews=reviews, comments=comments)
-        return rounds.review_rounds(session(gh, SHIP_PR_ROUND_GAP=str(gap)), "o/r", "7", icap, rcap)
+        got = state.review_rounds(ctx(gh), "7", gap, icap, rcap)
+        return f"{got.token()}|{got.detail}"
 
     def test_bursts_by_head_and_gap(self) -> None:
         r = self.count([
@@ -328,66 +349,71 @@ class Rounds(unittest.TestCase):
 
 class StatusState(unittest.TestCase):
     def test_idle_on_a_review_of_the_head(self) -> None:
-        line = run_state(feeds(reviews=[review(5, HEAD, "2026-09-01T00:00:00Z")]))
-        self.assertTrue(line.startswith("idle|"), line)
-        self.assertEqual(state.state_merge(line), "clean")
+        st = run_state(feeds(reviews=[review(5, HEAD, "2026-09-01T00:00:00Z")]))
+        self.assertEqual(st.tok, "idle", st.line())
+        self.assertEqual(st.merge, "clean")
 
     def test_a_thumbs_up_is_an_approval_and_the_gate_reads_the_threads(self) -> None:
         gh = feeds(reactions=[reaction("+1", iso(30))], head_at=iso(3600),
                    threads=[{"isResolved": False, "path": "a b.sh",
                              "comments": {"nodes": [{"fullDatabaseId": "4095735704",
                                                      "author": {"login": "codex"}}]}}])
-        line = run_state(gh)
-        self.assertEqual(line, f"approved|-|clean|👍 from {REV}")
-        gated = state.approval_gate(session(gh), "o/r", "7", line, 50)
-        self.assertEqual(gated, f"unresolved|-|clean|1|👍 from {REV}|4095735704 by codex on a\\ b.sh")
+        st = run_state(gh)
+        self.assertEqual(st.line(), f"approved|-|clean|👍 from {REV}")
+        self.assertEqual(gated(gh, st).line(),
+                         f"unresolved|-|clean|1|👍 from {REV}|4095735704 by codex on a\\ b.sh")
 
     def test_a_live_eyes_is_reviewing_and_an_old_one_stalled(self) -> None:
-        self.assertTrue(run_state(feeds(reactions=[reaction("eyes", iso(60))])).startswith("reviewing|"))
-        self.assertTrue(run_state(feeds(reactions=[reaction("eyes", iso(9999))])).startswith("stalled|"))
+        self.assertEqual(run_state(feeds(reactions=[reaction("eyes", iso(60))])).tok, "reviewing")
+        self.assertEqual(run_state(feeds(reactions=[reaction("eyes", iso(9999))])).tok, "stalled")
 
     def test_a_feed_that_did_not_answer_is_unknown(self) -> None:
         gh = feeds()
         gh.down.add("repos/o/r/issues/7/reactions?per_page=100")
-        self.assertTrue(run_state(gh).startswith("unknown|-|-|the reactions API did not answer (gh: HTTP 503"))
+        self.assertTrue(run_state(gh).line().startswith("unknown|-|-|the reactions API did not answer (gh: HTTP 503"))
 
     def test_a_shape_a_read_cannot_take_is_unknown(self) -> None:
-        line = run_state(feeds(comments=[{**comment(1, "2026-09-01T00:00:00Z", "x"), "body": 7}]))
+        st = run_state(feeds(comments=[{**comment(1, "2026-09-01T00:00:00Z", "x"), "body": 7}]))
         # The head is read after the feeds, so no mergeability rides on this line yet.
-        self.assertEqual(line, "unknown|-|-|the comments feed did not parse")
+        self.assertEqual(st.line(), "unknown|-|-|the comments feed did not parse")
 
     def test_a_pending_request_is_nudged(self) -> None:
-        line = run_state(feeds(comments=[comment(9, iso(30), "@codex review", login="me")]), 1)
-        self.assertTrue(line.startswith("nudged|"), line)
-        self.assertEqual(state.status_line(line, "o/r", "7").split(" — ")[0], "review EXPECTED but not started")
+        st = run_state(feeds(comments=[comment(9, iso(30), "@codex review", login="me")]), 1)
+        self.assertEqual(st.tok, "nudged", st.line())
+        self.assertEqual(state.status_line(st, "o/r", "7").split(" — ")[0], "review EXPECTED but not started")
 
     def test_the_initialization_failure_names_its_head(self) -> None:
         body = ("Codex Review: Something went wrong. Try again later by commenting “@codex review”.\n\n"
                 f"```\nProvided git ref {HEAD} does not exist\n```")
-        line = run_state(feeds(comments=[comment(1, "2026-09-01T01:00:00Z", body)]))
-        self.assertTrue(line.startswith("failed|"), line)
-        self.assertEqual(state.state_detail(line).split("|")[:2], ["aaaaaaa", "git"])
+        st = run_state(feeds(comments=[comment(1, "2026-09-01T01:00:00Z", body)]))
+        self.assertEqual(st.tok, "failed", st.line())
+        self.assertEqual(st.detail.split("|")[:2], ["aaaaaaa", "git"])
 
 
 class StatusLine(unittest.TestCase):
     def test_tokens(self) -> None:
-        self.assertEqual(state.status_line("approved|-|dirty|x", "o/r", "7"),
-                         "approved (x); " + state.conflict_note("dirty", "o/r", "7"))
-        self.assertIn("the next move is yours", state.status_line("idle|5|clean|d", "o/r", "7"))
-        self.assertNotIn("the next move is yours", state.status_line("idle|5|draft|d", "o/r", "7"))
-        self.assertIn("gh pr ready <pr> --repo o/r", state.status_line("idle|5|draft|d", "o/r", ""))
-        self.assertEqual(state.status_line("weird|-|-|", "o/r", "7"),
-                         "unrecognised state 'weird' — treat as unknown and retry")
-        self.assertIn("running 2m", state.status_line("reviewing|125|clean|d", "o/r", "7"))
+        def line(tok: state.Token, age: int | None, merge: str, detail: str, pr: str = "7") -> str:
+            return state.status_line(state.State(tok, age, merge, detail), "o/r", pr)
 
-    def test_parsers_keep_pipes_in_the_detail(self) -> None:
-        line = "unknown|-|-|gh: 502 | Bad Gateway"
-        self.assertEqual((state.state_tok(line), state.state_age(line), state.state_merge(line),
-                          state.state_detail(line)), ("unknown", "-", "-", "gh: 502 | Bad Gateway"))
+        self.assertEqual(line("approved", None, "dirty", "x"),
+                         "approved (x); " + state.conflict_note("dirty", "o/r", "7"))
+        self.assertIn("the next move is yours", line("idle", 5, "clean", "d"))
+        self.assertNotIn("the next move is yours", line("idle", 5, "draft", "d"))
+        self.assertIn("gh pr ready <pr> --repo o/r", line("idle", 5, "draft", "d", ""))
+        self.assertIn("running 2m", line("reviewing", 125, "clean", "d"))
+
+    def test_the_status_line_entry_keeps_pipes_in_the_detail_and_names_a_stranger(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status.run_line(session(feeds()), ["unknown|-|-|gh: 502 | Bad Gateway", "7"])
+            status.run_line(session(feeds()), ["weird|-|-|", "7"])
+        first, second = out.getvalue().splitlines()
+        self.assertEqual(first, state.status_line(state.State("unknown", None, "-", "gh: 502 | Bad Gateway"), "o/r", "7"))
+        self.assertEqual(second, "unrecognised state 'weird' — treat as unknown and retry")
 
     def test_threads_named_names_ten(self) -> None:
-        rows = [jq.tsv([str(i), "u", "p"]) for i in range(12)]
-        n, shown = state.threads_named(rows)
+        rows = [tsv([str(i), "u", "p"]) for i in range(12)]
+        n, shown = threads.threads_named(rows)
         self.assertEqual(n, 12)
         self.assertTrue(shown.endswith("9 by u on p, and 2 more"))
 
