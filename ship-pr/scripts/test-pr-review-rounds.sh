@@ -155,6 +155,34 @@ test_malformed_threshold_is_refused() {
   assert_eq "$rc" 0 "off is accepted"
 }
 
+# The command line of the three readers, pinned before their v2 port (ludics-lite#403): a missing
+# PR is bash's `${1:?usage: ...}`, exit 1 naming the usage; a malformed one and one with no repository
+# named are pr_arg's refusals, exit 2. Nothing is read in any of them. (The library exports
+# SHIP_PR_TEST_SOURCE_ONLY for its own sourcing; these runs are the whole command, so they drop it.)
+test_the_readers_refuse_a_missing_or_malformed_pr() {
+  local out rc sub
+  for sub in poll status rounds; do
+    set +e
+    out=$(env -u REPO -u SHIP_PR_TEST_SOURCE_ONLY bash "$HELPER" "$sub" 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 1 "$sub with no PR is bash's parameter error"
+    assert_contains "$out" "usage: $sub <pr>" "$sub names its usage"
+    set +e
+    out=$(env -u SHIP_PR_TEST_SOURCE_ONLY bash "$HELPER" "$sub" "$REPO#x" 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 2 "$sub with a malformed PR is a usage error"
+    assert_contains "$out" "PR must be a number or owner/name#number, got '$REPO#x'" "$sub names the argument"
+    set +e
+    out=$(env -u REPO -u SHIP_PR_TEST_SOURCE_ONLY bash "$HELPER" "$sub" 7 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 2 "$sub with a bare number and no repository is refused"
+    assert_contains "$out" "Pass it as owner/name#7" "$sub says how to name it"
+  done
+}
+
 test_malformed_gap_is_refused() {
   local out rc v
   for v in '"900"' true -1 900.5 x; do
@@ -513,6 +541,7 @@ tests=(
   test_rounds_are_ordered_by_submission_and_chained
   test_malformed_threshold_is_refused
   test_malformed_gap_is_refused
+  test_the_readers_refuse_a_missing_or_malformed_pr
   test_comment_only_rounds_count
   test_large_comment_feed_still_counts
   test_initialization_failures_are_not_rounds
