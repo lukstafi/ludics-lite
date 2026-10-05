@@ -280,9 +280,6 @@ reset_fixture() {
   JOBS_DEFAULT=$(jobs_json '[]')
   FAIL_ENDPOINT=""
   FAIL_STATUS=500
-  BASE_JOBS_CACHE=""
-  BASE_RED_DETAIL=""
-  BASE_IGNORE_CACHE=""
   WORKFLOW_PATH=".github/workflows/ci.yml"
   WORKFLOW_YAML="$DOCS_IGNORED_YAML"
   COMPARE_COMMITS=$(jq -cn --arg c "$SHA_C" '[$c]')

@@ -5,9 +5,26 @@ Is the base branch's CI green? Ported from the shell's ``cmd_base`` and the help
 paths-ignore settle (``range_files``, ``commit_files``, ``commits_ignored``,
 ``tip_within_paths_ignore``), and the two named sources of a tip no push run judges
 (``tip_pr_head_verdict``, ``tip_named_source``). The shell's comments carry the incident history
-of every rule here; this file keeps a line of it where a rule would otherwise look arbitrary, and
-the shell region (``cmd_base`` and above, in ship-pr/scripts/pr-review.sh at the port) is where
-to read the rest.
+of every rule here; this file keeps the load-bearing ones, and the shell region they came from
+(``cmd_base`` and the helpers above it, in ship-pr/scripts/pr-review.sh at c856bb0, the v2 branch
+point) is where to read the rest. The helpers ``base`` shares with ``checks``/``merge``
+(``range_files``, ``commit_files``, the workflow-file readers) are still served by shell for
+those subcommands; their ports here are marked SHARED-CANDIDATE.
+
+WHY ``base`` EXISTS, and why ``--wait``. The other half of ahrefs/ocannl#694: the confusion lands
+on whoever branches off a broken master, so the base's own CI is read before work starts, not
+only before merging. ``--wait`` is for the other end of a branch's life, the roll-forward
+policy's complement: "after a merge, read the base's CI on what you just landed" -- and a plain
+``base`` seconds after a merge answers with the PREVIOUS tip's green, because the merge's own run
+is queued or not created yet. So ``--wait`` re-reads until nothing non-advisory is mid-flight and
+every non-advisory workflow's newest judged run is about the CURRENT tip -- or, with nothing in
+flight and NO run for the tip at all, until the workflow's own paths-ignore says none can be
+created for this tip (a docs-only push never gets one), or failing that until a grace expires
+(SHIP_PR_BASE_ABSENT_GRACE, all that separates "never coming" from "not yet"). Then it settles
+for the verdicts in hand, saying which commit each is about. Two absences it will not settle: a
+run that EXISTS for the tip and has not judged it (only that run can answer), and a run in flight
+anywhere on the branch (it judges a tree the tip contains). A red at the tip breaks the wait at
+once: it is a verdict.
 
 Stdout: the verdict line, then one line per workflow (and its notes). Exit: 0 green (an interim
 green under --interim included); 1 red; 2 usage or configuration; 3 UNKNOWN (a read the verdict
@@ -457,6 +474,31 @@ def load_records(path: str) -> list[Record]:
 
 
 # --- the named sources ------------------------------------------------------------------------------
+# A default branch without push CI (ludics-lite#401). A workflow that used to run on pushes to this
+# branch and whose file at the tip no longer declares `push` leaves its push runs standing
+# forever: `event=push` pages never age out, so the fold would keep presenting the last push run's
+# verdict -- days or months old -- as the base's. A stale green is worse than none. So such a
+# workflow's push rows are not read as a verdict at all, and the tip's verdict for it comes only
+# from a source this file can NAME, in this order:
+#
+#   (b) an INTEGRATION RECORD: a wave coordinator's own run concluded at exactly the tip, handed in
+#       by `fleet-worker.sh gate` as `--integration-records <file>`. About the tip's own tree, so
+#       it goes first, and a failed one is RED.
+#   (a) the MERGED PR'S HEAD RUN under the roll-forward rule: the tip is GitHub's own merge commit
+#       of one merged pull request into this branch, its second parent is that PR's head, and the
+#       head's build signal -- the one `merge` gated on -- is green (or red).
+#
+# Anything else is "no verdict", never an older green. Source (c), the latest daily sweep record
+# at or after the tip, has no machine-readable form on this side and is not read (#414).
+#
+# "Clean merge" is established from the commit, not assumed: exactly two parents, committed by
+# GitHub itself (`noreply@github.com`) with a signature GitHub verified. GitHub makes a merge
+# commit only for a PR it can merge without conflict, so its own merge carries nothing the head did
+# not; a merge made elsewhere can carry a resolution the head's run never saw, and a squash or a
+# rebase keeps no head in the history at all. The workflows the verdict is FOR must each have a run
+# of their own at the head that concluded `success` with a non-advisory job that succeeded: the
+# head's build signal is an aggregate, and on a docs-only PR the retired `ci` is filtered out by
+# its `pull_request` paths-ignore while another workflow passes (review rounds 1 and 2).
 
 type SourceVerdict = Literal["green", "red", "pending", "none"]
 
@@ -752,10 +794,20 @@ class Base:
         return yaml or None
 
     def push_trigger(self, wid: str, tip: str) -> Trigger | None:
-        """``base_push_trigger``: None is UNKNOWN (exit 3 at the caller), not remembered. Only a
-        404 that the directory at the tip confirms is ``absent``; any other refusal is unknown,
-        since a token that may read Actions but not the file would otherwise pass for a file with
-        no trigger to read (ludics-lite#401)."""
+        """``base_push_trigger``: does this workflow's file AT THE TIP declare ``push`` at all
+        (ludics-lite#401)? None is UNKNOWN (exit 3 at the caller), not remembered: a transport
+        failure, and any refusal of the API's (403, 401, or a 404 the directory listing does not
+        confirm), since a token that may read Actions but not the file would otherwise pass for a
+        file with no trigger to read.
+
+        BOUNDARY, as a fail-closed allowlist: ``pushless`` is claimed only for a file that was read
+        whole and whose ``on:`` block the narrow reader parsed and found without ``push`` in any of
+        its three forms (mapping, scalar, flow). ``unparsed`` and ``absent`` are read as a push
+        workflow, exactly as before #401, and so is a ``push`` whose ``branches:`` filter does not
+        reach this branch, which this does not evaluate (#176: what a push filter reaches is not
+        answerable from these feeds). An ABSENT file is claimed only when the directory at the tip
+        was read and does not hold it: a workflow the tip deleted (or a dynamic one, like Pages'
+        ``dynamic/pages/...``, which has no file) keeps the reading it had before #401."""
         key = f"{wid}/{tip}"
         hit = self._trigger_cache.get(key)
         if hit is not None:
