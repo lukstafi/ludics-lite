@@ -311,6 +311,15 @@ test_transport_failure_is_unknown() {
   assert_eq "$AWAIT_RC" 3 "an unanswered read is transport ($AWAIT_OUT)"
   assert_contains "$AWAIT_OUT" "UNKNOWN" "it should say the state is unknown"
   assert_not_contains "$AWAIT_OUT" "not a failure, so it is" "no verdict is implied"
+  # The run read is a READ: a 500, which the write policy would take as ambiguous and stop on after
+  # one call, is retried to the last attempt.
+  reset_fixture
+  retune API_ATTEMPTS=3
+  RUN_ERROR="gh: HTTP 500: Internal Server Error"
+  run_await example/repo#4242
+  assert_eq "$AWAIT_RC" 3 "a 500 on the run read is transport ($AWAIT_OUT)"
+  assert_contains "$AWAIT_OUT" "after 3 attempts" "after every attempt"
+  assert_eq "$(grep -c '^run view' "$CALL_LOG")" 3 "the run read is retried like a read"
 }
 
 # And a run still going at the deadline is exit 4, stopped-not-judged like everywhere else.
@@ -890,6 +899,18 @@ test_parse_ref() {
     assert_eq "$rc" 2 "'$bad' must not parse as a PR ($out)"
     assert_contains "$out" "PR must be a number or owner/name#number, got '$bad'" "and is refused as one"
     assert_eq "$(gh_calls)" "" "and nothing is posted for '$bad'"
+    # And a subcommand the shell still serves, which parses through the shell's parse_ref rather
+    # than the Python's: the two copies are held to one list (ludics-lite#403). The empty argument
+    # is left out here, since `status`'s own `${1:?usage}` refuses it before any parse does.
+    [ -n "$bad" ] || continue
+    reset_fixture
+    set +e
+    out=$(cmd_status "$bad" 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 2 "'$bad' must not parse as a PR for status ($out)"
+    assert_contains "$out" "PR must be a number or owner/name#number, got '$bad'" "and status refuses it as one"
+    assert_eq "$(gh_calls)" "" "and nothing is read for '$bad'"
   done
 }
 

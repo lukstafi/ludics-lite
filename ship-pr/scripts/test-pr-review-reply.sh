@@ -1105,6 +1105,23 @@ test_resolve_keeps_its_failures_apart() {
   assert_eq "$RC" 3 "an unanswered mutation is transport ($ERR)"
   assert_contains "$ERR" "after 2 attempts" "after every attempt"
   assert_contains "$ERR" "the thread was FOUND" "and it says the thread is there"
+  assert_eq "$(grep -c resolveReviewThread "$BODIES/mutations")" 2 "the mutation is retried"
+  # The READ policy on both calls, told apart from the write policy by the one class the two
+  # disagree on: a 500 is ambiguous for a write (one attempt, no retry) and transport for a read.
+  # Resolving is idempotent, so the mutation retries like the lookup does; a 502 above cannot show
+  # it, since both policies retry a gateway refusal.
+  reset_fixture
+  retune API_ATTEMPTS=2
+  THREADS_FAIL_MSG="HTTP 500: Internal Server Error (https://api.github.com/graphql)"
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 3 "a 500 on the lookup is transport ($ERR)"
+  assert_eq "$(grep -c graphql "$REQUEST_LOG")" 2 "and the lookup is retried like a read"
+  reset_fixture
+  retune API_ATTEMPTS=2
+  RESOLVE_FAIL_MSG="HTTP 500: Internal Server Error"
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 3 "a 500 on the mutation is transport, not a rejection ($ERR)"
+  assert_contains "$ERR" "after 2 attempts" "after every attempt"
   assert_eq "$(grep -c resolveReviewThread "$BODIES/mutations")" 2 "the mutation is retried like a read"
   # In a batch, the refusal names what was closed first, with the line break the shell's message
   # has always carried.
