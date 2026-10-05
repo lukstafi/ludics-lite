@@ -164,9 +164,13 @@ trap cleanup EXIT
 
 # Copy the dispatcher beside a canned base helper: no live GitHub reads, and no
 # production bypass knob. The production helper's own suites pin its red diagnostics.
-mkdir -p "$TMP/dispatcher/issue-wave/scripts" "$TMP/dispatcher/ship-pr/scripts"
+mkdir -p "$TMP/dispatcher/issue-wave/scripts" "$TMP/dispatcher/ship-pr/scripts" "$TMP/dispatcher/scripts"
 cp "$FW" "$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
-cp "$HERE/fleet-execution.py" "$TMP/dispatcher/issue-wave/scripts/fleet-execution.py"
+# The standalone registry while there is one; the interpreter wrapper and the package the ported
+# subcommands forward to (ludics-lite#403) travel with the dispatcher either way.
+[ ! -f "$HERE/fleet-execution.py" ] || cp "$HERE/fleet-execution.py" "$TMP/dispatcher/issue-wave/scripts/fleet-execution.py"
+cp "$HERE/../../scripts/py" "$TMP/dispatcher/scripts/py"
+cp -R "$HERE/../../lib" "$TMP/dispatcher/lib"
 cp "$HERE/bg-run.sh" "$TMP/dispatcher/issue-wave/scripts/bg-run.sh"
 FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 export BASE_CALL_LOG="$TMP/base-calls"
@@ -2185,11 +2189,11 @@ echo local-fix >> "$repo/issue-wave/SKILL.md"
 expect "a divergent execution host is reported and the dispatch still stands" 0 "REFRESH FAILED other: 1 local change(s) in the served tree -- left as it is, never reset" -- "${FWR[@]}" execution run "$(rreq rf-c)"
 [ "$(git -C "$repo" rev-parse HEAD)" = "$cur" ] && grep -q local-fix "$repo/issue-wave/SKILL.md" && ok "...with the checkout left as it was" || ko "a divergent execution host was moved or reset"
 git -C "$repo" checkout -q -- issue-wave/SKILL.md; fixture_done rf-c
-# A dispatch whose record cannot be read says so, rather than skipping the refresh silently.
-mkdir -p "$TMP/nojq"; printf '#!/bin/sh\necho "jq: not here" >&2; exit 127\n' > "$TMP/nojq/jq"; chmod +x "$TMP/nojq/jq"
-expect "an unreadable dispatched record is a loud refresh failure, the dispatch standing" 0 "REFRESH FAILED: cannot read the execution host from the dispatched record (jq: not here)" -- \
-  env PATH="$TMP/nojq:$PATH" "${FWR[@]}" execution run "$(rreq rf-g)"
-fixture_done rf-g
+# A dispatch whose record cannot be read says so, rather than skipping the refresh silently. Not a
+# case here: the registry's own output is the record, so no command line makes it unreadable, and
+# the shell's version of this case broke the reader by putting a failing `jq` first on PATH, which
+# tests the implementation's tool rather than the command (ludics-lite#403). The rule is pinned
+# where the reader is: lib/ludics/tests/test_fleetworker_execution.py.
 # The reserve + dispatch pair refreshes at the dispatch, which is where the box is about to be used.
 "${FWR[@]}" execution reserve "$(rreq rf-d)" 2>&1 | grep -q REFRESH && ko "a bare reserve refreshed the box" || ok "a bare reserve does not refresh"
 jq -n '{request_id:"rf-d", evidence:"fixture dispatch"}' > "$TMP/refresh-rf-d-dispatch.json"
