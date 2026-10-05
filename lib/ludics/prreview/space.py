@@ -15,11 +15,15 @@ running in the C locale is read as the C locale, and not as the C.UTF-8 Python w
 Boundary: one character (or, in a single-byte locale, one byte) at a time. Not reproduced: bash
 3.2's matching of a string that MIXES invalid bytes with multibyte whitespace, which bash itself
 answers inconsistently between its two expansions. Where the C library cannot be reached (a native
-Windows interpreter), only the C locale's six count.
+Windows interpreter under Git Bash), the locale is read off LC_ALL, LC_CTYPE and LANG as Cygwin
+reads it -- no setting at all is C.UTF-8 there -- and a UTF-8 one gets the class Cygwin's newlib and
+glibc both answer: Unicode's spaces and separators without the no-break ones (U+00A0, U+2007,
+U+202F).
 """
 
 import ctypes
 import locale
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -37,21 +41,39 @@ class _Classes:
     utf8: bool
 
 
-def _c_locale_only() -> _Classes:
-    return _Classes(lambda code: chr(code) in C_SPACE, lambda b: chr(b) in C_SPACE, True)
+# newlib's and glibc's iswspace past ASCII in a UTF-8 locale.
+_UNICODE_SPACE = frozenset(
+    (0x1680, *range(0x2000, 0x2007), 0x2008, 0x2009, 0x200A, 0x2028, 0x2029, 0x205F, 0x3000)
+)
+
+
+def _env_utf8() -> bool:
+    for name in ("LC_ALL", "LC_CTYPE", "LANG"):
+        value = os.environ.get(name, "")
+        if value:
+            charset = value.split("@", 1)[0].partition(".")[2]
+            return charset.replace("-", "").lower() == "utf8"
+    return True
+
+
+def _table() -> _Classes:
+    utf8 = _env_utf8()
+    return _Classes(
+        lambda code: utf8 and code in _UNICODE_SPACE, lambda b: chr(b) in C_SPACE, utf8
+    )
 
 
 @cache
 def _classes() -> _Classes:
     if sys.platform == "win32":
-        return _c_locale_only()
+        return _table()
     try:
         libc = ctypes.CDLL(None)
         iswspace = libc.iswspace
         isspace = libc.isspace
         codeset = locale.nl_langinfo(locale.CODESET)
     except (OSError, AttributeError, ValueError):
-        return _c_locale_only()
+        return _table()
     iswspace.argtypes = [ctypes.c_uint32]
     iswspace.restype = ctypes.c_int
     isspace.argtypes = [ctypes.c_int]

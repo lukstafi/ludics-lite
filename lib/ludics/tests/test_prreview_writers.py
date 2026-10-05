@@ -15,12 +15,13 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 
 from ludics import cli
 from ludics.proc import Completed
-from ludics.prreview import comment, reply, resolve, retry, runwatch
+from ludics.prreview import comment, reply, resolve, retry, runwatch, space
 from ludics.prreview.core import Config, GhSession, Json
 from ludics.tests.fake import Answer, FakeTool
 
@@ -117,6 +118,28 @@ class Mention(unittest.TestCase):
                 self.assertEqual(rc, 2)
                 self.assertIn("any mention is an instruction to the connector", errs)
         reply.mention_refusal("reply", "the codex review nudge")
+
+
+class SpaceTable(unittest.TestCase):
+    """The class a native Windows interpreter falls back to, read off the environment as Cygwin
+    reads it (the C library's own class is what the reply suite pins, against this bash)."""
+
+    def test_the_table_follows_the_locale_variables(self) -> None:
+        for env, utf8 in (
+            ({"LC_ALL": "en_US.UTF-8"}, True),
+            ({"LC_ALL": "C"}, False),
+            ({"LC_ALL": "", "LC_CTYPE": "", "LANG": "C"}, False),
+            ({"LC_CTYPE": "C.utf8"}, True),
+            ({}, True),
+        ):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
+                table = space._table()  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(table.utf8, utf8)
+                self.assertEqual(table.wide(0x3000), utf8)
+                self.assertEqual(table.wide(0x2003), utf8)
+                self.assertFalse(table.wide(0x00A0), "a no-break space is not whitespace there")
+                self.assertTrue(table.byte(ord("\t")))
+                self.assertFalse(table.byte(0xA0))
 
 
 class Reply(unittest.TestCase):
