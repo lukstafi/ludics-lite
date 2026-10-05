@@ -58,7 +58,7 @@ class RefTransaction:
             # Appending: the reader polls the same file, and an append never truncates under it.
             with open(self.output, "ab") as answers:
                 self.proc = subprocess.Popen(
-                    [exe, "-C", self.checkout, "update-ref", "--stdin"],
+                    [*exe, "-C", self.checkout, "update-ref", "--stdin"],
                     stdin=subprocess.PIPE,
                     stdout=answers,
                 )

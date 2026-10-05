@@ -27,11 +27,17 @@ fi
 # Under Git Bash the interpreter is a native Windows program, and an MSYS process that execs one
 # stays alive beside it with its working directory. One sitting in the session worktree would
 # keep Windows from renaming the session into its archive (ludics-lite#393), so the forwarder
-# leaves for the filesystem root and hands the caller's directory over to restore.
+# leaves for the filesystem root and hands the caller's directory over to restore. TMPDIR goes
+# over in a variable of its own: MSYS rewrites TMPDIR itself for a native program, which roots a
+# relative one.
 case "$(uname -s 2>/dev/null)" in
 MINGW* | MSYS* | CYGWIN*)
   LUDICS_CALLER_CWD=$(cygpath -m "$PWD") || exit 1
   export LUDICS_CALLER_CWD
+  if [ -n "${TMPDIR:-}" ]; then
+    LUDICS_CALLER_TMPDIR=$(cygpath -m "$TMPDIR") || exit 1
+    export LUDICS_CALLER_TMPDIR
+  fi
   cd / || exit 1
   ;;
 esac

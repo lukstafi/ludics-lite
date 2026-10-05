@@ -60,8 +60,67 @@ def _redirect(stream: Stream) -> int | None:
             return subprocess.PIPE
 
 
-def git_executable() -> str | None:
-    return shutil.which("git")
+_WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".com", ".bat", ".cmd")
+
+
+def _is_script(path: str) -> bool:
+    """A file Windows cannot start by itself: no executable suffix, and a ``#!`` line."""
+    if path.lower().endswith(_WINDOWS_EXECUTABLE_SUFFIXES):
+        return False
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def _windows_lookup(name: str) -> str | None:
+    """PATH as Git Bash searches it: in each directory, the bare name (a ``#!`` script such as a
+    suite's fake ``git``) and then the name with each executable suffix, first match winning."""
+    suffixes = [s for s in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if s]
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        for candidate in [name, *(name + suffix.lower() for suffix in suffixes)]:
+            path = os.path.join(directory, candidate)
+            if os.path.isfile(path) and (candidate != name or _is_script(path)):
+                return path
+    return None
+
+
+def msys_name(name: str) -> str:
+    """A file name as Git Bash's own tools spell it. Windows names cannot hold characters 1-31 or
+    ``"*:<>?|``, so MSYS stores each as the private-use character U+F000 plus its code and maps it
+    back for MSYS programs only; the shell helper read such names through `find` and printed the
+    mapped-back spelling. A native interpreter sees the private-use one. Elsewhere: the name."""
+    if os.name != "nt" or not os.environ.get("MSYSTEM"):
+        return name
+    mapped = set(range(1, 32)) | {ord(c) for c in '"*:<>?|'}
+    return "".join(
+        chr(ord(c) - 0xF000) if 0xF000 < ord(c) < 0xF080 and ord(c) - 0xF000 in mapped else c
+        for c in name
+    )
+
+
+def command_argv(name: str) -> list[str] | None:
+    """The argv prefix that runs ``name`` as the shell found it on PATH.
+
+    Under Git Bash the shell ran a ``#!`` script on PATH -- a suite's fake ``git``, a wrapper a box
+    installs -- through its own exec, which reads the line; Windows cannot start such a file, so a
+    native interpreter hands it to the bash on PATH, which is Git Bash's own. Elsewhere the file
+    is started directly, as the shell started it."""
+    exe = _windows_lookup(name) if os.name == "nt" else shutil.which(name)
+    if exe is None:
+        return None
+    if os.name == "nt" and _is_script(exe):
+        shell = shutil.which("bash")
+        if shell is not None:
+            return [shell, exe]
+    return [exe]
+
+
+def git_executable() -> list[str] | None:
+    return command_argv("git")
 
 
 # SHARED-CANDIDATE: run_tool with stream redirections, stdin and env overrides (ludics.proc)
@@ -83,7 +142,7 @@ def git(
     sys.stderr.flush()
     try:
         proc = subprocess.run(
-            [exe, *args],
+            [*exe, *args],
             input=stdin,
             stdout=_redirect(out),
             stderr=_redirect(err),

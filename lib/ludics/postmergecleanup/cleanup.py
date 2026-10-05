@@ -28,6 +28,9 @@ from ludics.postmergecleanup.system import git, substitution
 from ludics.postmergecleanup.transaction import RefTransaction
 
 
+CALLER_TMPDIR = "LUDICS_CALLER_TMPDIR"
+
+
 def fail(message: str) -> NoReturn:
     raise cli.Exit(1, message)
 
@@ -490,7 +493,7 @@ class Cleanup:
             fail(f"could not inspect residual session submodule repositories: {modules}")
         if entries:
             # The directory name derives from the submodule name in `.gitmodules`: shell-quoted.
-            first = substitution(f"{modules}/{entries[0]}")
+            first = substitution(f"{modules}/{system.msys_name(entries[0])}")
             fail(
                 "session has a residual submodule repository; retain or remove it before "
                 f"cleanup: {q(first)}"
@@ -2101,7 +2104,9 @@ def quiet_err_ok(*args: str) -> int:
 def temp_directory() -> str:
     """``${TMPDIR:-/tmp}``; a native Windows interpreter has no ``/tmp``, and takes the one the
     platform names."""
-    value = os.environ.get("TMPDIR", "")
+    # Under Git Bash the forwarder hands TMPDIR over in its own variable: MSYS rewrites TMPDIR
+    # itself for a native program, and a relative one arrived rooted.
+    value = os.environ.pop(CALLER_TMPDIR, "") or os.environ.get("TMPDIR", "")
     if value:
         return value
     if os.name == "nt":
