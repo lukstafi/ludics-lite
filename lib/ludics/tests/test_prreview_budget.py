@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import unittest
 from collections.abc import Sequence
+from unittest import mock
 
 from ludics import proc
 from ludics.prreview import budget, core
@@ -193,6 +194,36 @@ class Holds(Scratch):
         self.assertEqual(names, sorted([f"{T0 + 900}.c", f"{T0 - 1}.b"]))
         with open(os.path.join(self.dir, "quota-last"), encoding="utf-8") as f:
             self.assertEqual(f.read(), f"{T0}\t600\n")
+
+    def test_a_refusal_in_the_lift_doubles_from_the_lifted_hold(self) -> None:
+        # ludics-lite#551: the lift removed the last entry before writing quota-last, so a refusal
+        # landing in between found neither and held for a minute instead of doubling.
+        b = self.budget()
+        self.plant(T0 - 1, "graphql", 600)
+        landed: list[Hold | None] = []
+        real_remove = os.remove
+
+        def remove_then_refuse(path: str) -> None:
+            real_remove(path)
+            if not landed:
+                b.hold_set("repos/o/r/pulls/7", "unprobed")
+                landed.append(b.hold_read())
+
+        with mock.patch.object(budget.os, "remove", remove_then_refuse):
+            b.hold_lift("graphql", T0)
+        self.assertEqual(len(landed), 1)
+        refusal = landed[0]
+        assert refusal is not None
+        self.assertEqual(refusal.length, 1200, "doubled from the hold just lifted")
+
+    def test_quota_hit_says_when_the_hold_cannot_be_recorded(self) -> None:
+        with open(os.path.join(self.dir, "quota-holds"), "w", encoding="utf-8"):
+            pass
+        self.gh = Gh(headers("HTTP/2.0 403 Forbidden", "X-Ratelimit-Remaining: 0", f"X-Ratelimit-Reset: {T0 + 60}"))
+        why = self.budget().quota_hit(["api", "repos/o/r/pulls/7"])
+        assert why is not None
+        self.assertIn("SHIP_PR_STATE_DIR", why)
+        self.assertIsNone(self.budget().quota_hit(["run", "view", "5"]), "nothing to record is no error")
 
     def test_an_entry_this_did_not_write_is_no_hold(self) -> None:
         holds = os.path.join(self.dir, "quota-holds")

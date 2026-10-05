@@ -450,8 +450,13 @@ class Budget:
         """``hold_lift <endpoint> <probe start>``: that endpoint answered its probe. Removes ITS
         entries that had ended when the probe started, and remembers the longest of them in
         quota-last. Another endpoint's entries stay: its answer is its own (GraphQL and REST have
-        separate quotas), so the gate probes each in turn."""
+        separate quotas), so the gate probes each in turn.
+
+        quota-last is written BEFORE any entry goes (ludics-lite#551): a refusal landing between the
+        last entry's removal and that write found neither, and held for a minute instead of
+        doubling from the hold just lifted."""
         longest = 0
+        lifted: list[str] = []
         for until, path in self._entries():
             if until > probe_start:
                 continue
@@ -460,12 +465,14 @@ class Budget:
                 continue
             if _DIGITS.fullmatch(fields[1]) and int(fields[1]) > longest:
                 longest = int(fields[1])
+            lifted.append(path)
+        if longest:
+            self._write_last(longest)
+        for path in lifted:
             try:
                 os.remove(path)
             except OSError:
                 pass
-        if longest:
-            self._write_last(longest)
 
     def _write_last(self, length: int) -> None:
         try:
