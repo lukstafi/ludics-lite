@@ -454,11 +454,14 @@ EOF
 # it would be for real: nothing in these tests reaches a real box. The one exception is
 # `SHIM_SSH_LOCAL=<host>`, which runs whatever reaches that host here, as its remote shell would:
 # the stand-in for a second box, so a cross-box path is exercised through run_on's real quoting.
+# `SHIM_SSH_PY=<list>` is that box's own LUDICS_PY_CANDIDATES: a box whose Pythons are not the
+# coordinator's, which the coordinator's own environment cannot fake (it runs under scripts/py too).
 cat > "$TMP/bin/ssh" <<'SHIMEOF'
 #!/usr/bin/env bash
 host=""
 while [ $# -gt 0 ]; do case "$1" in -o) shift ;; -*) ;; *) host="$1"; break ;; esac; shift; done
 shift
+[ -z "${SHIM_SSH_LOCAL:-}" ] || [ "$host" != "$SHIM_SSH_LOCAL" ] || [ -z "${SHIM_SSH_PY:-}" ] || export LUDICS_PY_CANDIDATES="$SHIM_SSH_PY"
 [ -n "${SHIM_SSH_LOCAL:-}" ] && [ "$host" = "$SHIM_SSH_LOCAL" ] && exec bash -c "$*"
 [ "$*" = "exit 0" ] || { echo "ssh: Could not resolve hostname $host: nodename nor servname provided" >&2; exit 255; }
 [ "$host" = "${SHIM_SSH_HANG:-}" ] && sleep 30
@@ -977,11 +980,30 @@ echo x >> "$repo/ship-pr/SKILL.md"
 expect "a reachable sibling does not swallow the refusal that follows the probe" 1 "1 local change(s) in the served tree" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_SLURP=otherbox "$FW" preflight testbox --no-probe
 git -C "$repo" checkout -q -- ship-pr/SKILL.md
 [ -d "$repo/.git/fleet-checkout.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
-# `execution slot` runs a python3 flock on the box that runs the batches, so Python is no longer
-# an anchor-only requirement and the preflight is where a box missing it must say so.
-mkdir -p "$TMP/nopy"; printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/nopy/python3"; chmod +x "$TMP/nopy/python3"
-expect "a box whose python3 cannot import fcntl refuses (the run-time slot lock needs it)" 1 "no python3 with fcntl" -- \
-  env PATH="$TMP/nopy:$PATH" "$FW" preflight testbox --no-probe
+# `execution slot` runs a flock on the box that runs the batches, and since ludics-lite#403 every
+# fleet-worker.sh verb there but the slot probe runs under scripts/py: the first Python >= 3.12 in
+# its order (LUDICS_PY_CANDIDATES replaces the order). So the preflight asks the box that order --
+# never a bare python3, which on a Mac's non-interactive ssh is Xcode's 3.9 -- and refuses a box
+# where it finds none, or one that cannot import fcntl. The coordinator runs under scripts/py
+# itself, so a box without one is `other` (SHIM_SSH_PY is its own candidate list), and the local
+# box's fixture is an interpreter that is Python >= 3.12 for everything but fcntl.
+real_py=$("$TMP/dispatcher/scripts/py" -c 'import sys; print(sys.executable)')
+mkdir -p "$TMP/pys"
+printf '#!/bin/sh\ncase "$*" in *"import fcntl"*) exit 1 ;; esac\nexec "%s" "$@"\n' "$real_py" > "$TMP/pys/py-nofcntl"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/pys/not-python"
+printf '#!/bin/sh\necho 3.9.6; exit 1\n' > "$TMP/pys/old-python"
+chmod +x "$TMP/pys/py-nofcntl" "$TMP/pys/not-python" "$TMP/pys/old-python"
+expect "a box whose Python >= 3.12 cannot import fcntl refuses (the run-time slot lock needs it)" 1 \
+  "PREFLIGHT REFUSED testbox: $TMP/pys/py-nofcntl, the Python >= 3.12 scripts/py would run here, cannot import fcntl" -- \
+  env LUDICS_PY_CANDIDATES="$TMP/pys/py-nofcntl" "$FW" preflight testbox --no-probe --no-cross
+expect "a box with no Python >= 3.12 in scripts/py's order refuses, naming what it found" 1 \
+  "PREFLIGHT REFUSED other: no Python >= 3.12 in scripts/py's order on other (tried $TMP/pys/missing: absent, $TMP/pys/old-python: Python 3.9.6, $TMP/pys/not-python: not Python (exit 1)): fleet-worker.sh runs under it here" -- \
+  env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other SHIM_SSH_PY="$TMP/pys/missing
+$TMP/pys/old-python
+$TMP/pys/not-python" "$FW" preflight other --no-probe --no-cross
+expect "...and passes once the order reaches one" 0 "^PREFLIGHT OK other skills=[0-9a-f]*$" -- \
+  env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other SHIM_SSH_PY="$TMP/pys/old-python
+$real_py" "$FW" preflight other --no-probe --no-cross
 mkdir -p "$TMP/pk-yes" "$TMP/pk-no"; printf '#!/bin/sh\nexit 0\n' > "$TMP/pk-yes/pkcheck"; printf '#!/bin/sh\nexit 1\n' > "$TMP/pk-no/pkcheck"
 chmod +x "$TMP/pk-yes/pkcheck" "$TMP/pk-no/pkcheck"; printf '#!/bin/sh\n' > "$TMP/pk-yes/fleet-test-inhibit"; chmod +x "$TMP/pk-yes/fleet-test-inhibit"
 expect "a box with systemd-inhibit and the polkit grant adds nothing to the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- \

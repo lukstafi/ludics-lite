@@ -252,7 +252,9 @@ to deploy), a deployed skill symlink that does not point into the checkout (and,
 three `~/.codex/skills` links the README's Codex loop installs), and, for CLI workers only, a
 live one-word headless turn. `claude auth status` cannot stand in for that probe (2026-09-02:
 it reported `loggedIn:true` on minix while every `claude -p` there failed with an expired,
-unrefreshable OAuth session). Every mode also makes the box's GitHub call, `gh api user`, in the
+unrefreshable OAuth session). Every mode refuses a box with no Python >= 3.12 in `scripts/py`'s
+order, under which every `fleet-worker.sh` verb there but the slot probe runs (ludics-lite#403).
+Every mode also makes the box's GitHub call, `gh api user`, in the
 session kind a worker or leg uses, a non-interactive ssh (a local shell on the anchor), and
 refuses a token that call rejects (ludics-lite#360: on 2026-09-23 a dead keyring token surfaced
 an hour into a worker's task, and on 2026-09-24 minix's token answered HTTP 401 over ssh while

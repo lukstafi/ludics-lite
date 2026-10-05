@@ -151,8 +151,9 @@ def in_roster(cfg: Config, name: str) -> bool:
     return name in cfg.boxes.split()
 
 
-def box_spec_count(cfg: Config, variable: str, spec: str, box: str, default: int) -> int:
-    """The shared reader of the two ``<box>=<n>`` specs: the box's count, or ``default``."""
+def box_spec_text(cfg: Config, variable: str, spec: str, box: str, default: str) -> str:
+    """The shared reader of the two ``<box>=<n>`` specs: the box's count as the spec spells it
+    (``007`` stays ``007``, as the shell echoed it), or ``default``."""
     found = default
     for pair in spec.split():
         name, sep, count = pair.partition("=")
@@ -161,8 +162,13 @@ def box_spec_count(cfg: Config, variable: str, spec: str, box: str, default: int
         if not in_roster(cfg, name):
             raise SpecError(f"{variable} names {name}, which is not in FLEET_BOXES")
         if name == box:
-            found = int(count)
+            found = count
     return found
+
+
+def box_spec_count(cfg: Config, variable: str, spec: str, box: str, default: int) -> int:
+    """``box_spec_text`` as a number."""
+    return int(box_spec_text(cfg, variable, spec, box, str(default)))
 
 
 def box_correctness_slots(cfg: Config, box: str) -> int:
@@ -171,5 +177,14 @@ def box_correctness_slots(cfg: Config, box: str) -> int:
 
 def box_gpu_tokens(cfg: Config, box: str) -> int:
     """How many of the box's slots may hold its GPU at once; one per slot where the spec is silent."""
-    slots = box_correctness_slots(cfg, box)
-    return box_spec_count(cfg, "FLEET_BOX_GPU_TOKENS", cfg.gpu_tokens, box, slots)
+    return int(box_gpu_tokens_text(cfg, box))
+
+
+def box_correctness_slots_text(cfg: Config, box: str) -> str:
+    return box_spec_text(cfg, "FLEET_BOX_CORRECTNESS_SLOTS", cfg.slots, box, "1")
+
+
+def box_gpu_tokens_text(cfg: Config, box: str) -> str:
+    """The token count as the spec spells it, or the slot count's spelling where it is silent."""
+    slots = box_correctness_slots_text(cfg, box)
+    return box_spec_text(cfg, "FLEET_BOX_GPU_TOKENS", cfg.gpu_tokens, box, slots)
