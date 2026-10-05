@@ -128,21 +128,26 @@ reset_fixture() {
   rm -f "$GH_REFUSED_FILE"
 }
 
-# cmd_run_watch in a command substitution: its refusals call `exit`, and a subshell is what keeps
-# them from ending this reporter. The subshell is also where AWAIT_WAIT is applied, so a case that
-# shortens the deadline cannot leak that to the next one.
+# `retry run watch` in a command substitution: its refusals call `exit`, and a subshell is what
+# keeps them from ending this reporter. The subshell is also where AWAIT_WAIT is applied, so a case
+# that shortens the deadline cannot leak that to the next one. It drives the subcommand a caller
+# runs, `cmd_retry`, and not the await's internal function, so the cases hold whichever language
+# serves the subcommand (ludics-lite#403).
 AWAIT_WAIT=""
 run_await() {
   local rc
   : >"$CALL_LOG"
   set +e
-  AWAIT_OUT=$(CHECKS_WAIT="${AWAIT_WAIT:-$CHECKS_WAIT}" cmd_run_watch "$@" 2>&1)
+  AWAIT_OUT=$(CHECKS_WAIT="${AWAIT_WAIT:-$CHECKS_WAIT}" cmd_retry run watch "$@" 2>&1)
   rc=$?
   set -e
   AWAIT_RC="$rc"
 }
 
 gh_calls() { cat "$CALL_LOG"; }
+# How many `gh api` calls were made: the log has a line per call, but a call's field can hold
+# newlines of its own (a reply's body, a GraphQL query), so the calls are counted by their head.
+api_calls() { grep -c '^api ' "$CALL_LOG" || true; }
 
 # cmd_retry in a command substitution, for the same reason: its verdicts call `exit`.
 run_retry() {
@@ -178,7 +183,7 @@ test_bare_run_id_without_a_repo_is_refused() {
   scratch_checkout
   : >"$CALL_LOG"
   set +e
-  AWAIT_OUT=$(cd "$CWD_CHECKOUT" && cmd_run_watch 12345 2>&1)
+  AWAIT_OUT=$(cd "$CWD_CHECKOUT" && cmd_retry run watch 12345 2>&1)
   rc=$?
   set -e
   assert_eq "$rc" 2 "a bare run id with no repo is an invocation error ($AWAIT_OUT)"
@@ -541,7 +546,8 @@ test_a_delegating_command_refusal_is_not_read() {
 
 # Inside the process: a refusal of an argument the script itself sends is a gh/script version
 # mismatch, so the call is not retried, the caller's verdict is not printed over it, and nothing
-# after it calls gh. Sourced, there is no main to signal, so the caller's `fail` is the exit 2.
+# after it calls gh. Each block drives a subcommand as the suite's other cases do (sourced, with
+# the fixture gh), so it pins the behaviour whether the shell or the Python serves the subcommand.
 OWN_REFUSAL='Unknown JSON field: "status"'
 test_the_scripts_own_refused_call_is_exit_2() {
   local rc out
@@ -557,43 +563,74 @@ test_the_scripts_own_refused_call_is_exit_2() {
   assert_contains "$AWAIT_OUT" "-> $OWN_REFUSAL. That is a version mismatch" "and quotes gh's refusal"
   assert_not_contains "$AWAIT_OUT" "UNKNOWN" "it is not transport"
   assert_not_contains "$AWAIT_OUT" "attempts" "and no retry count is reported"
-  # The merge write, under the write policy: refused, not ambiguous, and not re-sent.
+  # A write of the script's own, under the write policy: refused, not ambiguous, and not re-sent.
+  # This block drove the merge write through the internal gh_retry; it drives a writing subcommand
+  # now, so it holds for the Python port too, and the merge write itself is pinned whole-process
+  # in the next case, against a refusing gh on PATH.
   reset_fixture
   CLIENT_ERROR="$OWN_REFUSAL"
   set +e
-  out=$(gh_retry write pr merge 7 --repo example/repo --merge --match-head-commit abc 2>&1)
+  out=$(cmd_comment example/repo#7 "The comment." 2>&1)
   rc=$?
   set -e
-  assert_eq "$rc" 2 "a refused merge call is exit 2 ($out)"
-  assert_contains "$out" "gh pr merge 7 --repo example/repo --merge" "naming the call"
-  assert_eq "$(gh_calls | wc -l | tr -d ' ')" 1 "and it is not re-sent"
+  assert_eq "$rc" 2 "a refused comment write is exit 2 ($out)"
+  assert_contains "$out" "gh api -X POST repos/example/repo/issues/7/comments -f body=... --jq .html_url" \
+    "naming the call"
+  assert_not_contains "$out" "AMBIGUOUSLY" "not a write that may have landed"
+  assert_eq "$(api_calls)" 1 "and it is not re-sent"
   # A field's value is payload, and is not copied into the message (review of #490): a refused
-  # reply names its endpoint and its field, never the text that was not posted.
+  # reply names its endpoint and its raw field, and a refused body edit its typed `@file` field,
+  # never the text that was not posted nor the file it was read from.
   reset_fixture
   CLIENT_ERROR="unknown flag: --raw-field"
   set +e
-  out=$(gh_retry write api -X POST repos/example/repo/pulls/7/comments/9/replies \
-    -f 'body=a private draft' -F "body=@/private/path" --jq .html_url 2>&1)
+  out=$(cmd_reply example/repo#7 9 'a private draft' 2>&1)
   rc=$?
   set -e
   assert_eq "$rc" 2 "a refused reply is exit 2 ($out)"
-  assert_contains "$out" "repos/example/repo/pulls/7/comments/9/replies -f body=... -F body=... --jq" \
-    "the call keeps its endpoint and field names"
-  assert_not_contains "$out" "private" "and loses the field values"
-  # After a refusal, the same process calls gh no more, and a verdict composed afterwards exits 2
-  # in silence instead of claiming transport.
+  assert_contains "$out" "repos/example/repo/pulls/7/comments/9/replies -f body=... --jq .html_url" \
+    "the call keeps its endpoint and field name"
+  assert_not_contains "$out" "private" "and loses the field's value"
+  reset_fixture
+  printf 'a private draft\n' >"$TEST_ROOT/secret-draft.md"
+  CLIENT_ERROR="unknown flag: --field"
+  set +e
+  out=$(cmd_body example/repo#7 "$TEST_ROOT/secret-draft.md" 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 2 "a refused body edit is exit 2 ($out)"
+  assert_contains "$out" "repos/example/repo/pulls/7 -F body=... --jq .html_url" \
+    "the call keeps its endpoint and field name"
+  assert_not_contains "$out" "secret-draft" "and loses the file the value was read from"
+  assert_not_contains "$out" "private draft" "and its content"
+  # After a refusal, the command calls gh no more, and the verdict it would have composed from the
+  # refused call is not printed over it: the refusal is said once, and the exit is 2, not the 3 a
+  # write or a lookup that did not go through reports. This block ran gh_retry twice in one
+  # subshell to show the marker file stopping the second call; it drives the two subcommands that
+  # make several calls now, a folded reply and a folded resolve, whose second call is the one that
+  # must never be made.
   reset_fixture
   CLIENT_ERROR="$OWN_REFUSAL"
   set +e
-  out=$( (gh_retry read api repos/example/repo/pulls/7) 2>/dev/null
-    CLIENT_ERROR=""
-    x=$(gh_retry read api repos/example/repo/pulls/8) || fail 3 "the API never answered"
-    echo "not reached: $x")
+  out=$(cmd_reply example/repo#7 900+901 "The answer." 2>&1)
   rc=$?
   set -e
-  assert_eq "$rc" 2 "the caller's exit 3 becomes the refusal's 2 ($out)"
-  assert_eq "$out" "" "and prints nothing over it"
-  assert_eq "$(gh_calls)" "api repos/example/repo/pulls/7" "the second call never reached gh"
+  assert_eq "$rc" 2 "the reply's refused write is exit 2 ($out)"
+  assert_eq "$(api_calls)" 1 "the second thread's write never reached gh"
+  assert_eq "$(grep -c 'refused this script' <<<"$out")" 1 "the refusal is said once"
+  assert_not_contains "$out" "did not go through" "and no transport verdict follows it"
+  assert_not_contains "$out" "AMBIGUOUSLY" "nor an ambiguous one"
+  reset_fixture
+  CLIENT_ERROR="$OWN_REFUSAL"
+  set +e
+  out=$(cmd_resolve example/repo#7 900+901 2>&1)
+  rc=$?
+  set -e
+  assert_eq "$rc" 2 "the resolve's refused lookup is exit 2 ($out)"
+  assert_eq "$(api_calls)" 1 "no second call reached gh"
+  assert_eq "$(grep -c 'refused this script' <<<"$out")" 1 "the refusal is said once"
+  assert_not_contains "$out" "did not complete" "and no transport verdict follows it"
+  assert_not_contains "$out" "no review thread" "nor a missing thread"
   reset_fixture
 }
 
@@ -818,30 +855,41 @@ test_a_plain_retry_keeps_its_exits_apart() {
 
 # --- the shared parse -------------------------------------------------------------------------
 
-# parse_ref is what both this command and pr_arg read their argument with; pinning it directly
-# keeps the two spellings from drifting apart behind their different refusal messages.
+# parse_ref is what both this await and every PR argument read their argument with; pinning both
+# readers here keeps the two spellings from drifting apart behind their different refusal messages.
+# It drives the subcommands (`retry run watch`, `comment`), not the internal function, so it holds
+# for the Python port (ludics-lite#403). Not carried over from the in-process form: that a failed
+# parse leaves no REF_REPO/REF_NUM behind, which is shell state a subcommand never shows.
 test_parse_ref() {
-  parse_ref example/repo#12 || bail "owner/name#number should parse"
-  assert_eq "$REF_REPO" example/repo "the repo comes off the argument"
-  assert_eq "$REF_NUM" 12 "the number comes off the argument"
-  parse_ref 34 || bail "a bare number should parse"
-  assert_eq "$REF_REPO" "" "a bare number carries no repo, and says so as empty"
-  assert_eq "$REF_NUM" 34 "the bare number is the number"
+  reset_fixture
+  run_await example/repo#12
+  assert_eq "$AWAIT_RC" 0 "owner/name#number should parse ($AWAIT_OUT)"
+  assert_contains "$(gh_calls)" "run view 12 --repo example/repo" "the repo and the number come off the argument"
+  reset_fixture
+  run_await -R example/repo 34
+  assert_eq "$AWAIT_RC" 0 "a bare number should parse ($AWAIT_OUT)"
+  assert_contains "$(gh_calls)" "run view 34 --repo example/repo" "and take the repo named beside it"
   # The names GitHub actually allows on both halves, so the tightening below refuses only what
   # cannot be a repository.
-  parse_ref my-org_1.x/repo.name-2#7 || bail "dots, dashes and underscores should parse"
-  assert_eq "$REF_REPO" my-org_1.x/repo.name-2 "the repo comes through intact"
-  assert_eq "$REF_NUM" 7 "and the number with it"
-  local rc bad
+  reset_fixture
+  run_await my-org_1.x/repo.name-2#7
+  assert_eq "$AWAIT_RC" 0 "dots, dashes and underscores should parse ($AWAIT_OUT)"
+  assert_contains "$(gh_calls)" "run view 7 --repo my-org_1.x/repo.name-2" "the repo comes through intact"
+  local rc bad out
   for bad in example/repo#x "" "#123" "junk#123" "example/repo#111#222" "example/repo/extra#1" \
     "example repo#1" "/repo#1" "example/#1" "example/repo#" "example/repo"; do
+    reset_fixture
+    run_await -R example/repo "$bad"
+    assert_eq "$AWAIT_RC" 2 "'$bad' must not parse as a run ($AWAIT_OUT)"
+    assert_eq "$(gh_calls)" "" "and nothing is read for '$bad'"
+    reset_fixture
     set +e
-    parse_ref "$bad"
+    out=$(cmd_comment "$bad" "The comment." 2>&1)
     rc=$?
     set -e
-    assert_eq "$rc" 1 "'$bad' must not parse"
-    assert_eq "$REF_REPO" "" "'$bad' must leave no repo behind"
-    assert_eq "$REF_NUM" "" "'$bad' must leave no number behind"
+    assert_eq "$rc" 2 "'$bad' must not parse as a PR ($out)"
+    assert_contains "$out" "PR must be a number or owner/name#number, got '$bad'" "and is refused as one"
+    assert_eq "$(gh_calls)" "" "and nothing is posted for '$bad'"
   done
 }
 
