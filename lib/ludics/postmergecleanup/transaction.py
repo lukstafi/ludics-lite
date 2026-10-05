@@ -49,8 +49,8 @@ class RefTransaction:
             self.reader = os.open(self.output, os.O_RDONLY)
         except OSError:
             return f"could not open the {what} transaction output"
-        exe = system.git_executable()
-        if exe is None:
+        argv = system.spawn_args(["-C", self.checkout, "update-ref", "--stdin"])
+        if argv is None:
             return f"could not start the {what} transaction"
         sys.stdout.flush()
         sys.stderr.flush()
@@ -58,7 +58,7 @@ class RefTransaction:
             # Appending: the reader polls the same file, and an append never truncates under it.
             with open(self.output, "ab") as answers:
                 self.proc = subprocess.Popen(
-                    [*exe, "-C", self.checkout, "update-ref", "--stdin"],
+                    argv,
                     stdin=subprocess.PIPE,
                     stdout=answers,
                 )

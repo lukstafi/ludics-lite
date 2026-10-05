@@ -123,6 +123,40 @@ def git_executable() -> list[str] | None:
     return command_argv("git")
 
 
+def windows_command_line(argv: list[str]) -> str:
+    """Every argument double-quoted, by the C runtime's rules. A Cygwin/MSYS program started by a
+    native one parses its own command line and expands each UNQUOTED word as a glob, braces
+    included -- `<oid>^{object}` arrived at a fake git as `<oid>^object` -- so a #! script run
+    through Git Bash's bash gets nothing unquoted."""
+    words: list[str] = []
+    for arg in argv:
+        out: list[str] = []
+        slashes = 0
+        for char in arg:
+            if char == "\\":
+                slashes += 1
+                continue
+            if char == '"':
+                out.append("\\" * (2 * slashes + 1) + '"')
+            else:
+                out.append("\\" * slashes + char)
+            slashes = 0
+        out.append("\\" * (2 * slashes))
+        words.append('"' + "".join(out) + '"')
+    return " ".join(words)
+
+
+def spawn_args(args: list[str]) -> list[str] | str | None:
+    """What subprocess runs for ``git args``: the argv, or -- under Windows, for a #! script that
+    Git Bash's bash runs -- the fully quoted command line. None when there is no git."""
+    prefix = git_executable()
+    if prefix is None:
+        return None
+    if len(prefix) > 1:
+        return windows_command_line([*prefix, *args])
+    return [*prefix, *args]
+
+
 # SHARED-CANDIDATE: run_tool with stream redirections, stdin and env overrides (ludics.proc)
 def git(
     *args: str,
@@ -132,8 +166,8 @@ def git(
     stdin: bytes | None = None,
 ) -> Done:
     """Run ``git args``; ``env`` adds to (does not replace) the process environment."""
-    exe = git_executable()
-    if exe is None:
+    argv = spawn_args(list(args))
+    if argv is None:
         if err == "inherit":
             cli.note(PROG, "git: command not found")
         return Done(127, "")
@@ -142,7 +176,7 @@ def git(
     sys.stderr.flush()
     try:
         proc = subprocess.run(
-            [*exe, *args],
+            argv,
             input=stdin,
             stdout=_redirect(out),
             stderr=_redirect(err),

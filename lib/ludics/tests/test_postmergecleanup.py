@@ -168,6 +168,20 @@ class Paths(unittest.TestCase):
         self.assertTrue(system.has_nonzero("00a0"))
 
 
+class WindowsSpawning(unittest.TestCase):
+    def test_every_word_is_quoted_by_the_c_runtime_rules(self) -> None:
+        self.assertEqual(
+            system.windows_command_line(["bash", "abc^{object}", "a b", ""]),
+            '"bash" "abc^{object}" "a b" ""',
+        )
+        self.assertEqual(system.windows_command_line(['q"t', "end\\"]), '"q\\"t" "end\\\\"')
+
+    def test_names_are_untouched_outside_git_bash(self) -> None:
+        if os.name == "nt":
+            self.skipTest("POSIX only")
+        self.assertEqual(system.msys_name("nes\uf00ated"), "nes\uf00ated")
+
+
 class Files(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = os.path.realpath(tempfile.mkdtemp(prefix="ludics-pmc-test."))

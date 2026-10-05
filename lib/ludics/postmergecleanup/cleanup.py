@@ -68,10 +68,10 @@ def show(path: str) -> str:
 
 def canonical_dir(path: str) -> str:
     if not system.is_dir(path):
-        fail(f"directory does not exist: {show(path)}")
+        fail(f"directory does not exist: {path}")
     resolved = system.physical_directory(path)
     if resolved is None:
-        fail(f"cannot resolve directory: {show(path)}")
+        fail(f"cannot resolve directory: {path}")
     return resolved
 
 
