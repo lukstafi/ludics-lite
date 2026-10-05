@@ -7,6 +7,7 @@ name the way the shell printed it, and the status.
 """
 
 import io
+import os
 import sys
 from collections.abc import Callable
 from typing import NoReturn
@@ -64,10 +65,26 @@ def main_guard(prog: str, run: Callable[[list[str]], int], argv: list[str]) -> i
     """Run ``run(argv)``; an ``Exit`` from anywhere inside becomes its message and status."""
     setup_streams()
     try:
-        return run(argv)
-    except Exit as end:
-        if end.message:
-            sys.stdout.flush()
-            sys.stderr.write(end.message + "\n" if end.raw else f"{prog}: {end.message}\n")
-            sys.stderr.flush()
-        return end.rc
+        try:
+            return run(argv)
+        except Exit as end:
+            if end.message:
+                sys.stdout.flush()
+                sys.stderr.write(end.message + "\n" if end.raw else f"{prog}: {end.message}\n")
+                sys.stderr.flush()
+            return end.rc
+    except BrokenPipeError:
+        return broken_pipe(prog)
+
+
+def broken_pipe(prog: str) -> int:
+    """stdout's reader closed early (``| head -1``). The shell's ``printf`` died of SIGPIPE there:
+    exit 141 (128 + 13), never a status this CLI gives a meaning -- 1 says the API rejected the
+    call. stdout is pointed at the null device so the interpreter's own flush at exit cannot fail
+    a second time with a traceback."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, sys.stdout.fileno())
+    os.close(devnull)
+    sys.stderr.write(f"{prog}: printf: write error: Broken pipe\n")
+    sys.stderr.flush()
+    return 141

@@ -213,7 +213,7 @@
 #                                          # several: the body goes to the first thread and each
 #                                          # duplicate gets a one-line pointer to that reply, from
 #                                          # this one invocation. A body mentioning '@codex' is
-#                                          # refused unless --allow-mention (see mention_refusal)
+#                                          # refused unless --allow-mention (see prreview/reply.py)
 #   pr-review.sh reply <pr> <comment-id>[+...] --anchor <comment-id>
 #                                          # no body: the answer already stands in <comment-id>'s
 #                                          # thread, and every id in the token is pointed at it.
@@ -224,7 +224,7 @@
 #                                          # a plain PR comment, for what has no thread to reply in:
 #                                          # a review SUMMARY's findings, or a '@codex review' nudge
 #                                          # (the one body that may mention '@codex' without the
-#                                          # flag; see mention_refusal)
+#                                          # flag; see prreview/reply.py)
 #   pr-review.sh body <pr> <file>          # replace the PR's description with the file's content,
 #                                          # over REST: `gh pr edit --body-file` rides GraphQL and
 #                                          # fails on a repo whose PRs trip the classic-Projects
@@ -2748,11 +2748,13 @@ cmd_rounds() {
 # on its prefix. Reads: one call per 100 threads, made only where an approval is about to be
 # reported or acted on — never on a watch round that is not ending on one.
 #
-# `find_thread` (what `resolve` looks a thread up with) reads the same connection, and both go
-# through `threads_walk`: one query, one paging loop, one cap. Every thread this read can name is
-# then one the advertised `resolve` can reach, by the same id — the two once paged to different
-# caps (review of #370, round 1), and a lookup matching only `databaseId` would miss a thread the
-# gate named by its `fullDatabaseId`.
+# `resolve`'s lookup (find_thread, ported to lib/ludics/prreview/resolve.py with a port of
+# `threads_walk` beside it, ludics-lite#403) reads the same connection: one query, one paging loop,
+# one cap -- the cap reaches it through PY_FORWARD_VARS, so the two cannot drift apart. Every thread
+# this read can name is then one the advertised `resolve` can reach, by the same id — the two once
+# paged to different caps (review of #370, round 1), and a lookup matching only `databaseId` would
+# miss a thread the gate named by its `fullDatabaseId`. THREADS_QUERY and THREAD_ID_JQ have their
+# copies there too, until the gate's port leaves one home for all three.
 THREADS_PAGE_CAP=50
 THREADS_QUERY='query($owner:String!, $name:String!, $pr:Int!, $after:String) {
   repository(owner:$owner, name:$name) { pullRequest(number:$pr) {
@@ -3630,552 +3632,18 @@ watch_loop() {
   return 1
 }
 
-# Replies carry the automated-work marker so a human scanning the thread knows what wrote them.
-# The comment-id argument of `reply` and `resolve` is the token poll RENDERS — `900` for an
-# ordinary thread, `900+901+902` for a folded entry (see fold_inline) — so the caller pastes back
-# what it read instead of re-deriving a list. Splits it into FOLD_IDS, space-joined, anchor first;
-# refuses anything else, because the split is new and an id that silently stayed "900+901" would
-# address no comment and come back as a 404 the caller would read as a missing thread.
-FOLD_IDS=""
-split_ids() { # <token> <command name, for the message>
-  local id
-  FOLD_IDS=""
-  # The WHOLE token is matched against the grammar BEFORE anything is split off it, and checking
-  # each piece afterwards is not the same thing: the split is an unquoted expansion, so it also
-  # word-splits and GLOBS. A token carrying whitespace ("900 901") would arrive as two pieces a
-  # per-piece numeric check accepts and be written to twice, and one carrying a glob character
-  # ("*") would expand against the caller's working directory, where a numeric filename would
-  # become a comment id this script then replies to and resolves (round 1 of #86). Digits and
-  # single `+`, nothing else, so nothing that reaches the split can split or expand further.
-  case "$1" in
-  '' | *[!0-9+]* | *"++"* | "+"* | *"+")
-    die "$2: '$1' is not a comment id — a comment id is digits, and several are joined by single" \
-      "'+' as poll renders a folded entry (900+901+902)" ;;
-  esac
-  for id in ${1//+/ }; do
-    # Repeats are dropped rather than refused: they cost a duplicate write, and the entry they
-    # came from is one finding either way.
-    case " $FOLD_IDS " in *" $id "*) continue ;; esac
-    FOLD_IDS="$FOLD_IDS $id"
-  done
-}
-
-# ids_from <space-joined ids> <first id to keep>: the tail of the list starting at that id, for a
-# message that has to say which of a batch is still unanswered.
-ids_from() {
-  local id out="" seen=""
-  for id in $1; do
-    if [ -z "$seen" ] && [ "$id" != "$2" ]; then continue; fi
-    seen=1
-    out="$out $id"
-  done
-  printf '%s' "$out"
-}
-
-# ids_token <space-joined ids>: the same list as the TOKEN this command takes. A retry set is
-# printed through this and never as the internal space-joined form, which is not something the
-# caller can paste back (round 3 of ludics-lite#86).
-ids_token() {
-  local id out=""
-  for id in $1; do
-    if [ -z "$out" ]; then out="$id"; else out="$out+$id"; fi
-  done
-  printf '%s' "$out"
-}
-
-# Where a thread lives, from its first comment id alone — the anchor URL a `--anchor` retry points
-# at, which no read is spent on because this is the html_url shape GitHub serves for a review
-# comment (verified on this repository's own PRs).
-thread_url() { # <pr> <comment-id>
-  printf 'https://github.com/%s/pull/%s#discussion_r%s' "$REPO" "$1" "$2"
-}
-
-# One reply into one thread. Prints the reply's html_url and returns gh_retry's code; the CALLER
-# composes the failure, because what a failure means depends on how far the batch got.
-post_reply() { # <pr> <comment-id> <body>
-  gh_retry write api -X POST "repos/$REPO/pulls/$1/comments/$2/replies" \
-    -f body="$3
-
-_🤖 Addressed by an automated coding agent_" --jq .html_url
-}
-
-# What a failed reply says, with the batch's progress in it. A reply is the one write here that
-# cannot be repeated safely, so a refusal that said "nothing was posted" after the anchor had
-# landed would invite a caller to post the same body twice.
-#
-# The progress turns on the CLASSIFICATION as much as on how far the batch got, and conflating
-# the two is how the first cut of this printed a contradiction: an ambiguous first write (a 500,
-# a dropped connection — a request that may well have been served) left `answered` empty, so the
-# note said "nothing in this invocation was posted, so repeat it whole" directly under a sentence
-# saying the reply may have landed (round 2 of #86). The retry set is stated instead of the
-# instruction, because only for an ambiguous failure is it a question — and there it is stated as
-# the question it is, with both answers.
-reply_failed() { # <pr> <comment-id> <rc> <ids answered> <ids not answered, first> <anchor, or empty>
-  local pr="$1" id="$2" rc="$3" answered="$4" rest="$5" anchor="$6" landed="" after retry keep
-  after="${rest#" $id"}"
-  # The retry set as something the caller can paste. Once the ANSWER is standing in a thread, the
-  # retry must keep pointing at THAT thread: handing the suffix back plain would promote its first
-  # id to anchor, post the composed body there a second time and point the rest at the copy
-  # (round 3 of ludics-lite#86). `--anchor` is what says "the answer is already in that thread".
-  keep=""
-  [ -z "$anchor" ] || keep=" --anchor $anchor"
-  retry="$(ids_token "$rest")$keep"
-  [ -z "$answered" ] || landed="The replies to$answered DID land, so do not repeat those. "
-  case "$rc" in
-  # A gateway refusal is a request no backend ran (gh_retry's write policy is narrower than a
-  # read's for exactly this reason), so comment $id got nothing and the retry set is exact.
-  3) fail 3 "reply to comment $id on PR $REPO#$pr did not go through — the API refused it at the" \
-    "gateway on all $API_ATTEMPTS attempts ($(gh_err_line)). ${landed}Nothing was posted for" \
-    "comment $id, so retry with: $retry" ;;
-  esac
-  api_rejection "$(gh_err_line)" &&
-    fail 1 "reply to comment $id on PR $REPO#$pr was REJECTED, not dropped: $(gh_err_line)." \
-      "Retrying prints the same thing — check the comment id and the PR. ${landed}Comment $id got" \
-      "nothing, so once the id is right, retry with: $retry"
-  fail 3 "reply to comment $id on PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line)." \
-    "That is not a gateway refusal, so the reply MAY have landed and this script will not post it" \
-    "twice. ${landed}Read comment $id's thread: retry with: $retry if the reply is not there;" \
-    "${after:+retry with: $(ids_token "$after") --anchor ${anchor:-$id} if it is}" \
-    "${after:-there is nothing else outstanding if it is}"
-}
-
-# --- an '@codex' mention in a written body (ludics-lite#472) -------------------------------------
-# Any mention of the connector is an instruction to it, wherever it stands in the body. On PR #465
-# a thread reply rebutting a finding QUOTED the nudge ('@codex review') to explain the re-request
-# rule; the connector took the quote as a request and answered in that thread "To use Codex here,
-# create an environment for this repo" (inline comment 4138519259), and `watch` numbered the
-# answer as round 5. A request can also clear an approval, and nothing about it is undoable once
-# posted. So `reply` and `comment` REFUSE a body that mentions it, before any request, unless the
-# caller passes --allow-mention to say the mention is meant: a refusal costs a rephrase ("the
-# codex review nudge"), where a missed mention costs a round.
-#
-# Boundary, as a fail-closed allowlist: the ONE body that passes with a mention in it is
-# `comment`'s bare nudge, exactly '@codex review' with trailing whitespace allowed (the shape
-# status_state reads as a request). Every other body holding the characters '@codex', in any
-# letter case, refuses: inside a code span or a fence, quoted, inside an email-like word, or as
-# the prefix of a longer handle (`@codex-bot`). Not read: Markdown structure, whether GitHub
-# renders the mention as a link, or whether the connector would act on it, none of which this
-# script can know. `reply` has no allowlisted body: the nudge goes to the PR conversation through
-# `comment`, and a thread is where the connector answered a mention with its environment reply.
-mention_refusal() { # <reply|comment> <body>; exit 2 on a mention the allowlist does not name
-  local cmd="$1" body="$2" trimmed
-  case "$body" in *@[Cc][Oo][Dd][Ee][Xx]*) ;; *) return 0 ;; esac
-  trimmed="${body%"${body##*[![:space:]]}"}"
-  [ "$cmd" != comment ] || [ "$trimmed" != "@codex review" ] || return 0
-  local nudge="the bare nudge is the one body that may mention it"
-  [ "$cmd" = comment ] || nudge="a nudge goes through \`comment <pr> '@codex review'\`, never a thread"
-  die "$cmd: the body mentions '@codex', and any mention is an instruction to the connector —" \
-    "a quoted '@codex review' summoned it on PR #465 and drew a reply counted as a round. Rephrase" \
-    "without the at-sign (\"the codex review nudge\"), or pass --allow-mention if the mention is" \
-    "meant; $nudge. Nothing was posted."
-}
-
-# One invocation answers a whole folded entry: the body goes to the ANCHOR (the first id), and
-# each duplicate gets a one-line pointer to the anchor's reply. That is what makes a duplicate
-# cheap — one composed answer instead of one per thread (ludics-lite#76).
-#
-# The duplicates get a pointer REPLY rather than a bare resolve because a thread closed with
-# nothing in it reads, to the reviewer and to the next archaeologist, as a finding answered in
-# silence — which is what this loop exists to prevent. It is one line, and it says where the
-# answer is. `resolve` then closes each of them, taking the same token.
-#
-# Every reply's html_url is printed, one per line, in the order they were posted, so the caller
-# can see which threads it actually reached.
-cmd_reply() {
-  local anchor="" args=() arg allow_mention=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --allow-mention)
-      allow_mention=1
-      shift
-      ;;
-    --anchor)
-      anchor="${2:-}"
-      shift 2 || die "reply: --anchor takes the comment id of the thread the answer is already in"
-      ;;
-    --anchor=*)
-      anchor="${1#--anchor=}"
-      shift
-      ;;
-    *)
-      args+=("$1")
-      shift
-      ;;
-    esac
-  done
-  set -- ${args[@]+"${args[@]}"}
-  # Exactly three, checked rather than left to ${3:?...} — which exits 1, the code that means "the
-  # fact does not hold", for what is an invocation error. And a body is a sentence: an unquoted one
-  # arrives as several arguments, and the ${3:?} form would post its first word and drop the rest,
-  # which reads as a posted reply (cmd_comment's trap, same remedy). With --anchor there is no
-  # body at all: the answer is already written, and these threads are being pointed at it.
-  local body=""
-  if [ -n "$anchor" ]; then
-    [ $# -eq 2 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] --anchor <comment-id> —" \
-      "got $# positional argument(s). With --anchor the answer already stands in that thread," \
-      "so no body is taken: every id in the token is pointed at it."
-    case "$anchor" in '' | *[!0-9]*) die "reply: --anchor takes one comment id, got '$anchor'" ;; esac
-  else
-    [ $# -eq 3 ] || die "usage: reply <pr> <comment-id>[+<comment-id>...] <body> [--allow-mention] — got $# argument(s)." \
-      "The body is ONE argument: quote it, including a multi-line one."
-    body="$3"
-    [ -n "${body//[[:space:]]/}" ] || die "reply: the body is empty; there is nothing to post"
-    [ -n "$allow_mention" ] || mention_refusal reply "$body"
-  fi
-  local pr="$1" ids="$2"
-  pr_arg "$pr"
-  pr="$PR_NUM"
-  split_ids "$ids" reply
-  local id anchor_url="" answered="" url rc
-  if [ -n "$anchor" ]; then
-    case " $FOLD_IDS " in *" $anchor "*)
-      die "reply: --anchor $anchor is also in the token '$ids' — a thread cannot be pointed at" \
-        "itself; name the threads that still need the pointer" ;;
-    esac
-    anchor_url=$(thread_url "$pr" "$anchor")
-  fi
-  for id in $FOLD_IDS; do
-    if [ -z "$anchor" ]; then
-      url=$(post_reply "$pr" "$id" "$body")
-    else
-      url=$(post_reply "$pr" "$id" \
-        "Duplicate of the thread answered at ${anchor_url:-comment $anchor} — see there.")
-    fi
-    rc=$?
-    [ "$rc" -eq 0 ] ||
-      reply_failed "$pr" "$id" "$rc" "$answered" "$(ids_from "$FOLD_IDS" "$id")" "$anchor"
-    [ -z "$url" ] || printf '%s\n' "$url"
-    if [ -z "$anchor" ]; then
-      anchor="$id"
-      anchor_url="$url"
-    fi
-    answered="$answered $id"
-  done
-}
-
-# Not every finding has a thread to answer in. A review's SUMMARY body carries no comment ids, so
-# the only surface for answering it is a plain PR comment — and so is the '@codex review' nudge the
-# watch verdicts recommend. `gh pr comment` is the obvious tool and it does NOT take the
-# owner/name#number form the rest of this script standardizes on (it wants a bare number plus
-# --repo, or a full URL), so `retry gh pr comment lukstafi/ocannl-staging#475 --body ...` fails on
-# the argument, not on the network: during the 1.0.1 release prep on that PR (2026-08-25) the
-# workaround was hand-building the PR's URL. The REST issues endpoint takes the same pieces this
-# script already resolved, so the argument shape, the retry policy and the write semantics all stay
-# what every other command here has. Same marker as `reply`, for the same reason.
-cmd_comment() {
-  # Exactly two, and checked rather than left to ${1:?...} — which exits 1, the code that means "the
-  # fact does not hold". A body is a sentence, so an unquoted one arrives as several arguments and
-  # would otherwise post its first word and drop the rest; that reads as a posted comment.
-  local args=() allow_mention=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    --allow-mention) allow_mention=1 ;;
-    *) args+=("$1") ;;
-    esac
-    shift
-  done
-  set -- ${args[@]+"${args[@]}"}
-  [ $# -eq 2 ] || die "usage: comment <pr> <body> [--allow-mention] — got $# argument(s)." \
-    "The body is ONE argument: quote it, including a multi-line one."
-  local pr="$1" body="$2"
-  [ -n "${body//[[:space:]]/}" ] || die "comment: the body is empty; there is nothing to post"
-  [ -n "$allow_mention" ] || mention_refusal comment "$body"
-  pr_arg "$pr"
-  pr="$PR_NUM"
-  # issues/<n>/comments, not pulls/<n>/comments: on GitHub a PR *is* an issue, and the pulls
-  # endpoint posts INLINE review comments, which need a commit and a path.
-  gh_retry write api -X POST "repos/$REPO/issues/$pr/comments" \
-    -f body="$body
-
-_🤖 Addressed by an automated coding agent_" --jq .html_url
-  case "$?" in
-  0) return 0 ;;
-  3) fail 3 "comment on PR $REPO#$pr did not go through — the API refused it at the gateway on" \
-    "all $API_ATTEMPTS attempts ($(gh_err_line)). Nothing was posted, so retry." ;;
-  *)
-    api_rejection "$(gh_err_line)" &&
-      fail 1 "comment on PR $REPO#$pr was REJECTED, not dropped: $(gh_err_line)." \
-        "Retrying prints the same thing — check the PR number and the repo."
-    fail 3 "comment on PR $REPO#$pr failed AMBIGUOUSLY: $(gh_err_line)." \
-      "That is not a gateway refusal, so the comment may or may not have landed and this script" \
-      "will not post it twice — read the PR, then retry only if it is not there."
-    ;;
-  esac
-}
-
-# `body <pr> <file>`: the PR's description, replaced whole from a file over REST. PORTED to Python
-# (ludics-lite#403): lib/ludics/prreview/body.py, which carries this function's rationale and its
-# exits. main() forwards it before reaching the case below; this stub is for a caller that sources
+# --- the writers and `retry`: PORTED to Python (ludics-lite#403) --------------------------------
+# reply, resolve, comment, body and retry (with `retry run watch`, the quiet run await) are served
+# by lib/ludics/prreview/{reply,resolve,comment,body,retry,runwatch}.py, which carry these
+# functions' rationale, the incident history behind each rule, and their exits; resolve's lookup
+# reads the same connection as the open-thread gate, through a port of threads_walk there.
+# main() forwards them before reaching its case below. These stubs are for a caller that sources
 # the script and calls the function, as the fixture suites do.
+cmd_reply() { py_forward call reply "$@"; }
+cmd_resolve() { py_forward call resolve "$@"; }
+cmd_comment() { py_forward call comment "$@"; }
 cmd_body() { py_forward call body "$@"; }
-
-# Threads are addressed by node id, which is only reachable by matching a thread's FIRST comment.
-# Prints "<node-id> <isResolved>" for the thread starting at comment $2, matched by the same id the
-# gate names it by (THREAD_ID_JQ). Exits 1 when the PR genuinely has no such thread, 3 when the
-# read did not complete, and 4 when GraphQL rejected the query (a 4xx: bad repo, bad auth) — on
-# either of the last two it prints threads_walk's line saying why, and the caller must not report
-# it as a missing thread and send the user hunting for a comment id that is fine. reviewThreads is
-# itself a 100-item page: a PR that ran to many rounds keeps its LATEST threads — the ones actually
-# being addressed — past the first page, so the walk goes on until the id is found or the
-# connection is read whole.
-#
-# "Not found" is only concluded when EVERY page came back and they add up to the PR's totalCount:
-# one 503'd page is a hole the id could be hiding in, and reporting that as a missing thread is the
-# false finding this whole file guards against.
-find_thread() { # <pr> <comment id>
-  local id hit="" rc
-  # split_ids admits leading zeros, and the id is matched as the string GitHub serves.
-  id=$(jq -rn --arg id "$2" '$id | sub("^0+(?=.)"; "")')
-  threads_walk "$1" thread_page
-  rc=$?
-  [ "$rc" -eq 0 ] || return "$rc"
-  [ -n "$hit" ] || return 1
-  printf '%s\n' "$hit"
-}
-
-thread_page() { # <page json>: stops the walk on the thread find_thread's id starts
-  hit=$(jq -r --arg id "$id" ".nodes[] | select($THREAD_ID_JQ == \$id)
-      | \"\\(.id) \\(.isResolved)\"" <<<"$1" 2>/dev/null) || return 2
-  hit="${hit%%$'\n'*}"
-  [ -z "$hit" ] || return 1
-}
-
-# One thread, closed. <label> is nonempty when the invocation carries several ids, and then each
-# answer is prefixed with the id it is about — with one id the output stays what it always was,
-# a bare `true`. <done> is the ids already closed by this invocation, named in every refusal so a
-# caller knows where it stopped; resolving is idempotent, so the whole token can simply be
-# repeated. Refusals exit the process (`fail`), which is why this is called directly and never
-# from a command substitution.
-resolve_one() { # <pr> <comment-id> <label prefix, empty for none> <ids already resolved>
-  local pr="$1" id="$2" label="$3" done_ids="$4" hit rc out progress=""
-  [ -z "$done_ids" ] || progress=" Already resolved in this invocation:$done_ids — resolving is
-idempotent, so the whole token is safe to repeat."
-  hit=$(find_thread "$pr" "$id")
-  rc=$?
-  case "$rc" in
-  0) ;;
-  3) fail 3 "the thread lookup on PR $REPO#$pr did not complete: $hit — thread resolution has no" \
-    "REST equivalent, so this is a RETRY, not a missing thread: the threads are probably all" \
-    "there, and the reply (REST) may well have gone through. Do NOT read this as someone else" \
-    "having resolved it or as a wrong comment id.$progress" ;;
-  4) fail 2 "GraphQL REJECTED the thread lookup for PR $REPO#$pr: $(gh_err_line)." \
-    "The search never ran, so this says nothing about comment $id — check the repo, the PR" \
-    "number and \`gh auth status\` rather than the comment id.$progress" ;;
-  *) fail 1 "no review thread starts at comment $id — every page of PR $REPO#$pr was read and" \
-    "none of them begins there (this is a real answer, not a dropped request)$progress" ;;
-  esac
-  # Already-resolved is the goal state, not a no-op worth an API write: replying then resolving a
-  # thread twice across rounds is normal, and the mutation would just echo it back.
-  case "$hit" in
-  *" true")
-    printf '%s\n' "${label:+$id }true (already resolved)"
-    return 0
-    ;;
-  esac
-  # The mutation is idempotent — resolving a resolved thread just answers true — so it is retried
-  # like a read, on anything short of the API rejecting it.
-  out=$(gh_retry read api graphql -f query="mutation {
-      resolveReviewThread(input:{threadId:\"${hit%% *}\"}) {
-      thread { isResolved } } }" --jq .data.resolveReviewThread.thread.isResolved)
-  case "$?" in
-  0)
-    printf '%s\n' "${label:+$id }$out"
-    return 0
-    ;;
-  3) fail 3 "resolveReviewThread did not answer for the thread at comment $id on PR $REPO#$pr" \
-    "after $API_ATTEMPTS attempts ($(gh_err_line)); the thread was FOUND, so this is transport" \
-    "only — retry when the API recovers, and the mutation is safe to repeat.$progress" ;;
-  *) fail 1 "resolveReviewThread was rejected for the thread at comment $id on PR $REPO#$pr:" \
-    "$(gh_err_line)$progress" ;;
-  esac
-}
-
-# `resolve` takes the same token `reply` does, so a folded entry is closed by one invocation too:
-# every thread the entry lists, in order, each answered on its own line. Unlike a reply, this is
-# safe to repeat whole — the mutation is idempotent and an already-resolved thread costs no write.
-cmd_resolve() {
-  [ $# -eq 2 ] || die "usage: resolve <pr> <comment-id>[+<comment-id>...] — got $# argument(s)"
-  local pr="$1" ids="$2"
-  pr_arg "$pr"
-  pr="$PR_NUM"
-  split_ids "$ids" resolve
-  local id resolved="" label=""
-  case "$FOLD_IDS" in *" "*" "*) label=1 ;; esac
-  for id in $FOLD_IDS; do
-    resolve_one "$pr" "$id" "$label" "$resolved"
-    resolved="$resolved $id"
-  done
-}
-
-# `gh run watch` is the wrong tool on both of its ends, and workers keep reaching for it (the
-# 2026-08-29 wave, ludics-lite#2). Its nonzero exit on a run that concluded FAILURE is a workflow
-# VERDICT, but it arrives with no HTTP status on stderr, so the retry policy read it as transport:
-# four attempts re-watching a run that had already completed, then "the API never answered" — a
-# lie, it answered every time. And in a non-TTY shell its progress redraws accumulate; one session
-# captured ~168k tokens of them. So `retry` does not forward `run watch` to gh at all: the await
-# below polls `gh run view` on the checks cadence, prints a heartbeat line instead of redraws, and
-# ends with ONE verdict line. Each poll keeps the usual transport retries. For a PR's build
-# signal, prefer `checks <pr> --wait`, which reads EVERY check on the head commit, not one run.
-#
-# The run is addressed the way a PR is — owner/name#<run-id>, through the same parse_ref — and the
-# repo is NEVER inferred from the cwd (ludics-lite#74) — nor, since ludics-lite#92, is any
-# other subcommand's. It used to be, and the inference is a
-# false-verdict generator on exactly the invocation this await exists for: a worker whose
-# background shell had started in an ocannl-staging worktree awaited a ludics-lite run id, the
-# read 404'd against the repo the cwd named, and the await returned exit 1 over a run that was
-# fine — a red gate manufactured out of a wrong-target invocation. A cwd mismatch has to be an
-# INVOCATION error, so an unnamed repo is refused (exit 2) rather than guessed, and a named pair
-# the API says does not exist is one too (below) rather than a verdict about the run.
-#
-# Exit codes, matching `checks`: 0 the run succeeded; 1 it concluded failure — a VERDICT, so do
-# not retry the watch, read the run; 2 the invocation is wrong (no repo named, a malformed run
-# argument, or a run/repo pair the API rejects); 3 the API did not answer, so the run's state is
-# UNKNOWN; 4 no verdict — still running at the deadline, or stopped without being judged.
-cmd_run_watch() {
-  local run_ref="" run_id="" repo="" flag_repo="" interval="$CHECKS_INTERVAL"
-  local line rc status concl sleep_for remaining
-  while [ $# -gt 0 ]; do
-    case "$1" in
-    -R | --repo)
-      flag_repo="${2:?$1 needs owner/name}"
-      shift
-      ;;
-    -R=* | --repo=*) flag_repo="${1#*=}" ;;
-    -i | --interval)
-      interval="${2:?$1 needs seconds}"
-      shift
-      ;;
-    -i=* | --interval=*) interval="${1#*=}" ;;
-    # The two native flags whose meaning this await subsumes are accepted as no-ops so a pasted
-    # `gh run watch` line keeps working; everything ELSE dies loudly. A catch-all that discards
-    # an argument turns a mistyped repo flag into a watch against whatever REPO resolves to —
-    # the wrong-target failure the strict parse_ref parse exists to prevent.
-    --exit-status | --compact) ;;
-    -*) die "run watch: unsupported flag '$1' — the quiet await takes owner/name#<run-id>," \
-      "-R/--repo, -i/--interval, --exit-status, --compact" ;;
-    *)
-      [ -z "$run_ref" ] || die "run watch: got two run arguments ('$run_ref' and '$1') —" \
-        "name exactly one"
-      run_ref="$1"
-      ;;
-    esac
-    shift
-  done
-  [ -n "$run_ref" ] || die "retry run watch: name the run as owner/name#<run-id> — the quiet" \
-    "await polls \`gh run view <id> --repo <owner/name>\`. For a PR's checks, prefer" \
-    "\`checks <pr> --wait\`."
-  parse_ref "$run_ref" || die "run watch: the run must be owner/name#<run-id> (or a bare run id" \
-    "with -R owner/name), got '$run_ref'"
-  run_id="$REF_NUM"
-  case "$interval" in '' | *[!0-9]*) die "run watch: the interval must be seconds, got '$interval'" ;; esac
-  # `gh run watch` documents -i as seconds and defaults to 3; 0 would turn the quiet await into a
-  # rate-limit-burning busy loop of API reads for up to the full two-hour ceiling.
-  [ "$interval" -gt 0 ] || die "run watch: the interval must be at least 1 second, got '$interval'"
-  # Two spellings that BOTH name a target and disagree are an invocation error, not a precedence
-  # puzzle: silently preferring either is how a run gets awaited in the repo the caller did not
-  # mean, which is the whole failure this argument form removes. REPO= is a session default rather
-  # than a second target, so a spelled-out argument overrides it the way it does for a PR.
-  repo="$REF_REPO"
-  [ -z "$repo" ] || [ -z "$flag_repo" ] || [ "$repo" = "$flag_repo" ] ||
-    die "run watch: the run names $repo and -R/--repo names $flag_repo — two explicit targets" \
-      "that disagree; name the repo once."
-  [ -n "$repo" ] || repo="$flag_repo"
-  [ -n "$repo" ] || repo="$REPO"
-  [ -n "$repo" ] || die "run watch: name the repo — owner/name#$run_id (preferred), or a bare" \
-    "run id with -R owner/name or REPO=owner/name. A bare id alone is refused and NOT resolved" \
-    "from the cwd: this await is a background call by construction, a background shell does not" \
-    "start in the checkout, and guessing turned a wrong-target read into a FAILED run" \
-    "(ludics-lite#74)."
-  local started deadline beat now
-  started=$(date +%s)
-  deadline=$((started + CHECKS_WAIT))
-  beat=$started
-  while :; do
-    line=$(gh_retry read run view "$run_id" --repo "$repo" --json status,conclusion \
-      --jq '[.status, (.conclusion // "pending")] | @tsv')
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-      # A 4xx is the API saying THIS PAIR does not exist (or is not visible), which is a fact
-      # about the invocation and not about the run: exit 2, never the 1 that reads as a failed
-      # run. That conflation is the second half of ludics-lite#74 — the 404 the cwd inference
-      # earned came back as a red gate — and it survives the inference's removal, since a
-      # mistyped -R produces the same 404.
-      api_rejection "$(gh_err_line)" &&
-        die "run watch: $repo has no run $run_id readable here: $(gh_err_line). That is the" \
-          "API answering about the id and the repo you named — nothing about the run's outcome," \
-          "so it is not a failure. Check both, then re-run the await."
-      fail 3 "could not read run $run_id in $repo after $API_ATTEMPTS attempts ($(gh_err_line));" \
-        "the run's state is UNKNOWN — not failed, not passed. Retry rather than concluding."
-    fi
-    IFS=$'\t' read -r status concl <<<"$line"
-    [ "$status" = completed ] && break
-    now=$(date +%s)
-    [ "$now" -lt "$deadline" ] || fail 4 "run $run_id in $repo has NO VERDICT after" \
-      "$((CHECKS_WAIT / 60)) min (status: ${status:-unknown}) — that is still not a failure;" \
-      "re-arm the await, or read it with: gh run view $run_id --repo $repo"
-    if [ $((now - beat)) -ge "$CHECKS_HEARTBEAT" ]; then
-      warn "still waiting on run $run_id in $repo: ${status:-unknown} after" \
-        "$(((now - started) / 60)) min"
-      beat=$now
-    fi
-    # Capped at the remaining deadline: -i is a documented pass-through, and an interval longer
-    # than what is left would sleep the process hours past the advertised ceiling before the
-    # clock is checked again.
-    remaining=$((deadline - now))
-    sleep_for="$interval"
-    [ "$sleep_for" -le "$remaining" ] || sleep_for="$remaining"
-    sleep "$sleep_for"
-  done
-  case "$(conclusion_class "$concl")" in
-  green)
-    echo "run $run_id in $repo: $concl"
-    return 0
-    ;;
-  red) fail 1 "run $run_id in $repo concluded $concl — the run FAILED. That is the workflow's" \
-    "verdict, not transport: do not retry the watch; read the failure with:" \
-    "gh run view $run_id --repo $repo --log-failed" ;;
-  *) fail 4 "run $run_id in $repo concluded $concl — stopped, not judged (a superseding push or" \
-    "a manual cancel); re-run the workflow to turn it into an answer" ;;
-  esac
-}
-
-# Every gh call this skill makes wants the same policy, not just the ones wrapped above: the
-# 2026-08-17 outage had a session hand-rolling `for i in 1 2 3; do … && break; sleep; done` around
-# `gh pr comment` and `gh pr merge` five separate times. Run them through here instead. Default is
-# the write policy (gateway failures only, so a merge or a comment cannot be sent twice from an
-# ambiguous error); --read opts into the broader one for a plain GET.
-cmd_retry() {
-  local mode=write
-  case "${1:-}" in
-  --read) mode=read && shift ;;
-  --write) shift ;;
-  esac
-  [ "${1:-}" = gh ] && shift # tolerate the leading `gh` a caller pastes in
-  [ $# -gt 0 ] || die "usage: retry [--read] <gh args...>"
-  if [ "${1:-}" = run ] && [ "${2:-}" = watch ]; then
-    shift 2
-    cmd_run_watch "$@"
-    return
-  fi
-  local caller_args=unlisted
-  gh_api_only_command "$@" && caller_args=listed
-  GH_RETRY_CALLER_ARGS="$caller_args" gh_retry "$mode" "$@"
-  case "$?" in
-  0) return 0 ;;
-  2) die "gh $1 refused its own arguments and sent nothing: $(gh_err_line). That is a usage" \
-    "error in the command, not an API answer and not transport — re-sending it prints the same" \
-    "refusal, and nothing reached GitHub, so fix the arguments and run it again." ;;
-  3) fail 3 "gh $1 did not go through after $API_ATTEMPTS attempts ($(gh_err_line));" \
-    "the API never answered, so the outcome is UNKNOWN — confirm the state before retrying a" \
-    "write, and never report the command as having failed to do its job." ;;
-  *)
-    { api_rejection "$(gh_err_line)" || graphql_fixed_answer "$(gh_err_line)"; } &&
-      fail 1 "gh $1 was rejected: $(gh_err_line)"
-    fail 3 "gh $1 failed AMBIGUOUSLY: $(gh_err_line). Not a gateway refusal, so a write may have" \
-      "landed and this did not repeat it — confirm the state (over REST) before retrying."
-    ;;
-  esac
-}
+cmd_retry() { py_forward call retry "$@"; }
 
 # --- the build signal -------------------------------------------------------------------------
 # ahrefs/ocannl#694: a master that did not compile on OCaml 5.5 survived seven consecutive merges.
@@ -5136,7 +4604,7 @@ gate_checks() {
         "$((wait_for / 60)) min ($note)"
       beat=$now
     fi
-    # Capped at the remaining deadline, same as cmd_base and cmd_run_watch: an interval longer
+    # Capped at the remaining deadline, same as cmd_base and `retry run watch`: an interval longer
     # than what is left would sleep the process past the advertised ceiling before the clock is
     # checked again.
     remaining=$((deadline - now))
@@ -8450,15 +7918,18 @@ cmd_base() {
 # Porting a subcommand: its module in lib/ludics/prreview/, its `case` in that package's
 # __main__.py, its name here, its cmd_<name> reduced to the stub, and every constant it reads in
 # PY_FORWARD_VARS. lib/ludics/README.md says the rest.
-PY_PORTED=" body "
+PY_PORTED=" body reply resolve comment retry "
 # The source-time constants the Python side reads, as <shell variable>=<environment name>. The
 # VALUE handed over is the shell's own, not the caller's environment: a suite that `retune`s
 # API_ATTEMPTS, or main's --repo, has changed the variable and not the environment. Name a constant
 # here only when its environment name means "the caller set this" in the Python as well -- a
 # constant whose being SET is itself read (SHIP_PR_ADVISORY_CHECKS, ADVISORY_FROM_ENV) needs its own
-# name for the forward, or the Python would read every default as a caller's choice.
+# name for the forward, or the Python would read every default as a caller's choice. So does one no
+# caller's environment sets at all (THREADS_PAGE_CAP): its LUDICS_ name is the forward's alone.
 PY_FORWARD_VARS=(REPO=REPO REVIEWER=REVIEWER ROUND_THRESHOLD=SHIP_PR_ROUND_THRESHOLD
-  ROUND_GAP=SHIP_PR_ROUND_GAP API_ATTEMPTS=SHIP_PR_API_ATTEMPTS API_BACKOFF=SHIP_PR_API_BACKOFF)
+  ROUND_GAP=SHIP_PR_ROUND_GAP API_ATTEMPTS=SHIP_PR_API_ATTEMPTS API_BACKOFF=SHIP_PR_API_BACKOFF
+  CHECKS_INTERVAL=SHIP_PR_CHECKS_INTERVAL CHECKS_WAIT=SHIP_PR_CHECKS_WAIT
+  CHECKS_HEARTBEAT=SHIP_PR_CHECKS_HEARTBEAT THREADS_PAGE_CAP=LUDICS_THREADS_PAGE_CAP)
 # The commands the Python runs that a sourcing suite may have replaced with a shell FUNCTION (its
 # fixture `gh`). The Python cannot call a function of this shell, so when one of these is a function
 # here the forward hands its definitions over through the shell bridge (lib/ludics/proc.py): a file

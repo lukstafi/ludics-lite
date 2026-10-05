@@ -1273,8 +1273,11 @@ test_resolve_reaches_every_thread_the_gate_can_name() {
   for i in $(seq 1 25); do nodes="$nodes,$(review_thread "$((9000 + i))" true)"; done
   THREADS_JSON="[${nodes#,}]"
   local rc=0
-  find_thread 7 9025 >/dev/null || rc=$?
-  assert_eq "$rc" 0 "a thread on page 25 is found by the lookup resolve makes"
+  # `resolve` itself, not its internal lookup, so the case holds for the Python port of resolve
+  # (ludics-lite#403). The thread is resolved, so the answer costs no mutation.
+  (cmd_resolve 7 9025) >"$TEST_ROOT/resolve.out" 2>&1 || rc=$?
+  assert_eq "$rc" 0 "a thread on page 25 is found by resolve ($(cat "$TEST_ROOT/resolve.out"))"
+  assert_eq "$(cat "$TEST_ROOT/resolve.out")" "true (already resolved)" "and answered as the thread it is"
 }
 
 # --- a 👍 from before the head arrived (ludics-lite#418) --------------------------------------
