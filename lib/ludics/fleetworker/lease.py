@@ -6,9 +6,10 @@
 Fleet-wide state lives on one anchor box (FLEET_ANCHOR), never on whichever box the coordinator
 runs on: the lease is one file there, ``$ANCHOR_STATE/COORDINATOR`` (host, token, since), and the
 halt is ``$ANCHOR_STATE/HALT``. Every lease mutation runs under the lease lock
-``COORDINATOR.lock`` on the anchor, the same lock a ``launch`` (still shell) meets there, so the
-far-side scripts below are the shell's, verbatim; this module is their near side. An anchor that
-does not answer is ``<VERB> UNREACHABLE <anchor>``, exit 4, never a verdict about the lease.
+``COORDINATOR.lock`` on the anchor, taken by the prelude's ``take_lock`` (the one mkdir lock every
+far side uses), so the far-side scripts below are the shell's, verbatim; this module is their near
+side, and ``anchor_gate`` is what launch, unstick and close read first. An anchor that does not
+answer is ``<VERB> UNREACHABLE <anchor>``, exit 4, never a verdict about the lease.
 """
 
 import os

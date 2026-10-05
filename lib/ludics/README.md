@@ -130,3 +130,9 @@ execution` sends its source to the anchor box, where a Python >= 3.12 found by t
 probe runs it from stdin. So it imports nothing from `ludics` (the anchor's checkout may hold
 another version) and its positional argv is a contract; `issue-wave/scripts/test-fleet-execution.py`
 loads it with `runpy` and patches `os.replace` between records.
+
+Every other far side of `fleet-worker.sh` -- the bash a worker verb runs on its box, local child or
+`ssh <box> bash -s` -- is still bash, the shell's heredocs byte for byte, in
+`lib/ludics/fleetworker/farside.py`: a box needs no Python for a worker's record, only for the
+batches it runs (`execution slot`) and, on the anchor, the registry. The one verb `fleet-worker.sh`
+still answers itself is `execution slot --probe`, which must answer on a box without Python 3.12.

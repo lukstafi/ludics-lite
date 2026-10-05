@@ -254,10 +254,14 @@ if [ "${1:-}" = execution ] && [ "${2:-}" = slot ]; then
     case "$fw_arg" in --probe) fw_probe=1 ;; --) break ;; esac
   done
 fi
-CHECKOUT=$(CDPATH='' cd -P "$(dirname "$0")/../.." 2>/dev/null && pwd -P)
-[ -n "$fw_probe" ] || exec "$CHECKOUT/scripts/py" -m ludics.fleetworker "$0" "$@"
-
 die() { echo "fleet-worker.sh: $*" >&2; exit 2; }
+CHECKOUT=$(CDPATH='' cd -P "$(dirname "$0")/../.." 2>/dev/null && pwd -P)
+if [ -z "$fw_probe" ]; then
+  # A copy of this file away from its checkout has no package to forward to: said, not left to
+  # exec's own error.
+  [ -x "$CHECKOUT/scripts/py" ] || die "no $CHECKOUT/scripts/py: run this script from its skills checkout (issue-wave/scripts/ in it)"
+  exec "$CHECKOUT/scripts/py" -m ludics.fleetworker "$0" "$@"
+fi
 
 # THE PROBE WITHOUT PYTHON: `execution slot --probe`, the forwarder's one exception. A project
 # runner asks it before every batch (ahrefs/ocannl#1004), and any answer but the PROBE line tells
