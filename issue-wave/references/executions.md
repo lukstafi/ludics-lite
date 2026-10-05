@@ -87,7 +87,8 @@ its command, and an `execution slot` that finds it runs its command under the en
 instead of taking a second one (ahrefs/ocannl#1004). That lets a project runner take the slot
 itself: OCANNL's `tools/test-run.sh` does, declaring `--cpu` when the backend it resolves is a
 CPU one. It first asks `execution slot --probe`, which prints `EXECUTION SLOT PROBE <box> <slots>
-<gpu tokens>` and takes no lock and reads no registry. Any answer other than that line (a host
+<gpu tokens>` and takes no lock and reads no registry. It needs no Python 3.12, so a box
+without one still answers, and the slot that follows refuses loudly. Any answer other than that line (a host
 with no fleet name, or a fleet-worker.sh too old to have the probe) makes the runner run
 without a slot, as it did before. A worker's wrapper around such a runner is harmless, because the runner runs inside
 it. Without this, two slots per batch would fill a box at half its count, and a full box would

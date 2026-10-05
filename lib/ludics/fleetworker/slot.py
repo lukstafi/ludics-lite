@@ -638,7 +638,9 @@ def cmd_slot(cfg: Config, args: list[str]) -> int:
     marker_measure = os.environ.get("FLEET_MEASUREMENT_HELD", "")
     if parsed.probe:
         # THE PROBE: what a slot here would be, taking nothing and reading no registry; inside a
-        # live `execution hold --request` here, the measurement it runs.
+        # live `execution hold --request` here, the measurement it runs. fleet-worker.sh answers
+        # the probe itself, needing no Python (THE PROBE WITHOUT PYTHON there), and asks this only
+        # for the measurement.
         inside = ""
         if marker_measure:
             judged = judge_measurement(box, directory, marker_measure, None)

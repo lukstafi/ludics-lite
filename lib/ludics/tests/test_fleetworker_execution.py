@@ -3,9 +3,12 @@
 import contextlib
 import io
 import json
+import os
+import tempfile
 import unittest
 from typing import Any
 
+from ludics import cli
 from ludics.fleetworker import execution
 from ludics.fleetworker.config import load_config
 from ludics.fleetworker.execution import (
@@ -17,7 +20,9 @@ from ludics.fleetworker.execution import (
     records_of,
     refresh_host,
     run_verdict,
+    window_payload,
 )
+from ludics.fleetworker.__main__ import restore_caller_pythonpath
 from ludics.fleetworker.gate import integration_rows
 
 SHA = "a" * 40
@@ -116,6 +121,49 @@ class IntegrationRecords(unittest.TestCase):
             [f"{SHA}\tpass\tint-a\t2026-10-05T00:00:00+00:00", f"{SHA}\tfail\tint-i\t2026-10-05T00:00:00+00:00"],
         )
         self.assertEqual(integration_rows([], "example/project"), "")
+
+
+class WindowPayload(unittest.TestCase):
+    """jq's ``{box: $box, request: .}`` over a stream: one line per value, nothing for none, and
+    only text that does not parse is the command line's refusal."""
+
+    def payload(self, text: str) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(text)
+        try:
+            return window_payload(["window", "tbox", f.name])
+        finally:
+            os.unlink(f.name)
+
+    def test_each_value_is_one_wrapped_line(self) -> None:
+        self.assertEqual(self.payload('{"a":1}'), '{"box":"tbox","request":{"a":1}}')
+        self.assertEqual(self.payload('{"a":1}\n{"b":2}\n'),
+                         '{"box":"tbox","request":{"a":1}}\n{"box":"tbox","request":{"b":2}}')
+        self.assertEqual(self.payload(' \n\t'), "")
+
+    def test_text_that_does_not_parse_is_a_usage_refusal(self) -> None:
+        for text in ("not json", '{"a":1} trailing', '{"a":'):
+            with self.assertRaises(cli.Exit) as caught:
+                self.payload(text)
+            self.assertEqual(caught.exception.rc, 2, text)
+
+
+class CallerPythonpath(unittest.TestCase):
+    """The forwarder's note puts the caller's PYTHONPATH back for every child of the verb."""
+
+    def test_the_note_restores_set_empty_and_unset(self) -> None:
+        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_FW_PYTHONPATH": "=/mine"}
+        restore_caller_pythonpath(env)
+        self.assertEqual(env, {"PYTHONPATH": "/mine"})
+        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_FW_PYTHONPATH": "="}
+        restore_caller_pythonpath(env)
+        self.assertEqual(env, {"PYTHONPATH": ""})
+        env = {"PYTHONPATH": "/checkout/lib", "LUDICS_FW_PYTHONPATH": ""}
+        restore_caller_pythonpath(env)
+        self.assertEqual(env, {})
+        env = {"PYTHONPATH": "/checkout/lib"}
+        restore_caller_pythonpath(env)
+        self.assertEqual(env, {"PYTHONPATH": "/checkout/lib"})
 
 
 if __name__ == "__main__":

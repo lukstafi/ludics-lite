@@ -242,9 +242,25 @@ set -uo pipefail
 # CHECKOUT line below does. Forwarded before any configuration is read here: the Python reads the
 # same environment itself. An `execution slot` keeps its pid through every hop (each is an exec),
 # so the pid a caller holds is still the batch's own.
+# The caller's PYTHONPATH rides along in LUDICS_FW_PYTHONPATH (`=<value>` when set, empty when
+# unset): scripts/py replaces PYTHONPATH with the checkout's lib/, and the Python puts the caller's
+# back before it runs anything, so a batch under `execution slot`/`hold` sees the environment it was
+# given -- a wrapper must not change a batch's verdict, nor hand it the `ludics` package.
+# One exception stays in this shell: `execution slot --probe` is answered below, before any
+# interpreter is looked for (THE PROBE WITHOUT PYTHON, at cmd_execution_slot_probe).
 case "${1:-}" in
   gate | execution | halt | resume-launches | halted | claim | release | coordinator)
-    exec "$(CDPATH='' cd -P "$(dirname "$0")/../.." 2>/dev/null && pwd -P)/scripts/py" -m ludics.fleetworker "$0" "$@" ;;
+    fw_probe=""
+    if [ "$1" = execution ] && [ "${2:-}" = slot ]; then
+      for fw_arg in "$@"; do
+        case "$fw_arg" in --probe) fw_probe=1 ;; --) break ;; esac
+      done
+    fi
+    if [ -z "$fw_probe" ]; then
+      if [ -n "${PYTHONPATH+set}" ]; then LUDICS_FW_PYTHONPATH="=$PYTHONPATH"; else LUDICS_FW_PYTHONPATH=""; fi
+      export LUDICS_FW_PYTHONPATH
+      exec "$(CDPATH='' cd -P "$(dirname "$0")/../.." 2>/dev/null && pwd -P)/scripts/py" -m ludics.fleetworker "$0" "$@"
+    fi ;;
 esac
 
 # Which fleet box this is, from the hostname unless FLEET_LOCAL_BOX says so; an unrecognized
@@ -2395,6 +2411,59 @@ box_spec_count() {
   echo "$found"
 }
 
+# THE PROBE WITHOUT PYTHON: `execution slot --probe`, the forwarder's one exception. A project
+# runner asks it before every batch (ahrefs/ocannl#1004), and any answer but the PROBE line tells
+# the runner to run WITHOUT a slot (issue-wave/references/executions.md), so a probe that needed
+# Python >= 3.12 would turn a box without one into a box whose batches silently skip the run-time
+# cap. Answered here in bash, as before the port: no interpreter, no lock, no registry. Only inside
+# a live `execution hold --request` (FLEET_MEASUREMENT_HELD set) is Python asked, for the
+# measurement it runs -- the marker is judged against the hold's lock, which takes a flock -- and a
+# Python that cannot answer reads as no measurement, as a failed python3 always did here. The
+# slot count and token count are the spec's own text, as they always were. Anything that is not a
+# probe (an argument the forwarder misread, `--bg --probe` naming a directory) goes to Python.
+cmd_execution_slot_probe() {
+  local kind="" probe="" bg="" box cap tokens inside="" answer
+  local -a all=("$@")
+  shift   # slot
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --probe) probe=1 ;;
+      --bg)
+        [ "$#" -ge 2 ] && [ -n "$2" ] || die "execution slot: expected a parent directory for --bg"
+        bg="$2"; shift ;;
+      --wait)
+        [ "$#" -ge 2 ] || die "execution slot: expected value for --wait"
+        case "$2" in ''|*[!0-9]*) die "execution slot: --wait takes a whole number of seconds" ;; esac
+        shift ;;
+      --cpu|--gpu)
+        [ -z "$kind" ] || [ "$kind" = "$1" ] || die "execution slot: --cpu and --gpu are exclusive"
+        kind="$1" ;;
+      --) break ;;
+      *) die "execution slot [--bg <parent>] [--wait <seconds>] [--cpu|--gpu] -- <command> [args...] | execution slot --probe" ;;
+    esac
+    shift
+  done
+  if [ -z "$probe" ]; then
+    if [ -n "${PYTHONPATH+set}" ]; then LUDICS_FW_PYTHONPATH="=$PYTHONPATH"; else LUDICS_FW_PYTHONPATH=""; fi
+    export LUDICS_FW_PYTHONPATH
+    exec "$CHECKOUT/scripts/py" -m ludics.fleetworker "$0" execution "${all[@]}"
+  fi
+  [ -z "$bg" ] || die "execution slot: --probe takes no --bg; it runs nothing"
+  box="$LOCAL_BOX"
+  [ -n "$box" ] || die "execution slot: this host has no fleet name; set FLEET_LOCAL_BOX (the slot is this box's own)"
+  in_roster "$box" || { echo "EXECUTION SLOT REFUSED $box: not a canonical FLEET_BOXES entry ($BOXES)"; exit 1; }
+  cap=$(box_correctness_slots "$box") || { echo "EXECUTION SLOT REFUSED $box: $cap"; exit 1; }
+  tokens=$(box_gpu_tokens "$box") || { echo "EXECUTION SLOT REFUSED $box: $tokens"; exit 1; }
+  # Where there are as many tokens as slots the tokens cannot bind, and every batch takes any slot.
+  [ "$tokens" -lt "$cap" ] || tokens=0
+  if [ -n "${FLEET_MEASUREMENT_HELD:-}" ]; then
+    answer=$("$CHECKOUT/scripts/py" -m ludics.fleetworker "$0" execution slot --probe 2>/dev/null) || answer=""
+    case "$answer" in "EXECUTION SLOT PROBE $box "*" measurement "*) inside="${answer##* measurement }" ;; esac
+  fi
+  echo "EXECUTION SLOT PROBE $box $cap $([ "$tokens" -eq 0 ] && echo "$cap" || echo "$tokens")${inside:+ measurement $inside}"
+  exit 0
+}
+
 # ---------------------------------------------------------------------------------------------
 cmd="${1:-}"; [ -n "$cmd" ] && shift
 case "$cmd" in
@@ -2410,7 +2479,8 @@ case "$cmd" in
   load) cmd_load "$@" ;;
   prs) cmd_prs "$@" ;;
   # gate, execution, halt, resume-launches, halted, claim, release, coordinator: forwarded to
-  # Python at the top of this group.
+  # Python at the top of this group, all but the probe.
+  execution) cmd_execution_slot_probe "$@" ;;
   *) sed -n '/^# Usage:/,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac
 exit "$?"

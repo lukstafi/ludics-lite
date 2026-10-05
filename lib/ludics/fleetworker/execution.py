@@ -584,13 +584,23 @@ def window_payload(args: list[str]) -> str:
             text = f.read()
     except OSError:
         die(f"execution window: {args[2]} is not a JSON reservation")
-    if not text.strip():
-        return ""  # jq reads no value and prints nothing: the registry refuses the empty payload
-    try:
-        request: Any = json.loads(text)
-    except ValueError:
-        die(f"execution window: {args[2]} is not a JSON reservation")
-    return json.dumps({"box": args[1], "request": request}, separators=(",", ":"), ensure_ascii=False)
+    # jq's reading: a stream of JSON values, one wrapped line each. No value prints nothing, and
+    # several print several lines; the registry refuses either payload (exit 1). Only text that
+    # does not parse is the usage refusal (exit 2).
+    decoder = json.JSONDecoder()
+    lines: list[str] = []
+    position = 0
+    while True:
+        while position < len(text) and text[position] in " \t\n\r":  # JSON's whitespace
+            position += 1
+        if position == len(text):
+            break
+        try:
+            request, position = decoder.raw_decode(text, position)
+        except ValueError:
+            die(f"execution window: {args[2]} is not a JSON reservation")
+        lines.append(json.dumps({"box": args[1], "request": request}, separators=(",", ":"), ensure_ascii=False))
+    return "\n".join(lines)
 
 
 def cmd_execution(cfg: Config, args: list[str]) -> int:

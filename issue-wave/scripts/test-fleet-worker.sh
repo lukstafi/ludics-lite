@@ -1916,6 +1916,17 @@ expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOX
 expect "a mutation needs a readable payload file" 2 "execution reserve: readable JSON file required" -- "${FWX[@]}" execution reserve "$TMP/no-such-payload.json"
 printf 'not json\n' > "$TMP/not-json.json"
 expect "a window payload that is not JSON is refused before the anchor is asked" 2 "execution window: $TMP/not-json.json is not a JSON reservation" -- "${FWX[@]}" execution window testbox "$TMP/not-json.json"
+# Several JSON values are jq's stream, one wrapped line each: the anchor is asked, and its registry
+# refuses the payload (exit 1), not the command line (2).
+printf '{"a":1}\n{"b":2}\n' > "$TMP/two-json.json"
+expect "a window payload of several JSON values is the registry's refusal, not a usage error" 1 "^EXECUTION REFUSED: Extra data: line 2 column 1" -- \
+  "${FWX[@]}" execution window testbox "$TMP/two-json.json"
+# A reader that went away: the verb dies of SIGPIPE as the shell did (141 under pipefail), with no
+# traceback. The writer starts after its reader has exited, so the first write is the broken one.
+env FLEET_BOXES="testbox other" sh -c 'sleep 1; exec "$0" execution list' "$FW" 2> "$TMP/epipe.err" | true
+rc=${PIPESTATUS[0]}
+[ "$rc" -eq 141 ] && [ ! -s "$TMP/epipe.err" ] && ok "a closed stdout ends the verb by SIGPIPE (141), silently" ||
+  ko "a closed stdout: rc=$rc (want 141) -- $(cat "$TMP/epipe.err")"
 expect "an unknown execution action is a usage error" 2 "execution: list, slot -- <command>" -- "${FWX[@]}" execution bogus
 expect "an anchor that does not answer leaves the outcome unknown (exit 4)" 4 "^EXECUTION UNREACHABLE far-anchor: outcome unknown; reconcile before retrying dispatch$" -- \
   env FLEET_ANCHOR=far-anchor "${FWX[@]}" execution list
@@ -2397,6 +2408,26 @@ held "$TMP/slot-p1.log" "slot 1 of 1 held" &&
 kill -9 "$p1" 2>/dev/null; wait "$p1" 2>/dev/null
 expect "a host with no fleet name has no probe answer" 2 "this host has no fleet name" -- \
   env FLEET_LOCAL_BOX= FLEET_BOXES="testbox other" "$FW" execution slot --probe
+# THE PROBE WITHOUT PYTHON: any answer but the PROBE line sends a project runner on without a
+# slot, so the probe needs no Python >= 3.12 (scripts/py's probe finds none here).
+printf '#!/bin/sh\nexit 1\n' > "$TMP/no-python"; chmod +x "$TMP/no-python"
+expect "the probe answers on a box with no Python >= 3.12" 0 "^EXECUTION SLOT PROBE testbox 3 1$" -- \
+  env LUDICS_PY_CANDIDATES="$TMP/no-python" "${FWT[@]}" execution slot --probe
+expect "...and says the spec's own counts" 0 "^EXECUTION SLOT PROBE testbox 007 007$" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="testbox=007" "${FWS[@]}" execution slot --probe
+expect "...and a non-probe still needs one (scripts/py's refusal, exit 2)" 2 "no Python >= 3.12 found" -- \
+  env LUDICS_PY_CANDIDATES="$TMP/no-python" "${FWS[@]}" execution slot --wait 0 -- echo no-python
+# The wrapper hands the batch its caller's environment: scripts/py's PYTHONPATH (the checkout's lib/)
+# must not reach the batch, set or unset.
+mkdir -p "$TMP/pp"
+expect "a slot's batch keeps the caller's PYTHONPATH" 0 "^pp=$TMP/pp$" -- \
+  env PYTHONPATH="$TMP/pp" "${FWS[@]}" execution slot --wait 0 -- sh -c 'echo "pp=${PYTHONPATH-unset}"'
+expect "...and the caller's lack of one" 0 "^pp=unset$" -- \
+  env -u PYTHONPATH "${FWS[@]}" execution slot --wait 0 -- sh -c 'echo "pp=${PYTHONPATH-unset}"'
+expect "...and so does a hold's" 0 "^pp=$TMP/pp$" -- \
+  env PYTHONPATH="$TMP/pp" "${FWS[@]}" execution hold -- sh -c 'echo "pp=${PYTHONPATH-unset}"'
+expect "...and its lack of one" 0 "^pp=unset$" -- \
+  env -u PYTHONPATH "${FWS[@]}" execution hold -- sh -c 'echo "pp=${PYTHONPATH-unset}"'
 # THE NESTED SLOT (ahrefs/ocannl#1004): a held slot exports its marker, and an `execution slot`
 # inside it runs under that slot instead of taking another -- a runner that takes its own slot
 # inside a worker's wrapper must not hold two, or deadlock a full box.
@@ -2564,6 +2595,8 @@ grep -Eq "slot [0-9]+ of [0-9]+ held|REFUSED" <<<"$out" && ko "the measurement's
   ok "...under the hold's one sleep guard, which names the measurement" || ko "the measurement's own batch took a second guard, or the hold's names no measurement: $(cat "$INHIBIT_LOG")"
 expect "...and the probe inside that hold reports it" 0 "^EXECUTION SLOT PROBE testbox 1 1 measurement hold-measure$" -- \
   "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot --probe
+expect "...where a probe with no Python >= 3.12 to judge the marker still answers, naming none" 0 "^EXECUTION SLOT PROBE testbox 1 1$" -- \
+  "${FWS[@]}" execution hold --request hold-measure -- env LUDICS_PY_CANDIDATES="$TMP/no-python" "$FW" execution slot --probe
 expect "...as does a slot nested a level deeper, through a shell" 0 "^deeper$" -- \
   "${FWS[@]}" execution hold --request hold-measure -- sh -c '"$1" execution slot -- "$1" execution slot -- echo deeper' _ "$FW"
 "${FWS[@]}" execution hold --request hold-measure -- sleep 30 > "$TMP/hold-m0.log" 2>&1 &
