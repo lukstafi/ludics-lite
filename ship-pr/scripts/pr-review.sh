@@ -979,10 +979,13 @@ snapshot_dir_ensure() {
 # reused by an unrelated live process leaves its path behind for the next sweep to find; that is
 # the safe way round.
 tmp_sweep_stale() {
-  local path pid family
-  [ -d "$SNAP_ROOT" ] || return 0
+  local path pid family root="${TMPDIR:-/tmp}"
+  # The TMPDIR of THIS call, not the one the script was sourced under: in a run they are the same,
+  # and a suite sweeping a scratch root says so through the environment (ludics-lite#403).
+  root="${root%/}"
+  [ -d "$root" ] || return 0
   for family in snap err gh probe test; do
-    for path in "$SNAP_ROOT/pr-review-$family".*; do
+    for path in "$root/pr-review-$family".*; do
       # The unmatched glob itself when a family has nothing in it.
       [ -e "$path" ] || continue
       [ -O "$path" ] || continue
@@ -1559,6 +1562,30 @@ SUMMARY_ROW_STAMP_RE='datetime="(?<at>[^"]+)"[^|]*\| *`(?<sha>[0-9a-f]{7,40})` *
 # both readers use this one definition, so they cannot disagree about which row is the newest.
 SUMMARY_ROW_INSTANT_DEF='def instant: sub("Z$"; "") | (if test("\\.") then . else . + "." end) + "000000000" | .[0:29];'
 
+# The clock every age and every watch deadline is read from: the epoch second, and a sleep. With
+# SHIP_PR_TEST_CLOCK naming a file, that file IS the clock (one epoch second in it) and a sleep
+# advances it instead of waiting, so a fixture suite drives a watch's window, its graces and the
+# ages it reads through the environment — the one interface the v2 rewrite (ludics-lite#403) can
+# hand to a Python implementation, which cannot see a suite's `sleep` function or its SECONDS.
+# Unset, which is every real run, it is the system clock and sleep(1).
+clock_now() {
+  if [ -n "${SHIP_PR_TEST_CLOCK:-}" ]; then
+    cat "$SHIP_PR_TEST_CLOCK"
+  else
+    date +%s
+  fi
+}
+
+clock_sleep() { # <seconds>
+  local t
+  if [ -n "${SHIP_PR_TEST_CLOCK:-}" ]; then
+    t=$(cat "$SHIP_PR_TEST_CLOCK")
+    echo $((t + $1)) >"$SHIP_PR_TEST_CLOCK"
+  else
+    sleep "$1"
+  fi
+}
+
 # ISO 8601 UTC timestamps sort correctly as plain strings, which is why every comparison below is a
 # string comparison: no date(1) is involved, whose parsing flags differ between BSD and GNU.
 newest() {
@@ -1580,8 +1607,8 @@ age_of() {
     echo -
     return 0
   }
-  out=$(jq -rn --arg t "$1" \
-    'try ((now - ($t | fromdateiso8601)) | floor | tostring) catch "-"' 2>/dev/null)
+  out=$(jq -rn --arg t "$1" --argjson clock "$(clock_now)" \
+    'try (($clock - ($t | fromdateiso8601)) | floor | tostring) catch "-"' 2>/dev/null)
   case "$out" in '' | *[!0-9]*) echo - ;; *) echo "$out" ;; esac
 }
 
@@ -3333,7 +3360,7 @@ watch_grace_deadline() {
   case "$tok" in reviewing | nudged) ;; *) return 0 ;; esac
   age=$(state_age "$1")
   case "$age" in '' | *[!0-9]*) return 0 ;; esac
-  echo $((SECONDS + GRACE - age))
+  echo $(($(clock_now) + GRACE - age))
 }
 
 # The round snapshot belongs to this command and to nothing after it, hence the wrapper: the loop
@@ -3370,10 +3397,11 @@ watch_loop() {
   pr_arg "$pr"
   pr="$PR_NUM"
   local interval="${WATCH_INTERVAL:-90}" timeout="${WATCH_TIMEOUT:-900}"
-  local start=$SECONDS was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
+  local start was state tok age quiet=0 saw=0 blind=0 past_seen=0 past_last=""
   local watch_nudge_after extension_end="" candidate_end candidate_kind extension_kind="" extension_mark="" remaining pause elapsed final_state last_healthy_mark="$mark"
   local fkind fsha rerequested="" rerequest_end=""
   watch_nudge_after=$(mark_of "$mark" 2)
+  start=$(clock_now)
 
   state=$(status_state "$pr")
   was=$(state_tok "$state")
@@ -3481,7 +3509,7 @@ watch_loop() {
           # The request's grace is this watch's to wait out, from now: the deadline the round
           # computed was the `failed` state's, which has none, and a failure first seen on the
           # window's last poll would otherwise end it before the request is ever read back.
-          rerequest_end=$((SECONDS + GRACE))
+          rerequest_end=$(($(clock_now) + GRACE))
           candidate_end="$rerequest_end"
           candidate_kind=nudged
           warn "PR $REPO#$pr: re-requested the review with '@codex review' — the run on head" \
@@ -3552,14 +3580,14 @@ watch_loop() {
     esac
 
     pause="$interval"
-    if [ $((SECONDS - start + interval)) -gt "$timeout" ]; then
+    if [ $(($(clock_now) - start + interval)) -gt "$timeout" ]; then
       # A live round can outlast the ordinary quiet window. Freeze the extension's
       # deadline on its first use so changing reactions cannot renew it indefinitely.
       # Cache deadlines on healthy reads, including before the ordinary boundary.
       # Unknown reads retain that evidence; none can invent or renew a deadline.
       [ -n "$candidate_end" ] || break
       if [ -z "$extension_end" ]; then
-        remaining=$((candidate_end - SECONDS))
+        remaining=$((candidate_end - $(clock_now)))
         [ "$remaining" -gt 0 ] || break
         extension_end="$candidate_end"
         extension_kind="$candidate_kind"
@@ -3573,11 +3601,11 @@ watch_loop() {
         extension_kind=reviewing
         warn "review started after the nudge; handing off to its fixed live-review deadline"
       fi
-      remaining=$((extension_end - SECONDS))
+      remaining=$((extension_end - $(clock_now)))
       [ "$remaining" -gt 0 ] || break
       [ "$pause" -le "$remaining" ] || pause="$remaining"
     fi
-    sleep "$pause"
+    clock_sleep "$pause"
   done
 
   # The window is out, and the last thing it does is look once more: the round this watch exists
@@ -3624,7 +3652,7 @@ watch_loop() {
   # The state is the last round's, not a fresh read: it is what the window actually observed, and a
   # re-read here would report a change this window never saw and never acted on.
   elapsed="$timeout"
-  [ -z "$extension_end" ] || elapsed=$((SECONDS - start))
+  [ -z "$extension_end" ] || elapsed=$(($(clock_now) - start))
   echo "$(watch_quiet_line "$elapsed"); status: $(status_line "$state")"
   echo "watermark: $mark"
   return 1
@@ -4087,7 +4115,7 @@ cmd_run_watch() {
     "start in the checkout, and guessing turned a wrong-target read into a FAILED run" \
     "(ludics-lite#74)."
   local started deadline beat now
-  started=$(date +%s)
+  started=$(clock_now)
   deadline=$((started + CHECKS_WAIT))
   beat=$started
   while :; do
@@ -4109,7 +4137,7 @@ cmd_run_watch() {
     fi
     IFS=$'\t' read -r status concl <<<"$line"
     [ "$status" = completed ] && break
-    now=$(date +%s)
+    now=$(clock_now)
     [ "$now" -lt "$deadline" ] || fail 4 "run $run_id in $repo has NO VERDICT after" \
       "$((CHECKS_WAIT / 60)) min (status: ${status:-unknown}) — that is still not a failure;" \
       "re-arm the await, or read it with: gh run view $run_id --repo $repo"
@@ -4124,7 +4152,7 @@ cmd_run_watch() {
     remaining=$((deadline - now))
     sleep_for="$interval"
     [ "$sleep_for" -le "$remaining" ] || sleep_for="$remaining"
-    sleep "$sleep_for"
+    clock_sleep "$sleep_for"
   done
   case "$(conclusion_class "$concl")" in
   green)

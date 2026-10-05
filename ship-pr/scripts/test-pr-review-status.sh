@@ -604,7 +604,7 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   # whose owner is gone — without touching a CONCURRENT watch's, which is the failure mode that
   # matters: several watches share a TMPDIR routinely, one per PR in flight.
   idle_fixture
-  local root live dead dead_dir live_dir own
+  local root live dead dead_dir live_dir
   root="$TEST_ROOT/snap-root"
   mkdir -p "$root"
   # A pid that is certainly gone: a child that has already exited and been reaped.
@@ -623,11 +623,8 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   : >"$root/pr-review-snap.$dead.feeds.pr"
   : >"$root/pr-review-snap.$live.feeds.pr"
 
-  local saved_root="$SNAP_ROOT" saved_dir="$SNAP_DIR" saved_snap="$SNAP"
-  SNAP_ROOT="$root" SNAP_DIR="" SNAP=""
-  run_watch 0,0,0
-  own="$SNAP_DIR"
-  SNAP_ROOT="$saved_root" SNAP_DIR="$saved_dir" SNAP="$saved_snap"
+  # The scratch root is the watch's TMPDIR: the sweep reads the environment of the call.
+  TMPDIR="$root" run_watch 0,0,0
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
 
@@ -644,13 +641,12 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   if [ ! -e "$root/pr-review-snap.$live.feeds.pr" ]; then
     bail "a live watch's loose snapshot file must survive another watch's sweep"
   fi
-  # And the watch's own files went into a directory of its own, not loose into the root, so there
-  # is nothing a SIGKILL could leave that a later sweep cannot collect as one unit.
-  assert_eq "$(find "$root" -maxdepth 1 -type f -name "pr-review-snap.$$.*" | wc -l | tr -d ' ')" 0 \
+  # And the watch left no loose snapshot file of its own in the root, so there is nothing a SIGKILL
+  # could leave that a later sweep cannot collect as one unit. (Where the round is kept — a
+  # per-process directory in the shell, memory in the Python — is not visible from outside, and is
+  # no longer asserted.)
+  assert_eq "$(find "$root" -maxdepth 1 -type f -name "pr-review-snap.*" | grep -v -e "\.$dead\." -e "\.$live\." | wc -l | tr -d ' ')" 0 \
     "the snapshot files should live inside a per-process directory, not beside it"
-  case "$own" in "$root"/pr-review-snap.$$.*) ;;
-  *) bail "the watch's own snapshot directory should be named for this process, got '$own'" ;;
-  esac
   rm -rf "$root"
 }
 
@@ -688,10 +684,7 @@ test_every_other_family_a_dead_process_leaves_is_swept_too() {
   # no owner, so this sweep has nothing to decide about it and must leave it exactly where it is.
   : >"$root/pr-review-gh.vswQwU"
 
-  local saved_root="$SNAP_ROOT" saved_dir="$SNAP_DIR" saved_snap="$SNAP"
-  SNAP_ROOT="$root" SNAP_DIR="" SNAP=""
-  run_watch 0,0,0
-  SNAP_ROOT="$saved_root" SNAP_DIR="$saved_dir" SNAP="$saved_snap"
+  TMPDIR="$root" run_watch 0,0,0
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
 

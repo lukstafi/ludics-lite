@@ -33,31 +33,20 @@ source "$SCRIPT_DIR/test-pr-review-lib.sh"
 {
 test_tmpdir TEST_ROOT watch-test
 
-# The two clock/outage controls are scoped by each test's locals; ordinary cases
-# still execute the production functions. Declare these overrides to the guard.
-stub age_of status_state
-eval "$(declare -f age_of | sed '1s/age_of/fixture_original_age_of/')"
-eval "$(declare -f status_state | sed '1s/status_state/fixture_original_status_state/')"
-age_of() {
-  if [ -n "${FIXTURE_FRESH_AT:-}" ] && [ "$1" = "$FIXTURE_FRESH_AT" ]; then
-    echo "${FIXTURE_FRESH_AGE:-0}"
-  elif [ -n "${FIXTURE_REVIEW_AT:-}" ] && [ "$1" = "$FIXTURE_REVIEW_AT" ]; then
-    echo $((FIXTURE_FRESH_AGE - FIXTURE_REVIEW_START))
-  elif [ -n "${FIXTURE_AGE:-}" ]; then
-    echo "$FIXTURE_AGE"
-  else
-    fixture_original_age_of "$@"
-  fi
-}
-status_state() {
-  if [ -n "${FIXTURE_INITIAL_STATE:-}" ] && [ "$(poll_rounds)" -eq 0 ]; then
-    echo "$FIXTURE_INITIAL_STATE"
-  elif [ "${FIXTURE_STATUS_UNKNOWN:-0}" = 1 ] ||
-    { [ -n "${UNKNOWN_STATUS_ROUND:-}" ] && [ "$(poll_rounds)" -eq "$UNKNOWN_STATUS_ROUND" ]; }; then
-    echo 'unknown|-|-|injected reactions outage'
-  else
-    fixture_original_status_state "$@"
-  fi
+# The clock is the script's own test clock (SHIP_PR_TEST_CLOCK, pr-review.sh's clock_now): a file
+# holding the epoch second, which every age the state reads and every deadline the watch keeps is
+# measured on, and which the watch's sleep ADVANCES instead of waiting. A window is then as long as
+# its arithmetic says and takes no wall time, and an age is exactly what a case dated it, however
+# slowly the box runs — through the environment alone, so the same cases drive any implementation
+# behind the command line (ludics-lite#403). It used to be a suite `sleep` advancing SECONDS and a
+# stubbed `age_of`, and the status outages a stubbed `status_state`: both are black-box now, the
+# outages as the reactions read failing at a round (FAIL_REACTIONS, below).
+export SHIP_PR_TEST_CLOCK="$TEST_ROOT/clock"
+date +%s >"$SHIP_PR_TEST_CLOCK"
+
+# The fixture clock's time, plus an offset in seconds, as GitHub dates things.
+clock_at() { # [offset]
+  jq -rn --argjson t "$(cat "$SHIP_PR_TEST_CLOCK")" --argjson o "${1:-0}" '($t + $o) | todate'
 }
 
 REPO=example/repo
@@ -75,6 +64,14 @@ FAIL_PULLS=""
 # and the one from which the PR read stops answering. 0 is never.
 FAIL_FEEDS_FROM=0
 FAIL_PULLS_FROM=0
+# The reactions read failing — the read every state line starts with, so a state read made while
+# it fails is `unknown`: always (FAIL_REACTIONS=1), at one poll round (FAIL_REACTIONS_ROUND), or
+# from one on (FAIL_REACTIONS_FROM, 0 is never). And the comments feed failing from a round on,
+# which fails a poll after the inline feed it reads first has answered.
+FAIL_REACTIONS=""
+FAIL_REACTIONS_ROUND=""
+FAIL_REACTIONS_FROM=0
+FAIL_COMMENTS_FROM=0
 # The head's committer date and the PR's creation, the two clocks the `expected` state runs on.
 # Fresh by default, so a case about what ends a wait is never decided by the grace expiring
 # underneath it; the clock cases set them where they need them.
@@ -84,7 +81,9 @@ PR_CREATED_AT=""
 # --- the sequenced fixture ---------------------------------------------------------------------
 # Every feed answers per POLL ROUND: `schedule <feed> <round> <json>` says what it answers from
 # that round on, and a round with no schedule of its own answers the newest one below it. So a
-# feed set once holds for the whole window, and one set at round 2 is invisible to round 1.
+# feed set once holds for the whole window, and one set at round 2 is invisible to round 1. Round
+# 0 is the reads a watch makes before its first poll (its opening state), which answer nothing
+# unless a case schedules round 0 itself.
 # The round counter lives in a file because the fixture runs inside the command substitution each
 # poll is made in, where a variable would not survive to the next call.
 
@@ -102,8 +101,13 @@ reset_fixture() {
   FAIL_PULLS=""
   FAIL_FEEDS_FROM=0
   FAIL_PULLS_FROM=0
-  HEAD_AT=$(jq -rn '(now - 60) | todate')
-  PR_CREATED_AT=$(jq -rn '(now - 60) | todate')
+  FAIL_REACTIONS=""
+  FAIL_REACTIONS_ROUND=""
+  FAIL_REACTIONS_FROM=0
+  FAIL_COMMENTS_FROM=0
+  date +%s >"$SHIP_PR_TEST_CLOCK"
+  HEAD_AT=$(clock_at -60)
+  PR_CREATED_AT=$(clock_at -60)
   : >"$REQUEST_LOG"
 }
 
@@ -118,7 +122,7 @@ feed_answer() { # <feed>
   local round n
   round=$(cat "$FEEDS/round")
   n="$round"
-  while [ "$n" -ge 1 ]; do
+  while [ "$n" -ge 0 ]; do
     if [ -e "$FEEDS/$1.$n" ]; then
       cat "$FEEDS/$1.$n"
       return 0
@@ -136,7 +140,7 @@ reaction() { # <content> <created_at>
 # A 👍 given for the fixture's head: dated after reset_fixture's HEAD_AT (a minute ago), because a
 # 👍 older than the head's commit is a previous head's and approves nothing (#418).
 head_thumb() {
-  reaction +1 "$(jq -rn '(now - 30) | todate')"
+  reaction +1 "$(clock_at -30)"
 }
 
 review() { # <id> <commit> <submitted_at> [body]
@@ -197,9 +201,22 @@ gh() {
     }
     response=$(feed_answer inline)
     ;;
-  "repos/$REPO/issues/7/reactions?per_page=100") response=$(feed_answer reactions) ;;
+  "repos/$REPO/issues/7/reactions?per_page=100")
+    if [ -n "$FAIL_REACTIONS" ] || [ "$(poll_rounds)" = "$FAIL_REACTIONS_ROUND" ] ||
+      { [ "$FAIL_REACTIONS_FROM" -ne 0 ] && [ "$(poll_rounds)" -ge "$FAIL_REACTIONS_FROM" ]; }; then
+      echo "gh: reactions unavailable (HTTP 500)" >&2
+      return 1
+    fi
+    response=$(feed_answer reactions)
+    ;;
   "repos/$REPO/pulls/7/reviews?per_page=100") response=$(feed_answer reviews) ;;
-  "repos/$REPO/issues/7/comments?per_page=100") response=$(feed_answer comments) ;;
+  "repos/$REPO/issues/7/comments?per_page=100")
+    if [ "$FAIL_COMMENTS_FROM" -ne 0 ] && [ "$(poll_rounds)" -ge "$FAIL_COMMENTS_FROM" ]; then
+      echo "gh: 503 No server is currently available to service your request" >&2
+      return 1
+    fi
+    response=$(feed_answer comments)
+    ;;
   "repos/$REPO/pulls/7/reviews/"*"/comments?per_page=100") response=$(feed_answer review_comments) ;;
   "repos/$REPO/pulls/7")
     if [ -n "$FAIL_PULLS" ] ||
@@ -415,7 +432,7 @@ test_the_ending_line_names_the_round() (
   assert_contains "$WATCH_ERR" \
     "ending the wait on review id=600 state=COMMENTED commit=${H2:0:7} by ${REVIEWER}[bot] — this window opened round 3 of 12" \
     "the exit line carries the round as \`rounds\` counts it, against the threshold"
-  assert_contains "$(rounds_line "$(review_rounds 7)")" "review rounds with findings: 3 of 12" \
+  assert_contains "$(cmd_rounds 7 || :)" "review rounds with findings: 3 of 12" \
     "the same count \`rounds\` reports"
   # The same window as a machine-readable trailer on stdout (ludics-lite#423, part 1), just above
   # the watermark, which stays the last line.
@@ -482,8 +499,7 @@ test_the_ending_line_claims_only_the_rounds_the_window_opened() (
 # The window is the whole watch, not the last poll (review of #434, round 3): the first poll sees
 # only a round about H1, scrolls past it and advances the watermark; the round about H2 lands on
 # the second. The watch opened both, as it would have read them in a single poll.
-test_the_round_span_is_the_whole_watch() (
-  sleep() { SECONDS=$((SECONDS + $1)); }
+test_the_round_span_is_the_whole_watch() {
   reset_fixture
   schedule reviews 1 "[$(review 400 "$H1" 2026-09-01T00:00:00Z)]"
   schedule reviews 2 "[$(review 400 "$H1" 2026-09-01T00:00:00Z),$(review 500 "$H2" 2026-09-01T01:00:00Z)]"
@@ -493,7 +509,7 @@ test_the_round_span_is_the_whole_watch() (
   assert_contains "$WATCH_ERR" "— this window opened rounds 1–2 of 12" \
     "the span is counted from the watermark the watch started with"
   assert_contains "$WATCH_OUT" "watch-rounds: from=0 to=2 threshold=12" "and so is the trailer's"
-)
+}
 
 # The label reads no feed of its own inside a round (review of #434, round 2): both counts take the
 # round's snapshot, and an empty-bodied review's own comments — which substantive_reviews asks for
@@ -521,7 +537,7 @@ test_the_round_label_costs_no_request() (
 test_the_missing_environment_ends_the_wait_with_the_nudge() {
   local now
   reset_fixture
-  now=$(jq -rn 'now | todate')
+  now=$(clock_at)
   schedule comments 1 "[$(summary_comment 100 "$now" \
     'To use Codex here, [create an environment for this repo](https://chatgpt.com/codex/cloud/settings/environments).')]"
   run_watch 0,0,0
@@ -691,7 +707,7 @@ test_an_approval_landing_during_the_final_poll_drops_the_verdict() {
 test_a_state_that_moved_drops_the_verdict_as_quiet() {
   reset_fixture
   retune GRACE=1
-  schedule reactions 2 "[$(reaction eyes "$(jq -rn '(now - 5) | todate')")]"
+  schedule reactions 2 "[$(reaction eyes "$(clock_at -5)")]"
   run_watch 0,0,0 5 1
   assert_eq "$WATCH_RC" 1 "a round that just started is a quiet window, not a verdict"
   assert_contains "$WATCH_OUT" "the state moved to 'reviewing'" "and the line says what it moved to"
@@ -776,8 +792,8 @@ test_a_summary_is_stamped_by_its_footer_not_by_what_it_mentions() {
 # before the PR exists.
 test_the_review_clock_starts_no_earlier_than_the_pr() {
   reset_fixture
-  HEAD_AT=$(jq -rn '(now - 2400) | todate')
-  PR_CREATED_AT=$(jq -rn '(now - 30) | todate')
+  HEAD_AT=$(clock_at -2400)
+  PR_CREATED_AT=$(clock_at -30)
   run_status
   assert_eq "$(state_tok "$STATE")" expected "an unreviewed head with no 👀 is expected"
   local age
@@ -787,7 +803,7 @@ test_the_review_clock_starts_no_earlier_than_the_pr() {
   assert_contains "$LINE" "due for " "the line still says how late the review is"
   # The negative control on the same fixture: with the PR itself old, the committer date is the
   # newer bound and the clock runs from it — the floor must not become the answer.
-  PR_CREATED_AT=$(jq -rn '(now - 86400) | todate')
+  PR_CREATED_AT=$(clock_at -86400)
   run_status
   age=$(state_age "$STATE")
   [ "$age" -ge 2400 ] && [ "$age" -lt 3000 ] ||
@@ -799,8 +815,8 @@ test_the_review_clock_starts_no_earlier_than_the_pr() {
 # age at all, so taking it would leave the state with no clock and the grace unable to expire.
 test_a_future_commit_date_does_not_blind_the_clock() {
   reset_fixture
-  HEAD_AT=$(jq -rn '(now + 3600) | todate')
-  PR_CREATED_AT=$(jq -rn '(now - 1800) | todate')
+  HEAD_AT=$(clock_at 3600)
+  PR_CREATED_AT=$(clock_at -1800)
   run_status
   assert_eq "$(state_tok "$STATE")" expected "still a due review"
   local age
@@ -1039,27 +1055,28 @@ test_the_same_body_against_two_heads_is_not_folded() {
 
 # A nudge buys one observer window, identified by its comment id. Carrying the
 # returned watermark into the next window must not buy that same grace again.
-test_a_nudge_buys_exactly_one_window() (
-  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+#
+# The cases from here on run on the fixture clock (see the top of the file) with an interval of a
+# whole GRACE where a sleep used to jump the clock by one: each pause then spends the grace in one
+# step, as the stubbed sleep did, and the extension caps a pause at what is left of it.
+test_a_nudge_buys_exactly_one_window() {
   reset_fixture
   HEAD_AT=2026-09-01T00:00:00Z
   PR_CREATED_AT="$HEAD_AT"
   local now mark
-  now=$(jq -rn 'now | todate')
-  FIXTURE_FRESH_AT="$now"
+  now=$(clock_at)
   schedule comments 1 "$(jq -cn --arg at "$now" '{id:700,user:{login:"maintainer"},created_at:$at,
     body:"@codex review\n\n_🤖 Addressed by an automated coding agent_"}' | jq -s '.')"
-  run_watch 0,699,0 1 0
+  run_watch 0,699,0 "$GRACE" 0
   assert_eq "$WATCH_RC" 0 "a fresh nudge is observed until its grace expires"
   assert_contains "$WATCH_ERR" "extending watch" "the nudge owns the full grace beyond timeout"
   [ "$(poll_rounds)" -ge 3 ] || bail "the nudge verdict returned on the first poll"
   mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
   assert_eq "$mark" 0,700,0 "the nudge identity is consumed by the outgoing watermark"
-  run_watch "$mark" 1 0
+  run_watch "$mark" "$GRACE" 0
   assert_eq "$WATCH_RC" 0 "the next window cannot renew the same nudge"
   assert_contains "$WATCH_OUT" "no review materialized" "the overdue verdict remains available"
-)
+}
 
 test_an_ordinary_reply_or_old_nudge_does_not_reset_grace() {
   local body
@@ -1068,7 +1085,7 @@ test_an_ordinary_reply_or_old_nudge_does_not_reset_grace() {
     HEAD_AT=2026-09-01T00:00:00Z
     PR_CREATED_AT="$HEAD_AT"
     local at
-    at=$(jq -rn 'now | todate')
+    at=$(clock_at)
     [ "$body" != '@codex review' ] || at="$HEAD_AT"
     schedule comments 1 "$(jq -cn --arg at "$at" --arg body "$body"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:$body}]')"
     run_watch 0,699,0 1 0
@@ -1080,7 +1097,7 @@ test_an_ordinary_reply_or_old_nudge_does_not_reset_grace() {
 test_a_live_round_extends_the_quiet_window() {
   reset_fixture
   local now
-  now=$(jq -rn 'now | todate')
+  now=$(clock_at)
   schedule reactions 1 "[$(reaction eyes "$now")]"
   # With timeout zero, the old loop settled at round 2 and missed round 3.
   schedule reviews 3 "[$(review 501 "$H2" "$now")]"
@@ -1090,34 +1107,29 @@ test_a_live_round_extends_the_quiet_window() {
   assert_contains "$WATCH_ERR" 'extending watch' "the extension is explicit"
 }
 
-test_a_live_round_extension_is_bounded() (
-  # Isolate an injected clock in this subshell: neither slow setup nor scheduler
-  # delays should spend the fixture's five-second extension before it starts.
-  local FIXTURE_AGE=0
-  sleep() { SECONDS=$((SECONDS + $1)); }
+# Neither slow setup nor scheduler delays can spend the five-second extension before it starts:
+# the fixture clock moves only when the watch sleeps.
+test_a_live_round_extension_is_bounded() {
   reset_fixture
-  local now GRACE=5
-  now=$(jq -rn 'now | todate')
+  retune GRACE=5
+  local now
+  now=$(clock_at)
   schedule reactions 1 "[$(reaction eyes "$now")]"
   run_watch 0,0,0 1 0
   assert_eq "$WATCH_RC" 1 "a round with no result cannot extend forever"
   assert_contains "$WATCH_OUT" 'no reviewer activity' "the exhausted extension returns quiet"
   assert_contains "$WATCH_ERR" 'extending watch' "the ordinary window was extended first"
   assert_not_contains "$WATCH_OUT" 'in 0s' "the verdict reports the extended elapsed duration"
-)
+}
 
-test_nudges_wait_past_old_failed_and_stalled_states() (
-  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+test_nudges_wait_past_old_failed_and_stalled_states() {
   local kind old now comments
   old=2026-09-01T00:00:00Z
   for kind in failed stalled; do
     reset_fixture
     HEAD_AT="$old"
     PR_CREATED_AT="$old"
-    now=$(jq -rn 'now | todate')
-    FIXTURE_FRESH_AT="$now"
-    FIXTURE_FRESH_AGE=0
+    now=$(clock_at)
     comments=$(jq -cn --arg at "$now"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
     if [ "$kind" = stalled ]; then
       schedule reactions 1 "[$(reaction eyes "$old")]"
@@ -1127,22 +1139,21 @@ test_nudges_wait_past_old_failed_and_stalled_states() (
       comments=$(jq -cn --argjson n "$comments" --argjson f "$(summary_comment 699 "$old" "$body")" '$n + [$f]')
     fi
     schedule comments 1 "$comments"
-    run_watch 0,699,0 1 0
+    run_watch 0,699,0 "$GRACE" 0
     assert_eq "$WATCH_RC" 0 "fresh nudge waits until its grace expires before $kind"
     [ "$(poll_rounds)" -ge 3 ] || bail "the $kind verdict returned before the nudge grace"
     assert_contains "$WATCH_ERR" 'fresh review nudge' "the nudge explains the new wait"
-    run_watch 0,700,0 1 0
+    run_watch 0,700,0 "$GRACE" 0
     assert_eq "$WATCH_RC" 0 "the same nudge cannot suppress $kind for another window"
   done
-)
+}
 
-test_an_extension_holds_through_unknown_status() (
+test_an_extension_holds_through_unknown_status() {
   reset_fixture
   # Preserve actual feed/status parsing, failing only the status read at round 2.
-  local UNKNOWN_STATUS_ROUND=2
-  sleep() { SECONDS=$((SECONDS + $1)); }
+  FAIL_REACTIONS_ROUND=2
   local now
-  now=$(jq -rn 'now | todate')
+  now=$(clock_at)
   schedule reactions 1 "[$(reaction eyes "$now")]"
   # Before the fix, unknown round 2 broke out and settled at round 3, missing 4.
   schedule reviews 4 "[$(review 501 "$H2" "$now")]"
@@ -1150,241 +1161,237 @@ test_an_extension_holds_through_unknown_status() (
   assert_eq "$WATCH_RC" 0 "a transient status outage cannot cut short the frozen extension"
   assert_contains "$WATCH_OUT" '--- review id=501' "the later round is caught"
   assert_contains "$WATCH_ERR" "holding 'reviewing'" "the unknown status held the known live state"
-)
+}
 
-test_an_unknown_boundary_uses_the_last_live_deadline() (
+test_an_unknown_boundary_uses_the_last_live_deadline() {
   reset_fixture
-  local UNKNOWN_STATUS_ROUND=2
-  sleep() { SECONDS=$((SECONDS + 100)); }
+  FAIL_REACTIONS_ROUND=2
   local now
-  now=$(jq -rn 'now | todate')
+  now=$(clock_at)
   schedule reactions 1 "[$(reaction eyes "$now")]"
   schedule reviews 4 "[$(review 501 "$H2" "$now")]"
-  run_watch 0,0,0 1 100
+  run_watch 0,0,0 100 100
   assert_eq "$WATCH_RC" 0 "the first boundary outage keeps the cached live deadline"
   assert_contains "$WATCH_OUT" '--- review id=501' "the later round is still observed"
   assert_contains "$WATCH_ERR" "holding 'reviewing'" "the boundary actually read unknown"
-)
+}
 
-test_a_late_review_gets_its_own_grace_after_the_nudge() (
+test_a_late_review_gets_its_own_grace_after_the_nudge() {
   reset_fixture
-  local GRACE=1000 FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 FIXTURE_REVIEW_AT FIXTURE_REVIEW_START=900
-  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
-  FIXTURE_REVIEW_AT=$(jq -rn --arg t "$FIXTURE_FRESH_AT" '($t | fromdateiso8601) + 900 | todate')
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + $1)); SECONDS=$((SECONDS + $1)); }
-  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
-  schedule reactions 2 "[$(reaction eyes "$FIXTURE_REVIEW_AT")]"
+  retune GRACE=1000
+  local fresh_at review_at
+  fresh_at=$(clock_at)
+  review_at=$(clock_at 900)
+  schedule comments 1 "$(jq -cn --arg at "$fresh_at"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  schedule reactions 2 "[$(reaction eyes "$review_at")]"
   # Without handoff, the nudge deadline stops at round 3 and settles at 4.
-  schedule reviews 5 "[$(review 501 "$H2" "$FIXTURE_REVIEW_AT")]"
+  schedule reviews 5 "[$(review 501 "$H2" "$review_at")]"
   run_watch 0,699,0 900 0
   assert_eq "$WATCH_RC" 0 "the late-started review owns a full eyes-start grace"
   assert_contains "$WATCH_OUT" '--- review id=501' "the review outlives the nudge pickup deadline"
   assert_contains "$WATCH_ERR" 'handing off' "the phase transition is explicit"
   assert_eq "$(occurrences "$WATCH_ERR" 'handing off')" 1 "later eyes observations cannot renew it"
-)
+}
 
-test_a_final_poll_leaves_an_unarmed_nudge_pending() (
-  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 kind mark
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+test_a_final_poll_leaves_an_unarmed_nudge_pending() {
+  local fresh_at kind mark
   for kind in quiet overdue; do
     reset_fixture
-    FIXTURE_FRESH_AGE=0
-    FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+    fresh_at=$(clock_at)
     if [ "$kind" = overdue ]; then
       HEAD_AT=2026-09-01T00:00:00Z
       PR_CREATED_AT="$HEAD_AT"
     fi
-    schedule comments 2 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
-    run_watch 0,0,0 1 0
+    schedule comments 2 "$(jq -cn --arg at "$fresh_at"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+    run_watch 0,0,0 "$GRACE" 0
     assert_eq "$WATCH_RC" 1 "the $kind final poll discovers a nudge it has not observed through grace"
     mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
     assert_eq "$mark" 0,0,0 "the $kind exit must leave the final nudge unconsumed"
-    run_watch "$mark" 1 0
+    run_watch "$mark" "$GRACE" 0
     assert_contains "$WATCH_ERR" 'extending watch' "the next watch grants the pending nudge its full grace"
   done
-)
+}
 
-test_a_fresh_nudge_supersedes_old_same_head_results() (
-  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 kind old comments
+test_a_fresh_nudge_supersedes_old_same_head_results() {
+  local fresh_at kind old comments
   old=2026-09-01T00:00:00Z
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
   for kind in idle verdict thumb; do
     reset_fixture
-    FIXTURE_FRESH_AGE=0
-    FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
-    comments=$(jq -cn --arg at "$FIXTURE_FRESH_AT"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
+    fresh_at=$(clock_at)
+    comments=$(jq -cn --arg at "$fresh_at"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
     case "$kind" in
     idle) schedule reviews 1 "[$(review 599 "$H2" "$old")]" ;;
     verdict) comments=$(jq -cn --argjson n "$comments" --argjson v "$(stamped_summary 699 "$old" "$H2" "Codex Review: Didn't find any major issues.")" '$n + [$v]') ;;
     thumb) schedule reactions 1 "[$(reaction +1 "$old")]" ;;
     esac
     schedule comments 1 "$comments"
-    run_watch 0,699,599 1 0
+    run_watch 0,699,599 "$GRACE" 0
     assert_contains "$WATCH_ERR" 'extending watch' "a fresh request supersedes the older $kind result"
     assert_not_contains "$WATCH_OUT" 'approved' "the older $kind cannot approve the requested round"
   done
   # A demonstrably newer approval still wins immediately.
   reset_fixture
-  FIXTURE_FRESH_AGE=0
-  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
-  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
-  schedule reactions 1 "[$(reaction +1 "$(jq -rn --arg at "$FIXTURE_FRESH_AT" '($at|fromdateiso8601) + 1 | todate')")]"
-  run_watch 0,699,599 1 0
+  fresh_at=$(clock_at)
+  schedule comments 1 "$(jq -cn --arg at "$fresh_at"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  schedule reactions 1 "[$(reaction +1 "$(clock_at 1)")]"
+  run_watch 0,699,599 "$GRACE" 0
   assert_contains "$WATCH_OUT" 'approved' "a later thumbs-up approves the new round"
-)
+}
 
-test_unreadable_status_cannot_consume_a_loop_nudge() (
+test_unreadable_status_cannot_consume_a_loop_nudge() {
   reset_fixture
-  local FIXTURE_STATUS_UNKNOWN=1 FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 mark
-  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
-  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
-  run_watch 0,0,0 1 0
+  local fresh_at mark
+  FAIL_REACTIONS=1
+  fresh_at=$(clock_at)
+  schedule comments 1 "$(jq -cn --arg at "$fresh_at"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  run_watch 0,0,0 "$GRACE" 0
   mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
   assert_eq "$mark" 0,0,0 "no healthy status read ever armed this nudge"
-  FIXTURE_STATUS_UNKNOWN=0
-  run_watch "$mark" 1 0
+  FAIL_REACTIONS=""
+  run_watch "$mark" "$GRACE" 0
   assert_contains "$WATCH_ERR" 'extending watch' "the recovered observer grants the still-pending nudge grace"
-)
+}
 
-test_one_empty_reaction_read_retains_the_live_boundary() (
+test_one_empty_reaction_read_retains_the_live_boundary() {
   reset_fixture
   local now
-  now=$(jq -rn 'now | todate')
-  sleep() { SECONDS=$((SECONDS + 100)); }
+  now=$(clock_at)
   schedule reactions 1 "[$(reaction eyes "$now")]"
   schedule reactions 2 '[]'
   schedule reactions 3 "[$(reaction eyes "$now")]"
   schedule reviews 4 "[$(review 501 "$H2" "$now")]"
-  run_watch 0,0,0 1 100
+  run_watch 0,0,0 100 100
   assert_eq "$WATCH_RC" 0 "one empty reaction read cannot terminate a held live deadline"
   assert_contains "$WATCH_OUT" '--- review id=501' "the returning live round remains observed"
-)
+}
 
-test_a_pre_push_nudge_keeps_the_fresher_head_clock() (
+test_a_pre_push_nudge_keeps_the_fresher_head_clock() {
   reset_fixture
-  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0
-  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
-  HEAD_AT="$FIXTURE_FRESH_AT"
+  HEAD_AT=$(clock_at)
   PR_CREATED_AT=2026-09-01T00:00:00Z
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
   schedule comments 1 '[{"id":700,"user":{"login":"maintainer"},"created_at":"2026-09-01T00:00:00Z","body":"@codex review"}]'
-  run_watch 0,699,0 1 0
+  run_watch 0,699,0 "$GRACE" 0
   assert_contains "$WATCH_ERR" 'extending watch' "the old request cannot shorten a fresh head clock"
   [ "$(poll_rounds)" -ge 3 ] || bail "the fresh head received no observation window"
-)
+}
 
-test_old_unseen_findings_leave_the_new_request_pending() (
-  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 kind comments mark
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
+# The issue-comment field of a watermark.
+mark_issue() { # <watermark>
+  cut -d, -f2 <<<"$1"
+}
+
+test_old_unseen_findings_leave_the_new_request_pending() {
+  local fresh_at kind comments mark
   for kind in review summary inline; do
     reset_fixture
-    FIXTURE_FRESH_AGE=0
-    FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
-    comments=$(jq -cn --arg at "$FIXTURE_FRESH_AT"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
+    fresh_at=$(clock_at)
+    comments=$(jq -cn --arg at "$fresh_at"       '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
     case "$kind" in
     review) schedule reviews 1 "[$(review 599 "$H2" 2026-09-01T00:00:00Z 'still actionable old finding')]" ;;
     summary) comments=$(jq -cn --argjson n "$comments" --argjson r "$(stamped_summary 699 2026-09-01T00:00:00Z "$H2" 'still actionable old finding')" '$n + [$r]') ;;
     inline) schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'still actionable old finding')]" ;;
     esac
     schedule comments 1 "$comments"
-    run_watch 0,0,0 1 0
+    run_watch 0,0,0 "$GRACE" 0
     assert_eq "$WATCH_RC" 0 "old $kind findings are still actionable"
     assert_contains "$WATCH_OUT" 'still actionable old finding' "the finding must not be filtered away"
     mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
-    assert_eq "$(mark_of "$mark" 2)" 699 "the new request remains pending after the old $kind result"
-    run_watch "$mark" 1 0
+    assert_eq "$(mark_issue "$mark")" 699 "the new request remains pending after the old $kind result"
+    run_watch "$mark" "$GRACE" 0
     assert_contains "$WATCH_ERR" 'extending watch' "the next observer grants the pending request grace"
     assert_not_contains "$WATCH_OUT" 'still actionable old finding' "the old $kind is not replayed"
   done
-)
+}
 
-test_initial_grace_cannot_renew_indefinitely_after_unknown_reads() (
+# The opening state is the one healthy read: the reactions answer before the first poll (round 0)
+# and from then on do not, and the nudge is in the comments from round 0.
+test_initial_grace_cannot_renew_indefinitely_after_unknown_reads() {
   reset_fixture
-  local FIXTURE_STATUS_UNKNOWN=1 FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 FIXTURE_INITIAL_STATE mark
-  FIXTURE_INITIAL_STATE='nudged|0|clean|700|fresh review nudge; waiting for pickup'
-  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
-  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  local fresh_at mark nudge
+  FAIL_REACTIONS_FROM=1
+  fresh_at=$(clock_at)
+  nudge=$(jq -cn --arg at "$fresh_at"     '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
+  schedule comments 0 "$nudge"
+  schedule comments 1 "$nudge"
   # Keep the head older too, so recovery cannot inherit an unrelated fresh-head clock.
   HEAD_AT=2026-09-01T00:00:00Z
   PR_CREATED_AT="$HEAD_AT"
-  run_watch 0,0,0 1 0
+  run_watch 0,0,0 "$GRACE" 0
+  assert_contains "$WATCH_ERR" 'from: review EXPECTED but not started — fresh review nudge' \
+    "the opening read is the healthy one, and it reads the nudge"
   assert_contains "$WATCH_ERR" 'extending watch' "initial healthy status grants the creation-time grace"
   mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
-  FIXTURE_INITIAL_STATE=""
-  FIXTURE_STATUS_UNKNOWN=0
-  run_watch "$mark" 1 0
+  FAIL_REACTIONS_FROM=0
+  run_watch "$mark" "$GRACE" 0
   assert_not_contains "$WATCH_ERR" 'extending watch' "the creation-time clock cannot restart on recovery"
   assert_contains "$WATCH_OUT" 'no review materialized' "recovery returns a due verdict, not another full window"
-)
+}
 
-test_a_second_nudge_at_settle_remains_pending() (
+test_a_second_nudge_at_settle_remains_pending() {
   reset_fixture
-  local FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 mark
-  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  local fresh_at mark
+  fresh_at=$(clock_at)
   HEAD_AT=2026-09-01T00:00:00Z
   PR_CREATED_AT="$HEAD_AT"
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
   schedule comments 1 '[{"id":700,"user":{"login":"maintainer"},"created_at":"2026-09-01T00:00:00Z","body":"@codex review"}]'
-  schedule comments 2 "$(jq -cn --arg at "$FIXTURE_FRESH_AT" '[{id:700,user:{login:"maintainer"},created_at:"2026-09-01T00:00:00Z",body:"@codex review"},{id:701,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
-  run_watch 0,699,0 1 0
+  schedule comments 2 "$(jq -cn --arg at "$fresh_at" '[{id:700,user:{login:"maintainer"},created_at:"2026-09-01T00:00:00Z",body:"@codex review"},{id:701,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  run_watch 0,699,0 "$GRACE" 0
   assert_contains "$WATCH_OUT" 'a newer nudge still needs its grace' "same state token does not mean same request"
   assert_not_contains "$WATCH_OUT" 'no review materialized' "the older expired verdict is dropped"
   mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
-  assert_eq "$(mark_of "$mark" 2)" 700 "the second request remains pending"
-  run_watch "$mark" 1 0
+  assert_eq "$(mark_issue "$mark")" 700 "the second request remains pending"
+  run_watch "$mark" "$GRACE" 0
   assert_contains "$WATCH_ERR" 'extending watch' "the recovered observer grants the second request its grace"
-)
+}
 
-test_an_actionable_result_with_unknown_status_keeps_pending_comments() (
+test_an_actionable_result_with_unknown_status_keeps_pending_comments() {
   reset_fixture
-  local UNKNOWN_STATUS_ROUND=1 FIXTURE_FRESH_AT FIXTURE_FRESH_AGE=0 mark
-  FIXTURE_FRESH_AT=$(jq -rn 'now | todate')
+  local fresh_at mark
+  FAIL_REACTIONS_ROUND=1
+  fresh_at=$(clock_at)
   HEAD_AT=2026-09-01T00:00:00Z
   PR_CREATED_AT="$HEAD_AT"
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + GRACE)); SECONDS=$((SECONDS + GRACE)); }
   schedule reviews 1 "[$(review 599 "$H2" 2026-09-01T00:00:00Z 'actionable during status outage')]"
-  schedule comments 1 "$(jq -cn --arg at "$FIXTURE_FRESH_AT" '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
-  run_watch 0,699,0 1 0
+  schedule comments 1 "$(jq -cn --arg at "$fresh_at" '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
+  run_watch 0,699,0 "$GRACE" 0
   assert_contains "$WATCH_OUT" 'actionable during status outage' "the readable review is surfaced"
   mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
   assert_eq "$mark" 0,699,599 "only the unverified issue cursor is retained"
-  run_watch "$mark" 1 0
+  FAIL_REACTIONS_ROUND=""
+  run_watch "$mark" "$GRACE" 0
   assert_contains "$WATCH_ERR" 'extending watch' "the fresh request receives grace on recovery"
   assert_not_contains "$WATCH_OUT" 'actionable during status outage' "the consumed review is not replayed"
-)
+}
 
-test_a_new_request_during_fixed_grace_remains_pending() (
-  local kind FIXTURE_FRESH_AT FIXTURE_FRESH_AGE FIXTURE_REVIEW_AT FIXTURE_REVIEW_START mark comments second_nudge
-  sleep() { FIXTURE_FRESH_AGE=$((FIXTURE_FRESH_AGE + 100)); SECONDS=$((SECONDS + 100)); }
+# The second request lands 100s into the first one's grace (on round 2, one 100s pause in), and
+# for `reviewing` a round starts on it at the same instant.
+test_a_new_request_during_fixed_grace_remains_pending() {
+  local kind fresh_at review_at mark comments second_nudge
   for kind in nudged reviewing; do
     reset_fixture
     retune GRACE=200
-    FIXTURE_FRESH_AT=$(jq -rn 'now - 5 | todate')
-    FIXTURE_FRESH_AGE=0
-    FIXTURE_REVIEW_AT=$(jq -rn 'now | todate')
-    FIXTURE_REVIEW_START=100
+    fresh_at=$(clock_at -5)
+    review_at=$(clock_at 100)
     HEAD_AT=2026-09-01T00:00:00Z
     PR_CREATED_AT="$HEAD_AT"
-    comments=$(jq -cn --arg at "$FIXTURE_FRESH_AT" '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
+    comments=$(jq -cn --arg at "$fresh_at" '[{id:700,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')
     schedule comments 1 "$comments"
-    second_nudge="$FIXTURE_REVIEW_AT"
-    [ "$kind" != reviewing ] || second_nudge=$(jq -rn 'now - 1 | todate')
+    second_nudge="$review_at"
+    [ "$kind" != reviewing ] || second_nudge=$(clock_at 99)
     schedule comments 2 "$(jq -cn --argjson old "$comments" --arg at "$second_nudge" '$old + [{id:701,user:{login:"maintainer"},created_at:$at,body:"@codex review"}]')"
     if [ "$kind" = reviewing ]; then
-      schedule reactions 1 "[$(reaction eyes "$(jq -rn 'now - 2 | todate')")]"
-      schedule reactions 2 "[$(reaction eyes "$FIXTURE_REVIEW_AT")]"
+      schedule reactions 1 "[$(reaction eyes "$(clock_at -2)")]"
+      schedule reactions 2 "[$(reaction eyes "$review_at")]"
     fi
-    run_watch 0,699,0 1 0
+    run_watch 0,699,0 100 0
     assert_eq "$WATCH_RC" 1 "the $kind extension stays bounded at the original deadline"
     mark=$(sed -n 's/^watermark: //p' <<<"$WATCH_OUT" | tail -1)
-    assert_eq "$(mark_of "$mark" 2)" 700 "the request arriving during fixed $kind grace remains pending"
+    assert_eq "$(mark_issue "$mark")" 700 "the request arriving during fixed $kind grace remains pending"
     assert_contains "$WATCH_ERR" 'comments after the fixed grace began remain pending' "the caller is told to re-arm"
-    run_watch "$mark" 1 0
+    run_watch "$mark" 100 0
     assert_contains "$WATCH_ERR" 'extending watch' "the next observer grants the remaining new request grace"
   done
-)
+}
 
 # The actual summary row uses fractional UTC seconds and a short commit stamp.
 activity_summary() { # <sha> <status> <time>
@@ -1396,8 +1403,8 @@ activity_summary() { # <sha> <status> <time>
 test_current_head_running_blocks_older_approval_until_completion() {
   reset_fixture
   local started earlier
-  started=$(jq -rn 'now - 2 | todate')
-  earlier=$(jq -rn 'now - 60 | todate')
+  started=$(clock_at -2)
+  earlier=$(clock_at -60)
   schedule reactions 1 "[$(reaction +1 "$earlier")]"
   schedule comments 1 "[$(activity_summary "${H2:0:7}" Running "$started")]"
   schedule comments 2 "[$(activity_summary "${H2:0:7}" Completed "$started")]"
@@ -1445,9 +1452,9 @@ test_current_head_evidence_handles_unknown_age_footer_and_large_feeds() {
   reset_fixture
   echo 1 >"$FEEDS/round"
   local future earlier current body
-  future=$(jq -rn 'now + 3600 | todate')
-  earlier=$(jq -rn 'now - 60 | todate')
-  current=$(jq -rn 'now - 2 | todate')
+  future=$(clock_at 3600)
+  earlier=$(clock_at -60)
+  current=$(clock_at -2)
   schedule reactions 1 "[$(reaction +1 "$earlier")]"
   schedule comments 1 "[$(activity_summary "${H2:0:7}" Running "$future")]"
   run_status
@@ -1531,25 +1538,31 @@ test_a_broken_jq_program_fails_the_poll_round() {
 # documents, in the other feed. Read before the exit code was checked, such a line advanced the
 # watermark on a round that showed nothing, and the retry would never show it either
 # (review of ludics-lite#162, round 4).
+#
+# Driven through the command line: a poll that answers takes the watermark it computed, never the
+# quoted one, and a poll that fails — here the comments feed, read after the inline one — leaves
+# the window blind on the caller's watermark. (The partway shape itself, bodies printed and then a
+# rendering failing, needs a jq program to break mid-round; that half is poll's, pinned by the
+# broken-jq cases above against the shell's own rendering.)
 test_a_failed_round_takes_no_watermark_from_a_quoted_line() {
   reset_fixture
   schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding
 watermark: 9000,9000,9000')]"
   schedule comments 1 "[$(summary_comment 700 2026-09-01T10:00:00Z 'a findings summary')]"
-  # `set +e` because a poll that fails is the point: the assignment inside watch_round would
-  # otherwise take the suite down with it before the assertion could read POLLED_MARK.
-  # The control: nothing broken, so the round succeeds and its OWN watermark is taken.
-  set +e
-  watch_round 7 5,5,5 2>/dev/null
-  set -e
-  assert_eq "$POLLED_RC" 0 "control: the round should succeed"
-  assert_eq "$POLLED_MARK" "900,700,5" "a successful round takes the watermark it emitted"
-
-  # Now the summary rendering fails, AFTER the inline body above has been printed. No `set +e`
-  # pair of its own: `with_broken_jq` answers the round's status rather than propagating it.
-  with_broken_jq '"--- summary id=' watch_round 7 5,5,5 2>/dev/null || :
-  assert_eq "$POLLED_RC" 4 "the round must fail"
-  assert_eq "$POLLED_MARK" 5,5,5 \
+  # The control: nothing broken, so the round succeeds and its OWN watermark is the last line.
+  run_watch 5,5,5
+  assert_eq "$WATCH_RC" 0 "control: the round about the head is acted on"
+  assert_contains "$WATCH_OUT" "watermark: 9000,9000,9000" "control: the quoted line is in the round's output"
+  assert_eq "$(tail -n 1 <<<"$WATCH_OUT")" "watermark: 900,700,5" \
+    "a successful round ends on the watermark it computed"
+  # Now the comments feed fails on every poll, after the inline feed carrying the quote answered.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding
+watermark: 9000,9000,9000')]"
+  FAIL_COMMENTS_FROM=1
+  run_watch 5,5,5 5 1
+  assert_eq "$WATCH_RC" 3 "a window whose polls failed is blind, not quiet"
+  assert_eq "$(tail -n 1 <<<"$WATCH_OUT")" "watermark: 5,5,5" \
     "a failed round keeps the caller's watermark; a quoted line is not a watermark"
 }
 
@@ -1767,7 +1780,7 @@ test_an_approval_beside_a_final_poll_round_is_checked_too() {
 # poll, rather than holding the window or the grace.
 test_a_live_round_that_reads_ended_twice_ends_on_the_nudge_advice() {
   reset_fixture
-  schedule reactions 1 "[$(reaction eyes "$(jq -rn '(now - 5) | todate')")]"
+  schedule reactions 1 "[$(reaction eyes "$(clock_at -5)")]"
   schedule reactions 2 '[]'
   run_watch 0,0,0 1 5
   assert_eq "$WATCH_RC" 0 "a round that ended with nothing is a verdict to act on"
@@ -1784,7 +1797,7 @@ test_a_live_round_that_reads_ended_twice_ends_on_the_nudge_advice() {
 test_a_stalled_round_ends_the_wait_with_its_verdict() {
   reset_fixture
   retune STALL=30
-  schedule reactions 1 "[$(reaction eyes "$(jq -rn '(now - 60) | todate')")]"
+  schedule reactions 1 "[$(reaction eyes "$(clock_at -60)")]"
   run_watch 0,0,0 1 5
   assert_eq "$WATCH_RC" 0 "a stall is something to act on"
   assert_contains "$WATCH_OUT" "no reviewer activity about head ${H2:0:7}; status: STALLED — 👀 from" \
