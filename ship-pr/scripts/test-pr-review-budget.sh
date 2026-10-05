@@ -670,14 +670,19 @@ test_a_wait_behind_a_probe_marks_the_round() {
   local holder
   reset_fixture
   plant_hold "$((T0 - 1))" "repos/$REPO/pulls/7" 600
-  # Not a job of this shell: the hook kills it from inside the case's subshell, and a job killed
-  # there would be reported on this shell's stderr.
-  holder=$(sh -c 'sleep 300 >/dev/null 2>&1 & echo $!')
+  command sleep 300 &
+  holder=$!
   mkdir -p "$STATE_DIR/quota-probe"
   printf '%s\n%s\n' "$holder" "$T0" >"$STATE_DIR/quota-probe/owner"
-  SLEEP_HOOK="kill $holder 2>/dev/null"
+  # The other prober finishes while this one sleeps: its lock goes, and it stays alive (a holder
+  # killed here would be this shell's job, reported on its stderr, or an orphan a container may
+  # never reap).
+  SLEEP_HOOK='rm -rf "$STATE_DIR/quota-probe"'
   run read eval 'BUDGET_WAIT_UNTIL=$((T0 + 7200)); gh_retry read api "repos/$REPO/pulls/7" --jq .head.sha >/dev/null; budget_waited && echo marked'
+  kill "$holder" 2>/dev/null || :
+  wait "$holder" 2>/dev/null || :
   assert_eq "$(out read)" marked "the round is marked for a re-read ($(err read))"
+  assert_eq "$(cat "$SLEEP_LOG")" 5 "after one wait"
 }
 
 # An observer's quota refusal outside the budget (an Enterprise GH_HOST) gets no second try: with
@@ -700,6 +705,34 @@ test_a_host_qualified_run_await_is_scoped_by_its_host() {
   assert_eq "$(standing)" "" "and sets no hold"
   assert_eq "$(budget_endpoint run view 55 --repo github.com/o/r)" "repos/o/r/actions/runs/55" \
     "a github.com-qualified repository is probed at its own endpoint"
+}
+
+# GH_HOST applies only when a call names no host: a run await whose -R names github.com is
+# github.com's, in the budget, whatever GH_HOST says.
+test_an_explicit_github_repo_overrides_gh_host() {
+  local rc=0
+  (BUDGET_HOST=github.com GH_HOST=ghe.example.com budget_scope) || rc=$?
+  assert_eq "$rc" 0 "a named github.com host is in scope under an Enterprise GH_HOST"
+}
+
+# A probe whose answer the state directory cannot record (here: the entries' directory is made
+# unwritable) is an error at once, never a loop of probes on the same ended hold.
+test_an_unrecordable_probe_answer_stops_the_gate() {
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 7200))
+  plant_hold "$((T0 - 1))" "repos/$REPO/pulls/7" 600
+  chmod a-w "$STATE_DIR/quota-holds"
+  if mkdir "$STATE_DIR/quota-holds/probe-writable" 2>/dev/null; then
+    rmdir "$STATE_DIR/quota-holds/probe-writable"
+    chmod u+w "$STATE_DIR/quota-holds"
+    echo "SKIP test_an_unrecordable_probe_answer_stops_the_gate: this platform writes into a read-only directory"
+    return 0
+  fi
+  run single cmd_checks "$REPO#7"
+  chmod u+w "$STATE_DIR/quota-holds"
+  assert_eq "$(rc single)" 3 "the gate stops with UNKNOWN ($(err single))"
+  assert_eq "$(requests | grep -c probe)" 1 "after one probe"
+  assert_contains "$(err single)" "could not be updated" "naming the state directory"
 }
 
 test_a_lock_that_cannot_be_made_is_an_error() {
@@ -831,6 +864,8 @@ run_tests \
   test_a_wait_behind_a_probe_marks_the_round \
   test_an_out_of_scope_refusal_is_not_retried \
   test_a_host_qualified_run_await_is_scoped_by_its_host \
+  test_an_explicit_github_repo_overrides_gh_host \
+  test_an_unrecordable_probe_answer_stops_the_gate \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \

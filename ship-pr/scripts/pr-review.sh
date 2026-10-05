@@ -948,8 +948,9 @@ budget_endpoint() {
 }
 
 # budget_scope: status 0 when the call in hand is in the budget: one of this script's OWN calls
-# to github.com (BUDGET_OUT unset: `retry` sets it around a caller's call, and the run await for a
-# repository its -R qualifies with another host). The merge
+# to github.com (BUDGET_OUT unset: `retry` sets it around a caller's call). The host is
+# BUDGET_HOST when a call names one (the run await's HOST/OWNER/REPO), else GH_HOST, which gh
+# uses only when no host is named. The merge
 # call is the script's own even with a caller's `gh pr merge` flags forwarded. A `retry` caller's arguments can name
 # any host, repository or command form gh accepts, and reading each of those right is not this
 # file's business: such a call is neither gated nor held, and its quota refusal is still exit 3.
@@ -957,7 +958,7 @@ budget_endpoint() {
 # and a GH_HOST naming another server (an Enterprise one, with a quota of its own) puts every
 # call outside the budget.
 budget_scope() {
-  [ -z "${BUDGET_OUT:-}" ] && [ "${GH_HOST:-github.com}" = github.com ]
+  [ -z "${BUDGET_OUT:-}" ] && [ "${BUDGET_HOST:-${GH_HOST:-github.com}}" = github.com ]
 }
 
 # budget_probe <endpoint>: one request to the endpoint with its headers (`gh api -i`), not through
@@ -1182,7 +1183,7 @@ budget_at() { date -u -r "$1" '+%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%H:
 # minutes or hours later would act on reads the hold has made stale (a merge on its gate, a
 # review request over an approval that landed meanwhile).
 budget_gate() {
-  local mode="${1:-read}" now nap verdict noted="" probe_start rc
+  local mode="${1:-read}" now nap verdict noted="" probe_start rc probed
   [ -n "$BUDGET_DIR" ] || return 0
   while hold_read; do
     now=$(budget_now)
@@ -1221,6 +1222,7 @@ budget_gate() {
         continue
       fi
       probe_start=$(budget_now)
+      probed="$HOLD_UNTIL $HOLD_EP"
       verdict=$(budget_probe "$HOLD_EP")
       case "$verdict" in
       ok)
@@ -1230,6 +1232,14 @@ budget_gate() {
       *) hold_set "$HOLD_EP" "$verdict" ;;
       esac
       rm -rf "$BUDGET_DIR/quota-probe"
+      # The probe's answer must have changed the hold: lifted, or replaced by a later one. The same
+      # ended entry still standing means the state directory took no write, and probing it again
+      # at once would loop on requests.
+      if hold_read && [ "$HOLD_UNTIL $HOLD_EP" = "$probed" ]; then
+        GH_ERR="quota hold: the hold in $BUDGET_DIR (SHIP_PR_STATE_DIR) could not be updated after its probe; no call was made"
+        printf '%s' "$GH_ERR" >"$GH_ERR_FILE" 2>/dev/null
+        return 3
+      fi
       continue
       ;;
     esac
@@ -4735,9 +4745,7 @@ cmd_run_watch() {
   # as HOST/OWNER/REPO on another host (gh run view's -R form) is that server's, with its own
   # quota, and outside the budget.
   BUDGET_WAIT_UNTIL="$deadline"
-  case "$repo" in
-  */*/*) [ "${repo%%/*}" = github.com ] || BUDGET_OUT=1 ;;
-  esac
+  case "$repo" in */*/*) BUDGET_HOST="${repo%%/*}" ;; esac
   while :; do
     line=$(gh_retry read run view "$run_id" --repo "$repo" --json status,conclusion \
       --jq '[.status, (.conclusion // "pending")] | @tsv')
