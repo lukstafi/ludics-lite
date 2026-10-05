@@ -156,7 +156,10 @@ If this skill fires at the *end* of a task, as it usually does, this section is 
 to have run at the beginning. A session that did not is still better off running `base` before it
 branches for the follow-up work.
 
-The verdict is about the last **completed** run, and `base` prints which commit that run tested. A
+The verdict is about the last **completed** run that judged the branch, and `base` prints which
+commit that run tested. It reads ten push runs per workflow, and a hundred when none of those ten
+judged anything (ludics-lite#535); a hundred that judged nothing reads **no verdict**, exit 4, and
+says the read stopped there. A
 push a path filter skips produces no run at all, so the newest verdict can legitimately trail the
 tip by several commits — a gap in coverage, not a stale reading, and the printed SHA tells them
 apart.

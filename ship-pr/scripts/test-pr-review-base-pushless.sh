@@ -649,16 +649,16 @@ test_interim_over_a_green_behind_a_page_of_cancelled_runs() {
   assert_not_contains "$BASE_OUTPUT" "green, interim" "no green while it judges"
 }
 
-# The bound: a hundred push rows, none of them judged, and a red behind them that is never read.
-# That is no verdict saying so, never green — the interim included, whose source is a PR head's
-# green while nothing below the bound was read (ludics-lite#535).
+# The bound: a hundred push rows, none of them judged. Whatever judged the branch is behind them,
+# a red included, and is never read, so this is no verdict saying so, never green — the interim
+# included, whose source is a PR head's green while nothing below the bound was read
+# (ludics-lite#535). Exactly a hundred rows, so the feed holds nothing further to find.
 test_a_hundred_runs_that_judged_nothing_are_never_green() {
   local rows wait
   rows=$(jq -cn '[{status: "in_progress", conclusion: null, head_sha: "cccccccccccccccccccccccccccccccccccccccc", id: 8000,
                    created_at: "2026-09-10T12:00:00Z"}] +
     [range(1; 100) | {conclusion: "cancelled", head_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", id: (8000 - .),
-                      created_at: ((1789041600 - 60 * .) | todate)}] +
-    [{conclusion: "failure", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", id: 7000, created_at: "2026-09-01T00:00:00Z"}]')
+                      created_at: ((1789041600 - 60 * .) | todate)}]')
   for wait in "" --wait=2; do
     burst_fixture "$rows"
     run_base --interim ${wait:+"$wait"}
