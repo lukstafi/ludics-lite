@@ -69,7 +69,9 @@ date() {
     command date "$@"
   fi
 }
+SLEEP_HOOK=""         # run on every sleep: what happens while this process sleeps
 sleep() {
+  [ -z "$SLEEP_HOOK" ] || eval "$SLEEP_HOOK"
   printf '%s\n' "$1" >>"$SLEEP_LOG"
   printf '%s' "$(($(cat "$CLOCK") + $1))" >"$CLOCK"
 }
@@ -241,6 +243,7 @@ reset_fixture() {
   GRAPHQL_PROBE=""
   REPO_VIEW_QUOTA=""
   QUOTA_ENDPOINT=""
+  SLEEP_HOOK=""
   RUN_STATUSES=()
   rm -f "$TEST_ROOT/runs.calls"
   retune ADVISORY_FROM_ENV=1
@@ -624,6 +627,69 @@ test_the_observer_lock_reads_the_number_as_an_integer() {
   assert_eq "$(rc second)" 2 "#007 is the same PR's observer ($(err second))"
 }
 
+# Round 7. The first refusal on a fresh state directory still probes (the directory is made before
+# the probe lock), so the hold ends at the endpoint's own reset and not at a minute's guess.
+test_a_fresh_state_directory_still_probes() {
+  reset_fixture
+  rm -rf "$STATE_DIR"
+  QUOTA_UNTIL=$((T0 + 1800))
+  run single cmd_checks "$REPO#7"
+  assert_eq "$(rc single)" 3 "the refused read is UNKNOWN ($(err single))"
+  assert_contains "$(requests)" "probe repos/$REPO/pulls/7" "and the endpoint is probed"
+  assert_eq "$(standing | cut -f1)" "$((T0 + 1800))" "so the hold ends at its reset"
+}
+
+# An ended hold is read again once its probe lock is held: the prober before may have lifted it
+# meanwhile, and probing its endpoint again would be a request for nothing.
+test_an_ended_hold_lifted_before_the_lock_is_not_probed() {
+  reset_fixture
+  plant_hold "$((T0 - 1))" "repos/$REPO/pulls/7" 600
+  (
+    eval 'lock_take() {
+      rm -rf "$STATE_DIR/quota-holds"
+      mkdir "$1" && printf "%s\n%s\n" "$$" "$T0" >"$1/owner"
+    }'
+    gh_retry read api "repos/$REPO/pulls/7" --jq .head.sha
+  ) >/dev/null 2>&1
+  assert_eq "$(requests)" "read repos/$REPO/pulls/7" "the read goes out with no probe of a lifted hold"
+}
+
+# merge's own call stays in the budget with a caller's `gh pr merge` flags forwarded: a write
+# during a hold is not sent.
+test_a_forwarded_merge_is_still_gated() {
+  reset_fixture
+  plant_hold "$((T0 + 600))" graphql 600
+  run merge eval 'GH_RETRY_CALLER_ARGS=unlisted gh_retry write pr merge 7 --repo "$REPO" --squash'
+  assert_eq "$(rc merge)" 3 "the merge is not sent during the hold ($(err merge))"
+  assert_eq "$(cat "$MERGE_LOG")" "" "no merge call at all"
+}
+
+# A wait behind another process's recovery probe is a wait too: it marks the round for a re-read,
+# as a hold's wait does.
+test_a_wait_behind_a_probe_marks_the_round() {
+  local holder
+  reset_fixture
+  plant_hold "$((T0 - 1))" "repos/$REPO/pulls/7" 600
+  # Not a job of this shell: the hook kills it from inside the case's subshell, and a job killed
+  # there would be reported on this shell's stderr.
+  holder=$(sh -c 'sleep 300 >/dev/null 2>&1 & echo $!')
+  mkdir -p "$STATE_DIR/quota-probe"
+  printf '%s\n%s\n' "$holder" "$T0" >"$STATE_DIR/quota-probe/owner"
+  SLEEP_HOOK="kill $holder 2>/dev/null"
+  run read eval 'BUDGET_WAIT_UNTIL=$((T0 + 7200)); gh_retry read api "repos/$REPO/pulls/7" --jq .head.sha >/dev/null; budget_waited && echo marked'
+  assert_eq "$(out read)" marked "the round is marked for a re-read ($(err read))"
+}
+
+# An observer's quota refusal outside the budget (an Enterprise GH_HOST) gets no second try: with
+# no hold to wait for, a second read is only another request during the incident.
+test_an_out_of_scope_refusal_is_not_retried() {
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 600))
+  run read eval 'BUDGET_WAIT_UNTIL=$((T0 + 7200)); GH_HOST=ghe.example.com gh_retry read api "repos/$REPO/pulls/7" --jq .head.sha'
+  assert_eq "$(rc read)" 3 "it is UNKNOWN ($(err read))"
+  assert_eq "$(requests)" "read repos/$REPO/pulls/7 quota" "after one request"
+}
+
 test_a_lock_that_cannot_be_made_is_an_error() {
   local rc=0
   reset_fixture
@@ -667,14 +733,14 @@ test_a_reap_keeps_a_lock_retaken_meanwhile() {
 test_a_callers_call_is_outside_the_budget() {
   reset_fixture
   QUOTA_UNTIL=$((T0 + 600))
-  run caller eval 'GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
+  run caller eval 'BUDGET_CALLER=1 GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
   assert_eq "$(rc caller)" 3 "a caller's quota refusal is still UNKNOWN ($(err caller))"
   assert_eq "$(standing)" "" "but sets no hold"
   assert_not_contains "$(requests)" "probe" "and probes nothing"
   QUOTA_UNTIL=0
   : >"$CALL_LOG"
   plant_hold "$((T0 + 600))" graphql 600
-  run caller2 eval 'GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
+  run caller2 eval 'BUDGET_CALLER=1 GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
   assert_eq "$(rc caller2)" 0 "a hold does not stop it ($(err caller2))"
 }
 
@@ -747,6 +813,11 @@ run_tests \
   test_the_scope_and_the_job_read_what_gh_reads \
   test_a_round_split_by_a_hold_is_read_again \
   test_the_observer_lock_reads_the_number_as_an_integer \
+  test_a_fresh_state_directory_still_probes \
+  test_an_ended_hold_lifted_before_the_lock_is_not_probed \
+  test_a_forwarded_merge_is_still_gated \
+  test_a_wait_behind_a_probe_marks_the_round \
+  test_an_out_of_scope_refusal_is_not_retried \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \

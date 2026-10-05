@@ -731,7 +731,8 @@ gh_retry() {
     # one more try, and a write is never repeated.
     if quota_failure "${GH_ERR%%$'\n'*}"; then
       ! budget_scope || budget_quota_hit "$@"
-      if [ "$mode" = read ] && [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$(budget_now)" -lt "$BUDGET_WAIT_UNTIL" ]; then
+      if [ "$mode" = read ] && budget_scope && [ -n "$BUDGET_WAIT_UNTIL" ] &&
+        [ "$(budget_now)" -lt "$BUDGET_WAIT_UNTIL" ]; then
         if hold_read; then
           continue
         fi
@@ -945,14 +946,15 @@ budget_endpoint() {
 }
 
 # budget_scope: status 0 when the call in hand is in the budget: one of this script's OWN calls
-# (gh_retry's GH_RETRY_CALLER_ARGS empty), to github.com. A `retry` caller's arguments can name
+# (BUDGET_CALLER unset: `retry` alone sets it, around a caller's call), to github.com. The merge
+# call is the script's own even with a caller's `gh pr merge` flags forwarded. A `retry` caller's arguments can name
 # any host, repository or command form gh accepts, and reading each of those right is not this
 # file's business: such a call is neither gated nor held, and its quota refusal is still exit 3.
 # An own call names no host, so gh sends it to GH_HOST when that is set (`gh help environment`),
 # and a GH_HOST naming another server (an Enterprise one, with a quota of its own) puts every
 # call outside the budget.
 budget_scope() {
-  [ -z "$GH_RETRY_CALLER_ARGS" ] && [ "${GH_HOST:-github.com}" = github.com ]
+  [ -z "${BUDGET_CALLER:-}" ] && [ "${GH_HOST:-github.com}" = github.com ]
 }
 
 # budget_probe <endpoint>: one request to the endpoint with its headers (`gh api -i`), not through
@@ -1209,6 +1211,12 @@ budget_gate() {
       return 3
       ;;
     0)
+      # Again under the lock: the prober before this one may have lifted this hold, or set a new
+      # one, while this process waited for the lock.
+      if ! hold_read || [ "$(budget_now)" -lt "$HOLD_UNTIL" ]; then
+        rm -rf "$BUDGET_DIR/quota-probe"
+        continue
+      fi
       probe_start=$(budget_now)
       verdict=$(budget_probe "$HOLD_EP")
       case "$verdict" in
@@ -1224,6 +1232,7 @@ budget_gate() {
     esac
     if [ "$mode" = read ] && [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$now" -lt "$BUDGET_WAIT_UNTIL" ]; then
       sleep 5
+      : >"$BUDGET_DIR/waited.$$" 2>/dev/null
       continue
     fi
     GH_ERR="quota hold: pid $LOCK_HOLDER is probing $HOLD_EP for its recovery; no call was made"
@@ -1250,6 +1259,8 @@ budget_quota_hit() {
     hold_set "$ep" unprobed
     return 0
   fi
+  # The first refusal may be the state directory's first use.
+  mkdir -p "$BUDGET_DIR" 2>/dev/null
   if ! lock_take "$BUDGET_DIR/quota-probe"; then
     hold_set "$ep" unprobed
     return 0
@@ -4141,6 +4152,13 @@ watch_loop() {
     fi
     last_tok="$tok"
     last_pause="$pause"
+    # A pause the budget GREW past the window's end is cut to it, so the budget never ends a
+    # window earlier than the fixed interval would have: its last read is at the window's end, not
+    # up to a whole cap before it. A pause still at the interval keeps the fixed-interval rule.
+    remaining=$((timeout - (SECONDS - start)))
+    if [ "$pause" -gt "$interval" ] && [ "$remaining" -gt 0 ] && [ "$pause" -gt "$remaining" ]; then
+      pause="$remaining"
+    fi
     if [ $((SECONDS - start + pause)) -gt "$timeout" ]; then
       # A live round can outlast the ordinary quiet window. Freeze the extension's
       # deadline on its first use so changing reactions cannot renew it indefinitely.
@@ -4788,7 +4806,7 @@ cmd_retry() {
   fi
   local caller_args=unlisted
   gh_api_only_command "$@" && caller_args=listed
-  GH_RETRY_CALLER_ARGS="$caller_args" gh_retry "$mode" "$@"
+  BUDGET_CALLER=1 GH_RETRY_CALLER_ARGS="$caller_args" gh_retry "$mode" "$@"
   case "$?" in
   0) return 0 ;;
   2) die "gh $1 refused its own arguments and sent nothing: $(gh_err_line). That is a usage" \

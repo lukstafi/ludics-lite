@@ -597,8 +597,8 @@ test_the_quiet_exit_names_the_head_and_what_scrolled_past() {
 }
 
 # The polling budget (ludics-lite#543): a window whose state does not move backs off from the
-# interval toward the review cap, so a quiet 900s window at the 90s interval reads five times, not
-# eleven. The last pause that would run past the window is not taken. A subshell case, like the
+# interval toward the review cap, so a quiet 900s window at the 90s interval reads six times, not
+# eleven. The last pause is cut to the window's end, so the window's last read is at its end. A subshell case, like the
 # others that redefine sleep, so it is listed after the cases that make the snapshot directory in
 # the suite's own shell (one made in a subshell outlives it).
 test_an_unmoving_window_backs_off_to_the_review_cap() (
@@ -611,9 +611,14 @@ test_an_unmoving_window_backs_off_to_the_review_cap() (
   REVIEW_POLL_CAP=300
   run_watch 0,0,0 90 900
   assert_eq "$WATCH_RC" 1 "nothing at all is a quiet window"
-  assert_eq "$(tr '\n' ' ' <"$TEST_ROOT/sleeps")" "90 180 300 300 " \
+  local last
+  assert_eq "$(sed -n 1,4p "$TEST_ROOT/sleeps" | tr '\n' ' ')" "90 180 300 300 " \
     "an unchanged state doubles the pause up to the review cap"
-  assert_eq "$(poll_rounds)" 6 "five reads in the window, and the settle"
+  # The cut pause is what is left of the window: 30s, less any real second the case took.
+  last=$(sed -n 5p "$TEST_ROOT/sleeps")
+  assert_eq "$([ "${last:-0}" -ge 1 ] && [ "$last" -le 30 ] && echo cut)" cut \
+    "and the last is cut to the window's end (got '$last')"
+  assert_eq "$(poll_rounds)" 7 "six reads in the window, the last at its end, and the settle"
 )
 
 # --- one final poll before any verdict ------------------------------------------------------------
