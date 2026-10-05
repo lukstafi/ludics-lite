@@ -997,7 +997,7 @@ expect "a box whose Python >= 3.12 cannot import fcntl refuses (the run-time slo
   "PREFLIGHT REFUSED testbox: $TMP/pys/py-nofcntl, the Python >= 3.12 scripts/py would run here, cannot import fcntl" -- \
   env LUDICS_PY_CANDIDATES="$TMP/pys/py-nofcntl" "$FW" preflight testbox --no-probe --no-cross
 expect "a box with no Python >= 3.12 in scripts/py's order refuses, naming what it found" 1 \
-  "PREFLIGHT REFUSED other: no Python >= 3.12 in scripts/py's order on other (tried $TMP/pys/missing: absent, $TMP/pys/old-python: Python 3.9.6, $TMP/pys/not-python: not Python (exit 1)): fleet-worker.sh runs under it here" -- \
+  "PREFLIGHT REFUSED other: no Python >= 3.12 in scripts/py's order on other (tried $TMP/pys/missing: absent, $TMP/pys/old-python ($TMP/pys/old-python): Python 3.9.6, older than 3.12, $TMP/pys/not-python ($TMP/pys/not-python): did not run as Python (exit 1)): fleet-worker.sh runs under it here" -- \
   env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other SHIM_SSH_PY="$TMP/pys/missing
 $TMP/pys/old-python
 $TMP/pys/not-python" "$FW" preflight other --no-probe --no-cross

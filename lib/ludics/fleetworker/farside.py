@@ -17,8 +17,8 @@ composition the near side does around it:
   FRESHNESS    the skills checkout's freshness, shared by the preflight and ``refresh``
   ghprobe(b)   the GitHub probe (``gh_bound`` = FLEET_GH_TIMEOUT, then GHPROBE), shared by the
                preflight and the far sides that create a worker session (launch, unstick)
-  FLEET_PYTHON the first Python >= 3.12 in scripts/py's order (the registry's interpreter, and the
-               preflight's probe of the box)
+  FLEET_PYTHON the first Python >= 3.12 in scripts/py's order, PY_CANDIDATES then PY_LAUNCHER_ARGS
+               (the registry's interpreter, and the preflight's probe of the box)
   PREFLIGHT    after FRESHNESS, ghprobe and FLEET_PYTHON
   REFRESH      after FRESHNESS
   LAUNCH_EXISTS, LAUNCH_FETCH, LAUNCH (after ghprobe)
@@ -506,36 +506,81 @@ def ghprobe(bound: str) -> str:
     return f"gh_bound={shlex.quote(bound)}\n" + GHPROBE
 
 
-# The first Python >= 3.12 in scripts/py's order (/opt/homebrew/bin/python3, /usr/local/bin/python3,
-# python3.13, python3.12, python3, python, ~/.local/bin/python3.12), or in LUDICS_PY_CANDIDATES, one
-# per line, as the box's environment sets it. A non-interactive ssh session on a Mac often has no
-# /opt/homebrew on PATH, and its bare python3 is Xcode's 3.9. Prints the interpreter and returns 0;
-# or prints what each candidate was, as scripts/py names them, and returns 1. The probe is
+# scripts/py's interpreter order, held here as data so a unit test can pin it against scripts/py's
+# own text (test_fleetworker_workers): the built-in candidates, then under Git Bash / MSYS / Cygwin
+# the launcher `py` with each of these arguments.
+PY_CANDIDATES = (
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+    "python3.13",
+    "python3.12",
+    "python3",
+    "python",
+    "${HOME:-/nonexistent}/.local/bin/python3.12",
+)
+PY_LAUNCHER_ARGS = ("-3.12", "-3")
+
+# The first Python >= 3.12 in scripts/py's order, or in LUDICS_PY_CANDIDATES (one per line, which
+# replaces the order, the launcher included) as the box's environment sets it. A non-interactive
+# ssh session on a Mac often has no /opt/homebrew on PATH, and its bare python3 is Xcode's 3.9.
+# Prints the interpreter and returns 0 -- for the launcher, the interpreter it chose (its
+# sys.executable, as a POSIX path where cygpath can say one), since a caller runs "$py" as one
+# word; or prints what each candidate was, in scripts/py's words, and returns 1. The probe is
 # scripts/py's own, which parses on any Python down to 2.x and prints the version it ran under.
-FLEET_PYTHON = r"""fleet_python() {
-  local c candidates v rc tried=""
+FLEET_PYTHON = (
+    r"""# fleet_py_try <command> [<arg>]: scripts/py's try, noting a miss in fleet_py_tried.
+fleet_py_try() {
+  local cmd="$1" arg="${2:-}" label where v rc exe
+  label="$cmd${arg:+ $arg}"
+  case "$cmd" in
+    */*) if [ ! -f "$cmd" ] || [ ! -x "$cmd" ]; then fleet_py_tried="$fleet_py_tried, $label: absent"; return 1; fi
+         where="$cmd" ;;
+    *) where=$(command -v "$cmd" 2>/dev/null) || { fleet_py_tried="$fleet_py_tried, $label: not on PATH"; return 1; } ;;
+  esac
+  local probe='import sys; sys.stdout.write("%d.%d.%d\n" % tuple(sys.version_info[:3])); sys.exit(0 if sys.version_info >= (3, 12) else 1)'
+  if [ -n "$arg" ]; then v=$("$cmd" "$arg" -c "$probe" </dev/null 2>/dev/null); else v=$("$cmd" -c "$probe" </dev/null 2>/dev/null); fi
+  rc=$?
+  v=$(printf '%s' "$v" | tr -d '\r' | head -n 1)
+  if [ "$rc" -eq 0 ] && [ -n "$v" ]; then
+    if [ -z "$arg" ]; then printf '%s' "$cmd"; return 0; fi
+    exe=$("$cmd" "$arg" -c 'import sys; sys.stdout.write(sys.executable)' </dev/null 2>/dev/null | tr -d '\r')
+    if [ -n "$exe" ]; then
+      if command -v cygpath >/dev/null 2>&1; then exe=$(cygpath -u "$exe"); fi
+      printf '%s' "$exe"; return 0
+    fi
+    fleet_py_tried="$fleet_py_tried, $label ($where): Python $v, with no sys.executable"; return 1
+  fi
+  if [ -n "$v" ]; then fleet_py_tried="$fleet_py_tried, $label ($where): Python $v, older than 3.12"
+  else fleet_py_tried="$fleet_py_tried, $label ($where): did not run as Python (exit $rc)"; fi
+  return 1
+}
+fleet_python() {
+  local c candidates
+  fleet_py_tried=""
   if [ -n "${LUDICS_PY_CANDIDATES+set}" ]; then candidates=$LUDICS_PY_CANDIDATES
-  else candidates="/opt/homebrew/bin/python3
-/usr/local/bin/python3
-python3.13
-python3.12
-python3
-python
-$HOME/.local/bin/python3.12"; fi
+  else candidates="""
+    + '"'
+    + "\n".join(PY_CANDIDATES)
+    + '"'
+    + r"""; fi
   while IFS= read -r c; do
     [ -n "$c" ] || continue
-    command -v "$c" >/dev/null 2>&1 || { tried="$tried, $c: absent"; continue; }
-    v=$("$c" -c 'import sys; sys.stdout.write("%d.%d.%d\n" % tuple(sys.version_info[:3])); sys.exit(0 if sys.version_info >= (3, 12) else 1)' </dev/null 2>/dev/null); rc=$?
-    v=$(printf '%s' "$v" | tr -d '\r' | head -n 1)
-    if [ "$rc" -eq 0 ] && [ -n "$v" ]; then printf '%s' "$c"; return 0; fi
-    if [ -n "$v" ]; then tried="$tried, $c: Python $v"; else tried="$tried, $c: not Python (exit $rc)"; fi
+    fleet_py_try "$c" && return 0
   done <<FLEET_PYTHON_CANDIDATES
 $candidates
 FLEET_PYTHON_CANDIDATES
-  printf 'tried %s' "${tried#, }"
+  if [ -z "${LUDICS_PY_CANDIDATES+set}" ]; then
+    case "$(uname -s 2>/dev/null)" in
+      MINGW* | MSYS* | CYGWIN*) { """
+    + " || ".join(f"fleet_py_try py {a}" for a in PY_LAUNCHER_ARGS)
+    + r"""; } && return 0 ;;
+    esac
+  fi
+  printf 'tried %s' "${fleet_py_tried#, }"
   return 1
 }
 """
+)
 
 
 # Far-side skill-freshness preflight (ludics-lite#3), after FRESHNESS, ghprobe and FLEET_PYTHON.

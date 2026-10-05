@@ -7,6 +7,8 @@ import contextlib
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,6 +26,7 @@ from ludics.prreview.core import JsonStreamError, json_docs, json_stream
 from ludics.prreview.jqsem import JqError, jstr, tojson
 
 SCRIPT = "/repo/issue-wave/scripts/fleet-worker.sh"
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 ROSTER = "mac-studio rog-nv-linux minix-amd-linux tuf-amd-linux"
 
 
@@ -186,11 +189,58 @@ class FleetPython(unittest.TestCase):
             os.chmod(old, 0o755)
             os.chmod(junk, 0o755)
             missing = os.path.join(d, "missing")
-            rc, out = self.probe([missing, old, junk])
+            rc, out = self.probe([missing, old, junk, "no-such-python-on-path"])
             self.assertEqual(rc, 1)
-            self.assertEqual(out, f"tried {missing}: absent, {old}: Python 3.9.6, {junk}: not Python (exit 3)")
+            self.assertEqual(
+                out,
+                f"tried {missing}: absent, {old} ({old}): Python 3.9.6, older than 3.12,"
+                f" {junk} ({junk}): did not run as Python (exit 3), no-such-python-on-path: not on PATH",
+            )
             rc, out = self.probe([old, sys.executable])
             self.assertEqual((rc, out), (0, sys.executable))
+
+    def test_the_default_order_is_scripts_pys_own(self) -> None:
+        # The far side cannot run scripts/py's probe from the coordinator's checkout, so it holds the
+        # order as data; this pins that data to scripts/py's text, the launcher fallback included.
+        with open(os.path.join(ROOT, "scripts", "py"), encoding="utf-8") as f:
+            text = f.read()
+        loop = re.search(r"^  for candidate in (.*?); do$", text, re.MULTILINE | re.DOTALL)
+        launcher = re.search(r"^    if try py (\S+) \|\| try py (\S+); then", text, re.MULTILINE)
+        assert loop is not None and launcher is not None, "scripts/py's candidate loop moved"
+        self.assertEqual(tuple(shlex.split(loop.group(1).replace("\\\n", " "))), farside.PY_CANDIDATES)
+        self.assertEqual(launcher.groups(), farside.PY_LAUNCHER_ARGS)
+
+    def test_under_git_bash_the_launcher_comes_last_and_names_its_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            for name, body in (
+                ("uname", "echo MINGW64_NT-10.0-19045"),
+                # The launcher: no 3.12 here, a 3.13 for -3; asked for its executable, a Windows path.
+                ("py", 'case "$1 $3" in "-3.12 "*) exit 103 ;; *executable*) printf "C:\\\\Py313\\\\python.exe\\r\\n" ;; *) echo 3.13.1 ;; esac'),
+                ("cygpath", '[ "$1" = -u ] && echo "/c/Py313/python.exe"'),
+            ):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write(f"#!/bin/sh\n{body}\n")
+                os.chmod(os.path.join(d, name), 0o755)
+            # Every built-in candidate misses (this box has some of them), so the launcher is asked.
+            script = (
+                farside.FLEET_PYTHON
+                + 'eval "orig_$(declare -f fleet_py_try)"\n'
+                + 'fleet_py_try() { [ "$1" = py ] || { fleet_py_tried="$fleet_py_tried, $1: absent"; return 1; }; orig_fleet_py_try "$@"; }\n'
+                + "fleet_python"
+            )
+            env = {k: v for k, v in os.environ.items() if k != "LUDICS_PY_CANDIDATES"}
+            env["PATH"] = d + os.pathsep + "/usr/bin:/bin"
+            done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False)
+            self.assertEqual((done.returncode, done.stdout), (0, "/c/Py313/python.exe"))
+            # A LUDICS_PY_CANDIDATES list replaces the order, the launcher included, as in scripts/py.
+            env["LUDICS_PY_CANDIDATES"] = "python9"
+            done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False)
+            self.assertEqual((done.returncode, done.stdout), (1, "tried python9: absent"))
+            del env["LUDICS_PY_CANDIDATES"]
+            os.remove(os.path.join(d, "py"))
+            done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, check=False)
+            self.assertEqual(done.returncode, 1)
+            self.assertTrue(done.stdout.endswith(", py -3.12: not on PATH, py -3: not on PATH"), done.stdout)
 
 
 if __name__ == "__main__":
