@@ -57,6 +57,13 @@ SERIES_JSON_LATER=""                   # nonempty = what the SECOND series read 
 SERIES_COUNT=""                        # nonempty = the commit count the PR states, over the rows'
 SERIES_FAIL=""                         # nonempty = the commits read answers with a 503
 ADVISORY_FAIL=""                       # nonempty = the advisory-list read answers with a 503
+# An ABSENT verdict's base, re-read before each merge attempt (ludics-lite#523). The gate reads
+# base-sha until the merge loop's first base read; from that read on, every read answers BASE_MOVED
+# when it is set -- the base advanced between the gate's read and the merge call.
+BASE_MOVED=""
+BASE_READ_FAIL=""                      # nonempty = the merge loop's base read answers with a 503
+HEAD_AFTER_MOVE=""                     # nonempty = the head the gate reads once the base moved
+MOVED_RUN_RC=""                        # nonempty = run_signal's status on the moved base
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
 # the names body, base and default-branch: gh_retry calls the fixture inside a command
 # substitution, so a variable it increments dies with that subshell, and the count has to travel
@@ -86,7 +93,29 @@ build_checks() {
   fi
   return 0
 }
-run_signal() { printf '0\t\t%s\n' "$RUN_REASON"; return 0; }
+run_signal() {
+  if [ -n "$MOVED_RUN_RC" ] && [ "$4" = "$BASE_MOVED" ]; then
+    printf '0\t\t%s\n' "a run the moved base's workflows create may still appear"
+    return "$MOVED_RUN_RC"
+  fi
+  printf '0\t\t%s\n' "$RUN_REASON"
+  return 0
+}
+# The PR's base and head as the gate's reads see them: moved once the merge loop has read the base.
+fixture_base() {
+  if [ -n "$BASE_MOVED" ] && [ "$(fixture_call_total base-sha)" -ge 1 ]; then
+    printf '%s\n' "$BASE_MOVED"
+  else
+    printf '%s\n' base-sha
+  fi
+}
+fixture_head() {
+  if [ -n "$HEAD_AFTER_MOVE" ] && [ "$(fixture_call_total base-sha)" -ge 1 ]; then
+    printf '%s\n' "$HEAD_AFTER_MOVE"
+  else
+    printf '%s\n' "$1"
+  fi
+}
 warn_base_drift() { printf 'CALL warn_base_drift\n' >>"$CALLS_FILE"; }
 
 gh() {
@@ -107,9 +136,20 @@ gh() {
       gh_fixture_answer "$(series_answer "$reads" |
         jq -c --arg c "$SERIES_COUNT" '{commits: (if $c == "" then length else ($c | tonumber) end), head: {sha: .[-1].sha}}')"
       ;;
-    *'.updated_at'*) printf 'head-sha\t2026-09-01T00:00:00Z\tbase-sha\tclaude/topic\n' ;;
+    *'.updated_at'*)
+      printf '%s\t2026-09-01T00:00:00Z\t%s\tclaude/topic\n' "$(fixture_head head-sha)" "$(fixture_base)"
+      ;;
     *'--jq .head.sha // "-"') printf '%s\n' "${HEAD_AFTER_MERGE:-$CURRENT_HEAD}" ;;
-    *'.head.sha'*) printf '%s\tbase-sha\tclaude/topic\n' "$CURRENT_HEAD" ;;
+    *'--jq .base.sha // "-"')
+      printf 'CALL base-sha\n' >>"$CALLS_FILE"
+      fixture_call_count base-sha >/dev/null || return 1
+      if [ -n "$BASE_READ_FAIL" ]; then
+        printf 'gh: 503 No server is currently available to service your request\n' >&2
+        return 1
+      fi
+      fixture_base
+      ;;
+    *'.head.sha'*) printf '%s\t%s\tclaude/topic\n' "$(fixture_head "$CURRENT_HEAD")" "$(fixture_base)" ;;
     *'.base.ref'*)
       reads=$(fixture_call_count base) || return 1
       if [ -n "$BASE_LATER" ] && [ "$reads" -ge 2 ]; then
@@ -294,6 +334,10 @@ reset() {
   SERIES_COUNT=""
   SERIES_FAIL=""
   ADVISORY_FAIL=""
+  BASE_MOVED=""
+  BASE_READ_FAIL=""
+  HEAD_AFTER_MOVE=""
+  MOVED_RUN_RC=""
 }
 
 # The merge is bound to the head the gate read: a push during a long --wait must not land a head
@@ -924,6 +968,62 @@ test_a_base_moved_during_the_call_is_not_a_head_move() {
   assert_contains "$MERGE_OUTPUT" "ABSENT verdict was recognized against the old base" \
     "the refusal names the base as the reason"
   assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 1 "and is not retried"
+}
+
+# ludics-lite#523: an ABSENT verdict can rest on the base, and the merge call binds only the head,
+# so the base is re-read last before each attempt and a moved one is gated again. The recognition
+# itself, on a base that added a workflow, is test-pr-review-checks-absent.sh's; these are the
+# merge loop's own outcomes.
+test_an_absent_verdict_rereads_its_base_before_the_call() {
+  # Green rests on the head's own runs: no base read.
+  reset
+  run_merge
+  assert_eq "$MERGE_RC" 0 "a green head merges ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_CALLS" "CALL base-sha" "a green verdict does not re-read the base"
+  # Absent on an unmoved base: one read, then the call.
+  reset
+  NO_CHECKS=1
+  run_merge
+  assert_eq "$MERGE_RC" 0 "an absent head on an unmoved base merges ($MERGE_OUTPUT)"
+  assert_eq "$(grep -c 'CALL base-sha' <<<"$MERGE_CALLS")" 1 "one base read"
+  assert_not_contains "$MERGE_OUTPUT" "gating the head again" "and no second gate"
+  # Moved, and the second gate still finds the absence: merged on the new base after a rescan.
+  reset
+  NO_CHECKS=1
+  BASE_MOVED=moved-base
+  run_merge
+  assert_eq "$MERGE_RC" 0 "an absence the new base still settles merges ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_STDERR" "base moved since its ABSENT verdict was read (base-sha -> moved-ba)" \
+    "the move is named"
+  assert_eq "$(grep -c 'CALL base-sha' <<<"$MERGE_CALLS")" 2 "the rescan reads the base once more"
+  assert_eq "$(grep -c 'warn_base_drift' <<<"$MERGE_CALLS")" 2 "the drift is re-read for the new base"
+  assert_eq "$(grep -c 'pr merge' <<<"$MERGE_CALLS")" 1 "one merge call"
+  # Moved, and the second gate has no verdict: refused with the gate's status, nothing merged.
+  reset
+  NO_CHECKS=1
+  BASE_MOVED=moved-base
+  MOVED_RUN_RC=4
+  run_merge
+  assert_eq "$MERGE_RC" 4 "no verdict on the new base is not merged ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "the gate read against the new base is unjudged" "says why"
+  assert_no_merge_call
+  # Moved, and the head moved too: the second gate is about another head.
+  reset
+  NO_CHECKS=1
+  BASE_MOVED=moved-base
+  HEAD_AFTER_MOVE=pushed-sha
+  run_merge
+  assert_eq "$MERGE_RC" 5 "a head that moved with the base is refused ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "head moved too (head-sha -> pushed-s)" "and named"
+  assert_no_merge_call
+  # An unread base is unknown, not unmoved.
+  reset
+  NO_CHECKS=1
+  BASE_READ_FAIL=1
+  run_merge
+  assert_eq "$MERGE_RC" 3 "an unread base is not merged on ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "base could not be re-read" "says so"
+  assert_no_merge_call
 }
 
 # ludics-lite#471: gh refusing the merge call's own flags is a gh/script version mismatch, exit 2
@@ -1902,6 +2002,7 @@ tests=(
   test_the_local_qualified_spelling_is_the_same_issue
   test_the_body_is_rescanned_before_a_retried_merge
   test_a_base_moved_during_the_call_is_not_a_head_move
+  test_an_absent_verdict_rereads_its_base_before_the_call
   test_no_warning_when_the_base_is_not_the_default_branch
   test_an_unread_default_branch_is_not_an_inert_keyword
   test_a_repository_named_like_a_keyword_is_not_a_keyword
