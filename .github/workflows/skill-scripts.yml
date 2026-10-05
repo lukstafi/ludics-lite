@@ -115,6 +115,11 @@ jobs:
       - name: Exercise the hygiene checks against defective scratch trees
         if: ${{ !cancelled() }}
         run: scripts/test-check-prompts.sh || { echo '::error title=suite failed::test-check-prompts.sh'; exit 1; }
+      - name: Exercise the Python interpreter wrapper
+        # scripts/py, which every Python entry point of the v2 rewrite runs through (ludics-lite
+        # #403): seconds, and it is what the other Python steps stand on.
+        if: ${{ !cancelled() }}
+        run: scripts/test-py.sh || { echo '::error title=suite failed::test-py.sh'; exit 1; }
 
   lint:
     name: syntax, shellcheck, mode bits, parse guard
@@ -558,6 +563,9 @@ jobs:
       - name: base negative-control helper
         if: ${{ !cancelled() }}
         run: scripts/test-run-against-base.sh || { echo '::error title=macOS suite failed::test-run-against-base.sh'; exit 1; }
+      - name: Python interpreter wrapper
+        if: ${{ !cancelled() }}
+        run: scripts/test-py.sh || { echo '::error title=macOS suite failed::test-py.sh'; exit 1; }
       - name: execution reservations
         if: ${{ !cancelled() }}
         run: python3 issue-wave/scripts/test-fleet-execution.py || { echo '::error title=macOS suite failed::test-fleet-execution.py'; exit 1; }

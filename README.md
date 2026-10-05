@@ -391,6 +391,7 @@ scripts/test-check-parse-guards.sh
 scripts/test-preflight.sh
 scripts/test-sync-routines.sh
 scripts/test-run-against-base.sh
+scripts/test-py.sh
 ```
 
 Four conventions travel with that list. Each is held by a scanner that reads line shapes — a
