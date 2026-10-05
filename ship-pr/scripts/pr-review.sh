@@ -455,6 +455,7 @@ SNAP=""
 # preamble refuses to run if its trap no longer reaches whatever this one installs.
 pr_review_cleanup() {
   observer_release
+  budget_waited_reset
   rm -f "$GH_ERR_FILE" "$GH_REFUSED_FILE"
   [ -z "$GH_TMP_FILE" ] || rm -f "$GH_TMP_FILE"
   [ -z "$SNAP_DIR" ] || rm -rf "$SNAP_DIR"
@@ -703,7 +704,7 @@ gh_retry() {
   GH_ERR=""
   while :; do
     # The polling budget's hold (see "the polling budget"): no call while one stands.
-    if budget_scope "$@" && ! budget_gate "$mode"; then
+    if budget_scope && ! budget_gate "$mode"; then
       [ "$tmp" = /dev/null ] || { rm -f "$tmp"; GH_TMP_FILE=""; }
       return 3
     fi
@@ -729,7 +730,7 @@ gh_retry() {
     # that hold out at the top of this loop and repeats; a read the probe found no hold for gets
     # one more try, and a write is never repeated.
     if quota_failure "${GH_ERR%%$'\n'*}"; then
-      ! budget_scope "$@" || budget_quota_hit "$@"
+      ! budget_scope || budget_quota_hit "$@"
       if [ "$mode" = read ] && [ -n "$BUDGET_WAIT_UNTIL" ] && [ "$(budget_now)" -lt "$BUDGET_WAIT_UNTIL" ]; then
         if hold_read; then
           continue
@@ -817,9 +818,12 @@ gh_err_line() {
 # exhausted quota with a 200). A probe addresses the call's own endpoint: the one positional of
 # `api`, `repos/<repo>/actions/runs/<id>` (or `.../jobs/<id>` with `--job`) for `run view`, and
 # `graphql` for every other gh command, since gh's pr and issue commands ride GraphQL, which has
-# its own quota. A call whose endpoint cannot be told sets no hold. The budget covers github.com
-# only: a call to another host (`--hostname`, or GH_HOST with none named) is neither held nor
-# probed, and every probe names github.com. The hold
+# its own quota. A call whose endpoint cannot be told sets no hold. The budget covers this
+# script's OWN calls to github.com: a `retry` caller's call (any host, repository or command form
+# gh accepts) is neither gated nor held, a GH_HOST naming another server takes every call out,
+# and every probe names github.com. A gate round that waited a hold out between its reads is read
+# again whole (gate_checks), and nothing after `merge`'s gate waits a hold out at all; `watch`
+# rounds are not re-read (an approval it reports still goes through that gate). The hold
 # is per state directory, not per account: another host learns of the quota from its own first
 # refusal. Every gh call passes the hold's gate: gh_retry's, and repo_from_cwd's `gh repo view`.
 # An observer counts as live while `kill -0` reaches its pid, so a pid the OS has reused reads as
@@ -851,6 +855,12 @@ BUDGET_WAIT_FROM=""
 BUDGET_OBSERVER=""
 
 budget_now() { date +%s; }
+
+# budget_waited: status 0 when a read of this process has waited a hold out since the last
+# budget_waited_reset. A gate that read part of its round before the wait and part after is a
+# round of two different moments, so it reads the round again (gate_checks).
+budget_waited() { [ -n "$BUDGET_DIR" ] && [ -e "$BUDGET_DIR/waited.$$" ]; }
+budget_waited_reset() { [ -z "$BUDGET_DIR" ] || rm -f "$BUDGET_DIR/waited.$$"; }
 
 # budget_pause <interval> <cap> <previous pause, or empty> <changed: 1|0>: the next pause.
 budget_pause() {
@@ -934,25 +944,15 @@ budget_endpoint() {
   return 0
 }
 
-# budget_scope <gh args...>: status 0 when the call is github.com's, the one host the budget
-# covers. A call to another host (an Enterprise server) has a quota of its own, which this file
-# neither holds nor probes: one naming another `--hostname`, or naming none while GH_HOST names
-# another (gh reads GH_HOST when a command names no host, `gh help environment`).
+# budget_scope: status 0 when the call in hand is in the budget: one of this script's OWN calls
+# (gh_retry's GH_RETRY_CALLER_ARGS empty), to github.com. A `retry` caller's arguments can name
+# any host, repository or command form gh accepts, and reading each of those right is not this
+# file's business: such a call is neither gated nor held, and its quota refusal is still exit 3.
+# An own call names no host, so gh sends it to GH_HOST when that is set (`gh help environment`),
+# and a GH_HOST naming another server (an Enterprise one, with a quota of its own) puts every
+# call outside the budget.
 budget_scope() {
-  local a next="" host=""
-  for a in "$@"; do
-    if [ -n "$next" ]; then
-      host="$a"
-      next=""
-      continue
-    fi
-    case "$a" in
-    --hostname) next=1 ;;
-    --hostname=*) host="${a#--hostname=}" ;;
-    esac
-  done
-  [ -n "$host" ] || host="${GH_HOST:-github.com}"
-  [ "$host" = github.com ]
+  [ -z "$GH_RETRY_CALLER_ARGS" ] && [ "${GH_HOST:-github.com}" = github.com ]
 }
 
 # budget_probe <endpoint>: one request to the endpoint with its headers (`gh api -i`), not through
@@ -1191,6 +1191,8 @@ budget_gate() {
         nap=$((HOLD_UNTIL - now))
         [ "$nap" -le $((BUDGET_WAIT_UNTIL - now)) ] || nap=$((BUDGET_WAIT_UNTIL - now))
         sleep "$nap"
+        # Whatever this command read before the wait is as old as the wait now (budget_waited).
+        : >"$BUDGET_DIR/waited.$$" 2>/dev/null
         continue
       fi
       GH_ERR="quota hold until $(budget_at "$HOLD_UNTIL"), set when $HOLD_EP refused on quota ($HOLD_SRC); no call was made"
@@ -1268,7 +1270,8 @@ observer_claim() {
   local kind="$1" dir key
   [ -n "$BUDGET_DIR" ] || return 0
   # GitHub's names are case-insensitive, so the key is too: Owner/Repo and owner/repo are one PR.
-  key=$(printf '%s#%s.%s' "$REPO" "$PR_NUM" "$kind" | tr '/' '~' | tr '[:upper:]' '[:lower:]')
+  # And the number is canonical: #007 is PR 7 (GitHub reads the number as an integer).
+  key=$(printf '%s#%s.%s' "$REPO" "$((10#$PR_NUM))" "$kind" | tr '/' '~' | tr '[:upper:]' '[:lower:]')
   dir="$BUDGET_DIR/observers/$key"
   [ "$BUDGET_OBSERVER" != "$dir" ] || return 0
   mkdir -p "$BUDGET_DIR/observers" 2>/dev/null || die "cannot create $BUDGET_DIR/observers for the observer lock"
@@ -1338,7 +1341,7 @@ repo_from_cwd() {
   # quota hold's gate itself (see "the polling budget"). A hold is never a reason to fall back to
   # the remote below, which in a fork names the fork and not the repository gh resolved.
   local out err
-  budget_gate read || fail 3 "could not resolve the repository from the checkout: $(gh_err_line)." \
+  ! budget_scope || budget_gate read || fail 3 "could not resolve the repository from the checkout: $(gh_err_line)." \
     "Pass it as owner/name, or wait for the hold."
   err="${TMPDIR:-/tmp}/pr-review-gh.$$.repo-view"
   out=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>"$err")
@@ -1350,7 +1353,7 @@ repo_from_cwd() {
   # Refused on quota, it is a hold like any other call's, and still no reason for the remote.
   if quota_failure "$(sed -n 1p "$err" 2>/dev/null)"; then
     rm -f "$err"
-    budget_quota_hit repo view
+    ! budget_scope || budget_quota_hit repo view
     fail 3 "could not resolve the repository from the checkout: gh repo view was refused on quota." \
       "Pass it as owner/name, or wait for the hold."
   fi
@@ -5652,6 +5655,7 @@ gate_checks() {
   CHECK_SHA="$sha" # what the verdict is ABOUT; merge binds to it
   beat=$started
   while :; do
+    budget_waited_reset
     lines=$(build_checks "$sha")
     rc=$?
     if [ "$rc" -ne 0 ]; then
@@ -5757,6 +5761,12 @@ gate_checks() {
       VERDICT=superseded
       echo "build signal $REPO#$pr: SUPERSEDED — observed $sha, current $current_sha; re-run for the new head"
       return 5
+    fi
+    # A round that waited a quota hold out between its reads is two moments, not one: a check
+    # read green before the wait may have been re-run since. Read the whole round again.
+    if budget_waited; then
+      warn "a quota hold was waited out inside this round's reads; reading the round again"
+      continue
     fi
     now=$(date +%s)
     case "$VERDICT" in pending | unjudged) ;; *) break ;; esac
@@ -7005,6 +7015,9 @@ cmd_merge() {
   # after that read is a red the override was never given for.
   gate_checks "$PR_NUM" "$wait_for" ${override:+waive}
   gate=$?
+  # The gate's verdict is about the moment of its last round. Nothing after it waits a quota hold
+  # out: a read here during one is 3, so the merge never lands on a verdict the wait made old.
+  BUDGET_WAIT_UNTIL=""
   case "$gate" in
   1)
     if [ -n "$override" ] && [ "$VERDICT" = waived ]; then

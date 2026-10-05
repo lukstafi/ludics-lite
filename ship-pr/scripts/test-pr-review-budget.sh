@@ -43,6 +43,7 @@ T0=$(command date +%s)
 CHECKS_SEQ=()
 QUOTA_UNTIL=0        # fake epoch before which every request answers quota
 QUOTA_RESET=""       # the reset its headers name ("" = the quota's own end)
+QUOTA_ENDPOINT=""    # a glob: only this endpoint answers quota (empty: every endpoint)
 QUOTA_RESETS=()      # per probe, in order, when a case wants the reset to move
 FAIL_502=""          # an endpoint glob that answers 502 (transport)
 PROBE_ANSWERS=""     # nonempty: a probe answers even during the quota (a secondary limit on the
@@ -162,7 +163,9 @@ gh() {
       ;;
     esac
   fi
-  if [ "$(now)" -lt "$QUOTA_UNTIL" ] && { [ -z "$include" ] || [ -z "$PROBE_ANSWERS" ]; }; then
+  # shellcheck disable=SC2254 # a glob on purpose
+  if [ "$(now)" -lt "$QUOTA_UNTIL" ] && { [ -z "$include" ] || [ -z "$PROBE_ANSWERS" ]; } &&
+    case "$FIXTURE_ENDPOINT" in ${QUOTA_ENDPOINT:-*}) true ;; *) false ;; esac; then
     if [ -n "$include" ]; then
       printf 'HTTP/2.0 403 Forbidden\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: %s\r\n\r\n{"message":"API rate limit exceeded"}\n' "$(probe_reset)"
       printf 'probe %s\n' "$FIXTURE_ENDPOINT" >>"$CALL_LOG"
@@ -237,6 +240,7 @@ reset_fixture() {
   PROBE_HOOK=""
   GRAPHQL_PROBE=""
   REPO_VIEW_QUOTA=""
+  QUOTA_ENDPOINT=""
   RUN_STATUSES=()
   rm -f "$TEST_ROOT/runs.calls"
   retune ADVISORY_FROM_ENV=1
@@ -583,15 +587,41 @@ test_a_hold_set_before_the_lock_stops_the_probe() {
     "the refusal's entry is added unprobed"
 }
 
-# GH_HOST names the host of a call that names none, so an Enterprise GH_HOST puts it out of scope,
-# unless the call names github.com itself. A job-only run view reads the job.
+# The script's own calls name no host, so gh sends them to GH_HOST when it is set: an Enterprise
+# GH_HOST puts them outside the budget. A job-only run view reads the job.
 test_the_scope_and_the_job_read_what_gh_reads() {
   local rc
-  rc=0; GH_HOST=ghe.example.com budget_scope api "repos/$REPO/pulls/7" || rc=$?
-  assert_eq "$rc" 1 "a GH_HOST naming another host puts a call out of scope"
-  rc=0; GH_HOST=ghe.example.com budget_scope api --hostname github.com "repos/$REPO/pulls/7" || rc=$?
-  assert_eq "$rc" 0 "unless the call names github.com"
+  rc=0; GH_HOST=ghe.example.com budget_scope || rc=$?
+  assert_eq "$rc" 1 "a GH_HOST naming another host puts the calls out of scope"
+  rc=0; GH_HOST=github.com budget_scope || rc=$?
+  assert_eq "$rc" 0 "and github.com keeps them in"
   assert_eq "$(budget_endpoint run view --job 456 --repo o/r)" "repos/o/r/actions/jobs/456" "--job reads the job"
+}
+
+# A gate round that waited a hold out between its reads is two moments: a check read green before
+# the wait may have been re-run red since. The round is read again, and the red is the verdict.
+test_a_round_split_by_a_hold_is_read_again() {
+  reset_fixture
+  CHECKS_SEQ=(green red)
+  QUOTA_UNTIL=$((T0 + 600))
+  QUOTA_ENDPOINT="repos/$REPO/actions/runs?head_sha=*"
+  run wait cmd_checks "$REPO#7" --wait
+  assert_eq "$(rc wait)" 1 "the re-read round's red is the verdict, not the green read before the wait ($(err wait))"
+  assert_contains "$(err wait)" "reading the round again" "and it says why it read again"
+}
+
+# The observer lock reads the PR's number as GitHub does, an integer: #007 is PR 7.
+test_the_observer_lock_reads_the_number_as_an_integer() {
+  local holder
+  reset_fixture
+  command sleep 300 &
+  holder=$!
+  mkdir -p "$STATE_DIR/observers/example~repo#7.build"
+  printf '%s\n%s\n' "$holder" "$T0" >"$STATE_DIR/observers/example~repo#7.build/owner"
+  run second cmd_checks "$REPO#007" --wait
+  kill "$holder" 2>/dev/null || :
+  wait "$holder" 2>/dev/null || :
+  assert_eq "$(rc second)" 2 "#007 is the same PR's observer ($(err second))"
 }
 
 test_a_lock_that_cannot_be_made_is_an_error() {
@@ -632,20 +662,20 @@ test_a_reap_keeps_a_lock_retaken_meanwhile() {
   assert_eq "$(ls -A "$STATE_DIR" | grep -c lock || true)" 0 "the judged one is removed, nothing left aside"
 }
 
-# A call to another host (`--hostname`, an Enterprise server) is outside the budget: its quota is
-# its own, so it sets no github.com hold, and a github.com hold does not stop it.
-test_another_host_is_outside_the_budget() {
+# The budget is this script's own calls to github.com. A `retry` caller's arguments (any host,
+# repository or command form) are outside it: neither gated nor held, its refusal still exit 3.
+test_a_callers_call_is_outside_the_budget() {
   reset_fixture
   QUOTA_UNTIL=$((T0 + 600))
-  run ghe gh_retry read api --hostname ghe.example.com repos/ghe/repo
-  assert_eq "$(rc ghe)" 3 "its quota refusal is still UNKNOWN ($(err ghe))"
+  run caller eval 'GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
+  assert_eq "$(rc caller)" 3 "a caller's quota refusal is still UNKNOWN ($(err caller))"
   assert_eq "$(standing)" "" "but sets no hold"
   assert_not_contains "$(requests)" "probe" "and probes nothing"
   QUOTA_UNTIL=0
   : >"$CALL_LOG"
   plant_hold "$((T0 + 600))" graphql 600
-  run ghe2 gh_retry read api --hostname ghe.example.com repos/ghe/repo
-  assert_eq "$(rc ghe2)" 0 "a github.com hold does not stop it ($(err ghe2))"
+  run caller2 eval 'GH_RETRY_CALLER_ARGS=listed gh_retry read api repos/ghe/repo'
+  assert_eq "$(rc caller2)" 0 "a hold does not stop it ($(err caller2))"
 }
 
 # GraphQL answers an exhausted quota with a 200 (GitHub's GraphQL rate-limit documentation), so the
@@ -705,7 +735,7 @@ run_tests \
   test_resolving_the_repo_passes_the_hold \
   test_a_refusal_during_the_probe_survives_the_lift \
   test_a_reap_keeps_a_lock_retaken_meanwhile \
-  test_another_host_is_outside_the_budget \
+  test_a_callers_call_is_outside_the_budget \
   test_a_graphql_200_can_still_be_quota \
   test_each_endpoint_is_probed_before_its_hold_lifts \
   test_the_run_await_backs_off_on_a_still_run \
@@ -715,6 +745,8 @@ run_tests \
   test_a_probe_follows_the_environment_gh_reads \
   test_a_hold_set_before_the_lock_stops_the_probe \
   test_the_scope_and_the_job_read_what_gh_reads \
+  test_a_round_split_by_a_hold_is_read_again \
+  test_the_observer_lock_reads_the_number_as_an_integer \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
