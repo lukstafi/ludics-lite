@@ -50,9 +50,11 @@
 #                          every SKILL.md, both index READMEs and (its slot count) every *.md, and
 #                          its suite reads the live ship-pr/SKILL.md's shape -- wider than the
 #                          ship-pr/, issue-wave/ and routines/ the issue named, which miss the
-#                          root README and the other skills
+#                          root README and the other skills. Also on the checker's code and the
+#                          live scripts the suite reads: fleet-worker.sh's SLOTS, sync-routines.sh's
+#                          LOCAL_ROUTINES, post-merge-cleanup's usage (the table names them)
 #   - routines-fixtures    scripts/test-sync-routines.sh, on routines/*.md: its pin compares the
-#                          routines table with sync-routines.sh
+#                          routines table with sync-routines.sh; and on that script and the checker
 #   - reporters            scripts/test-workflow-reporters.py   } no file trigger: a Markdown
 #   - nudge-fixtures       ship-pr/hooks/test-ship-pr-nudge.py  } edit cannot break them, so they
 #   - base-helper-fixtures scripts/test-run-against-base.sh     } run under --guards all or by
@@ -95,6 +97,13 @@
 
 set -uo pipefail
 
+# Every pathspec this script hands git -- the file list's `*.sh`, the guard triggers -- means git's
+# default reading, a `*` that crosses `/`. These variables change that reading for every git call:
+# under GIT_LITERAL_PATHSPECS `*.md` is a file named `*.md`, so a guard trigger matched nothing and
+# the guard was reported not run while Markdown had changed. Unset, not checked: no caller means
+# them for this script, and the suites it runs inherit the same reading.
+unset GIT_LITERAL_PATHSPECS GIT_GLOB_PATHSPECS GIT_NOGLOB_PATHSPECS GIT_ICASE_PATHSPECS
+
 FILES=()
 
 # THE FILE LIST, once. It was spelled three times in the lint job's YAML -- by the syntax step,
@@ -127,11 +136,15 @@ STEPS=(
   'jq-version:-'
 )
 
-# THE GUARD TABLE: `name:command:trigger`, the trigger a git pathspec (its `*` crosses `/`) or
-# empty. A `.py` command runs under python3, as the job runs it.
+# THE GUARD TABLE: `name:command:trigger`, the trigger space-separated git pathspecs (a `*`
+# crosses `/`) or empty. A `.py` command runs under python3, as the job runs it. A suite's
+# trigger is every input that can turn it red, not only its subject: its own file, the code it
+# runs, and whatever it reads from the live checkout.
+# CHECKER: what check-prompts.sh runs, which both prompt suites run.
+CHECKER='scripts/check-prompts.sh scripts/py lib/ludics/__init__.py lib/ludics/proc.py lib/ludics/checkprompts/*'
 GUARDS=(
-  'prompt-fixtures:scripts/test-check-prompts.sh:*.md'
-  'routines-fixtures:scripts/test-sync-routines.sh:routines/*.md'
+  "prompt-fixtures:scripts/test-check-prompts.sh:*.md scripts/test-check-prompts.sh $CHECKER issue-wave/scripts/fleet-worker.sh scripts/sync-routines.sh ship-pr/scripts/post-merge-cleanup.sh lib/ludics/postmergecleanup/*"
+  "routines-fixtures:scripts/test-sync-routines.sh:routines/*.md scripts/test-sync-routines.sh scripts/sync-routines.sh $CHECKER"
   'reporters:scripts/test-workflow-reporters.py:'
   'nudge-fixtures:ship-pr/hooks/test-ship-pr-nudge.py:'
   'base-helper-fixtures:scripts/test-run-against-base.sh:'
@@ -421,9 +434,10 @@ run_step() { # run_step <name>: 0 pass, 1 fail, 3 skipped, 4 passed with a warni
     return 3
   fi
   # The fixture suite runs this script, so this script running it must not start a third copy.
-  # The suite calls preflight only by query or by named step today, so the loop cannot form; the
-  # guard is here because that is a property of the suite, and a bare call added to it later would
-  # otherwise fork until the box gave out (round 7).
+  # The suite's default-mode calls (no STEP named) judge scratch trees that hold no
+  # scripts/test-preflight.sh, so the loop does not form today; under a preflight run the suite
+  # carries PREFLIGHT_IN_FIXTURES (set below), and this guard is what stops a later call that
+  # reaches a real copy of the suite, which would otherwise fork until the box gave out (round 7).
   if [ "$name" = preflight-fixtures ] && [ -n "${PREFLIGHT_IN_FIXTURES:-}" ]; then
     printf 'preflight: %s: FAIL (already running inside %s; a suite that runs this script must not be run by it again)\n' \
       "$name" "$cmd"
@@ -639,24 +653,23 @@ changed)
       continue
     fi
     # The working tree against the merge base: committed, staged and unstaged edits to tracked
-    # files alike, and nothing untracked, which is the scope the steps judge.
-    git diff --quiet --no-ext-diff "$CHANGE_BASE" -- "$trigger" >/dev/null 2>&1
-    case $? in
-    0)
-      printf "preflight: %s: not run (nothing matching '%s' differs from the merge base with %s, %s; --guards all runs it)\n" \
-        "$name" "$trigger" "$BASE_REF" "$(git rev-parse --short "$CHANGE_BASE")"
-      ;;
-    1)
-      printf "preflight: %s: due (a tracked file matching '%s' differs from the merge base with %s, %s)\n" \
-        "$name" "$trigger" "$BASE_REF" "$(git rev-parse --short "$CHANGE_BASE")"
+    # files alike, and nothing untracked, which is the scope the steps judge. `read -a` splits the
+    # pathspecs without pathname expansion, which would turn `*.md` into this directory's files.
+    read -r -a specs <<<"$trigger"
+    # The verdict names the first file that fired, since a trigger of many pathspecs would not
+    # tell the reader which edit made the guard due.
+    if ! hit=$(git diff --name-only --no-ext-diff "$CHANGE_BASE" -- "${specs[@]}" 2>/dev/null); then
+      printf "preflight: %s: due (git could not compare its trigger with the merge base; running it rather than guessing)\n" \
+        "$name"
       WANTED+=("$name")
-      ;;
-    *)
-      printf "preflight: %s: due (git could not compare '%s' with the merge base; running it rather than guessing)\n" \
-        "$name" "$trigger"
+    elif [ -z "$hit" ]; then
+      printf "preflight: %s: not run (no tracked file its trigger matches differs from the merge base with %s, %s; 'preflight.sh guards' lists the trigger; --guards all runs it)\n" \
+        "$name" "$BASE_REF" "$(git rev-parse --short "$CHANGE_BASE")"
+    else
+      printf "preflight: %s: due (%s, which its trigger matches, differs from the merge base with %s, %s)\n" \
+        "$name" "${hit%%$'\n'*}" "$BASE_REF" "$(git rev-parse --short "$CHANGE_BASE")"
       WANTED+=("$name")
-      ;;
-    esac
+    fi
   done
   [ -z "$untriggered" ] ||
     printf 'preflight: not run here:%s (no file trigger; --guards all runs them, as CI always does)\n' "$untriggered"

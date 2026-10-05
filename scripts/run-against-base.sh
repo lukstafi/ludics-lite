@@ -14,7 +14,7 @@
 #
 # It is a suite run like any other, so callers take the box's correctness slot around it:
 #   ~/.claude/skills/issue-wave/scripts/fleet-worker.sh execution slot -- \
-#     scripts/run-against-base.sh <suite-path> [--base <ref>] [suite args...]
+#     scripts/run-against-base.sh <suite-path> [options] [suite args...]
 # (`execution slot --cpu -- ...` for a suite that holds no GPU).
 #
 # The base ref is used as it stands locally: fetch first if origin/main may be stale.
@@ -23,7 +23,9 @@
 #   <suite-path>     a file in the current checkout's working tree (relative to the cwd, or
 #                    absolute)
 # The options come right after the suite path, in any order; the first word that is not one of
-# them, and every word after it, goes to the suite (`--` included: it is the suite's).
+# them, and every word after it, goes to the suite (`--` included: it is the suite's), so a suite
+# whose own first argument is one of these names cannot take it through the helper. A repeated
+# --base or --timeout: the later one wins.
 #   --base <ref>     the base to run against (default origin/main; with --mutate, the working tree)
 #   --also <path>    carry this working-tree file into the base too, at the same path: a fixture
 #                    library the suite changed with (ludics-lite#501). Repeatable. Everything not
@@ -33,9 +35,9 @@
 #                    the throwaway worktree -- never to the live tree, so an interrupted run
 #                    leaves nothing to restore. Without --base the worktree is a snapshot of the
 #                    working tree (`git stash create`: tracked files, staged or not; untracked
-#                    ones are not in it), since a mutant is of the change, not of the base. An
-#                    expression that changes nothing is refused: that is not a mutant. Repeatable,
-#                    applied in order. A tests-only change takes this control instead of the
+#                    ones are not in it -- name a new file with --also too to mutate it), since a
+#                    mutant is of the change, not of the base. An expression that changes nothing
+#                    is refused: that is not a mutant. Repeatable, applied in order. A tests-only change takes this control instead of the
 #                    base's: its new cases pass on the base too (ludics-lite#501).
 #   --timeout <s>    stop the suite after <s> whole seconds (default RUN_AGAINST_BASE_TIMEOUT, or
 #                    0: none). On expiry its process group gets TERM, then KILL after the grace,
@@ -221,7 +223,9 @@ elif [ -n "$interp" ] && [ -n "${sb_path+set}" ]; then
   PATH=$sb_path command -v "$interp" >/dev/null 2>&1 \
     || die "$rel needs $interp, which is not on the PATH its shebang sets ($sb_path); it would never run"
 fi
+SNAPSHOT=
 if [ -z "$base" ] && [ "${#MUT_REL[@]}" -gt 0 ]; then
+  SNAPSHOT=1
   # A mutant is of the change: the throwaway worktree is the working tree as it stands, tracked
   # files staged or not, and HEAD when nothing differs from it. `git stash create` writes the
   # commit object and nothing else -- no ref, no reflog, no change to the tree -- and is given an
@@ -385,6 +389,14 @@ done
 i=0
 while [ "$i" -lt "${#MUT_REL[@]}" ]; do
   target="$WT/${MUT_REL[$i]}"
+  # resolve() found the file in the live tree, so a run's tree without it is a snapshot that
+  # leaves untracked files out, or a base that predates the file: either way --also is the cure.
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    if [ -n "$SNAPSHOT" ]; then
+      die "${MUT_REL[$i]} is untracked, and the working-tree snapshot holds tracked files only: there is nothing there to mutate (carry it with --also ${MUT_REL[$i]} as well)"
+    fi
+    die "${MUT_REL[$i]} is not in $base: there is nothing there to mutate (--also ${MUT_REL[$i]} carries the working tree's copy)"
+  fi
   { [ -f "$target" ] && [ ! -L "$target" ]; } \
     || die "${MUT_REL[$i]} is not a regular file in $base: there is nothing there to mutate"
   sed -e "${MUT_EXPRS[$i]}" "$target" >"$SCRATCH/mutant" \

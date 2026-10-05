@@ -253,6 +253,16 @@ else
   ko "want a git toplevel under $HTMP holding the suite; got TOPLEVEL=$top HERE=$here"
 fi
 if grep -qF 'ARGS=[one two]' <<<"$out"; then ok "suite arguments pass through"; else ko "args lost -- $out"; fi
+# The options lead: each of them is taken, the later --base winning, for as long as they lead,
+# and the first word that is none of them ends them -- it and every word after it are the suite's,
+# an option's name included (the 2026-10 contract; before --also it was one leading --base).
+run_rab test-toy.sh --base nosuch --base fixed one --base x --timeout 5
+if [ "$rc" -eq 0 ] && grep -qF 'ARGS=[one --base x --timeout 5]' <<<"$out" \
+  && grep -qF 'against fixed' <<<"$out"; then
+  ok "leading options are the helper's, the later --base winning; the first other word ends them"
+else
+  ko "option boundary: rc=$rc -- $out"
+fi
 worktrees_clean "after a failing base run"
 if [ "$(git -C "$R" status --porcelain)" = "$status_before" ]; then
   ok "the checkout's working tree is untouched"
@@ -702,6 +712,23 @@ if [ "$rc" -eq 125 ] && grep -qF 'nothing there to mutate' <<<"$out"; then
 else
   ko "mutant of a missing file: rc=$rc -- $out"
 fi
+# An untracked file is in the live tree but not in the snapshot: the refusal says so and names
+# the way through, rather than calling the working tree empty there.
+printf '%s\n' 'echo 2' >"$R/scripts/untracked.sh"
+run_rab test-toy.sh --mutate untracked.sh 's/2/3/'
+if [ "$rc" -eq 125 ] && grep -qF 'scripts/untracked.sh is untracked, and the working-tree snapshot holds tracked files only' <<<"$out" \
+  && grep -qF -- '--also scripts/untracked.sh' <<<"$out"; then
+  ok "a mutation of an untracked file is refused as untracked, naming --also"
+else
+  ko "mutant of an untracked file: rc=$rc -- $out"
+fi
+run_rab test-toy.sh --mutate untracked.sh 's/2/3/' --also untracked.sh
+if [ "$rc" -eq 0 ] && grep -qF 'mutant: scripts/untracked.sh: s/2/3/' <<<"$out"; then
+  ok "...and carried with --also it is mutated"
+else
+  ko "mutant of an untracked file carried: rc=$rc -- $out"
+fi
+rm -f "$R/scripts/untracked.sh"
 run_rab test-toy.sh --mutate lib.sh
 if [ "$rc" -eq 125 ] && grep -qF -- '--mutate needs a file and a sed expression' <<<"$out"; then
   ok "a --mutate without its expression is refused"

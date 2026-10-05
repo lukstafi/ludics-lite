@@ -1104,6 +1104,12 @@ grep -q -- '^  --base [^ ]* --regenerable [^ ]*$' ship-pr/SKILL.md \
 EOF
   cp "$ROOT/ship-pr/SKILL.md" "$T/ship-pr/SKILL.md"
   printf '# routines\n' >"$T/routines/README.md"
+  # Non-Markdown inputs of the prompt and routines suites: the checker's code, and a script whose
+  # text test-check-prompts.sh reads from the live checkout.
+  mkdir -p "$T/lib/ludics/checkprompts"
+  printf '# checker\n' >"$T/lib/ludics/checkprompts/tree.py"
+  printf '#!/usr/bin/env bash\ntrue\n' >"$T/scripts/sync-routines.sh"
+  chmod +x "$T/scripts/sync-routines.sh"
   printf '# notes\n' >"$T/notes.txt"
   git -C "$T" init -q -b main >/dev/null 2>&1 &&
     git -C "$T" add -A &&
@@ -1120,7 +1126,7 @@ drop_regenerable() {
 if gtree guards_clean && grep -q -- '^  --base [^ ]* --regenerable ' "$T/ship-pr/SKILL.md"; then
   ok "the guard controls' repository could be built from this checkout's ship-pr/SKILL.md"
   expect "with no Markdown changed, the changed mode runs no guard" \
-    0 "prompt-fixtures: not run (nothing matching '*.md' differs from the merge base with main" \
+    0 "prompt-fixtures: not run (no tracked file its trigger matches differs from the merge base with main" \
     -- "$PF" --root "$T" --guards changed --base main syntax
   guard_out=$("$PF" --root "$T" --guards changed --base main syntax 2>&1)
   grep -qF 'ran-' <<<"$guard_out" && ko "a guard ran with nothing changed -- $guard_out" \
@@ -1132,17 +1138,44 @@ if gtree guards_clean && grep -q -- '^  --base [^ ]* --regenerable ' "$T/ship-pr
   gcommit "not Markdown"
   expect "...nor does a change to a file no trigger matches" \
     0 'prompt-fixtures: not run' -- "$PF" --root "$T" --guards changed --base main syntax
+  # The suites read more than Markdown (review of ludics-lite#553): the checker they run, and live
+  # files such as sync-routines.sh's LOCAL_ROUTINES. An edit there can break them as surely.
+  printf '# edited\n' >>"$T/lib/ludics/checkprompts/tree.py"
+  expect "a change to the checker's code runs the prompt guard, though no Markdown changed" \
+    0 'ran-prompt-fixtures' -- "$PF" --root "$T" --guards changed --base main syntax
+  expect "...and the routines guard, whose suite runs the same checker" \
+    0 'ran-routines-fixtures' -- "$PF" --root "$T" --guards changed --base main syntax
+  git -C "$T" checkout -q -- lib/ludics/checkprompts/tree.py
+  printf '# edited\n' >>"$T/scripts/sync-routines.sh"
+  expect "a change to sync-routines.sh runs the routines guard" \
+    0 'ran-routines-fixtures' -- "$PF" --root "$T" --guards changed --base main syntax
+  expect "...and the prompt guard, whose suite reads its LOCAL_ROUTINES" \
+    0 'ran-prompt-fixtures' -- "$PF" --root "$T" --guards changed --base main syntax
+  git -C "$T" checkout -q -- scripts/sync-routines.sh
+  expect "...and with both reverted, neither runs" \
+    0 'routines-fixtures: not run' -- "$PF" --root "$T" --guards changed --base main syntax
 
   drop_regenerable
   expect "THE INCIDENT (ludics-lite#553): a prose edit to ship-pr/SKILL.md that breaks a prompt rule fails preflight" \
     1 'prompt-fixtures: FAIL' -- "$PF" --root "$T" --guards changed --base main syntax
   expect "...through the guard, which says it is due and why" \
-    1 "prompt-fixtures: due (a tracked file matching '*.md' differs from the merge base with main" \
+    1 "prompt-fixtures: due (ship-pr/SKILL.md, which its trigger matches, differs from the merge base with main" \
     -- "$PF" --root "$T" --guards changed --base main syntax
   expect "...while the step it was run with still passes, as check-prompts.sh did in that PR" \
     1 'syntax: PASS' -- "$PF" --root "$T" --guards changed --base main syntax
+  # The triggers are pathspecs whose `*` crosses `/`, which is git's default reading. The
+  # environment can change that reading for every git call (GIT_LITERAL_PATHSPECS and the others),
+  # and under it `*.md` matches nothing here -- a skipped guard that reads as clean.
+  expect "...and a pathspec mode in the environment does not hide the edit from the trigger" \
+    1 'prompt-fixtures: FAIL' -- env GIT_LITERAL_PATHSPECS=1 "$PF" --root "$T" --guards changed --base main syntax
+  expect "...nor does the glob mode, whose \`*\` stops at \`/\`" \
+    1 'prompt-fixtures: FAIL' -- env GIT_GLOB_PATHSPECS=1 "$PF" --root "$T" --guards changed --base main syntax
+  expect "...nor the no-glob mode" \
+    1 'prompt-fixtures: FAIL' -- env GIT_NOGLOB_PATHSPECS=1 "$PF" --root "$T" --guards changed --base main syntax
+  expect "...and the file list under the same environment still finds the tracked scripts" \
+    1 'syntax: PASS' -- env GIT_LITERAL_PATHSPECS=1 "$PF" --root "$T" --guards changed --base main syntax
   expect "...and the routines guard, whose trigger did not fire, is not run" \
-    1 "routines-fixtures: not run (nothing matching 'routines/*.md'" \
+    1 "routines-fixtures: not run (no tracked file its trigger matches differs" \
     -- "$PF" --root "$T" --guards changed --base main syntax
   # The default run is the changed mode: every step, then the due guards. The scratch tree lacks
   # the steps' scripts, so the run is red anyway; what is asserted is that the guard is decided
