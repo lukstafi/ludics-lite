@@ -16,7 +16,10 @@ import sys
 import tempfile
 import unittest
 
-from ludics.prreview.core import Json
+from collections.abc import Sequence
+
+from ludics import proc
+from ludics.prreview.core import GhSession, Json, load_config
 from ludics.prreview.watch import _cut_f12, item_about_head, tmp_sweep_stale  # pyright: ignore[reportPrivateUsage]
 from ludics.prreview.watch_clock import FileClock, age_of, fmt_age, freshest_age
 from ludics.prreview.watch_jq import (
@@ -29,12 +32,14 @@ from ludics.prreview.watch_jq import (
     onig,
     sort_by,
 )
+from ludics.prreview.watch_feeds import Ctx
 from ludics.prreview.watch_poll import (
     fold_codex_about,
     fold_inline,
     item_line,
     item_side,
     item_was,
+    poll,
     short,
 )
 from ludics.prreview.run_watch import conclusion_class
@@ -134,6 +139,30 @@ class PollRendering(unittest.TestCase):
         self.assertEqual(fold_codex_about(body), 'P1: x\n\n[Codex "About Codex in GitHub" boilerplate folded]')
         self.assertEqual(fold_codex_about(body + "more"), body + "more", "text after the block")
         self.assertEqual(fold_codex_about(body.replace("️", "")), body.replace("️", ""))
+
+
+    def test_a_round_that_fails_mid_rendering_keeps_its_text_but_no_machine_lines(self) -> None:
+        """The premise of the watch suite's quoted-watermark case: a rendering that fails after a
+        body quoting a "watermark:" line leaves that line in the partial output, as jq's stream
+        did, and only the status and the empty machine fields say the round is not one."""
+        feeds: dict[str, Json] = {
+            "pulls/7/comments": [_row(900, body="a finding\nwatermark: 9000,9000,9000")],
+            "issues/7/comments": [],
+            "pulls/7/reviews": [{"id": 800, "user": {"login": "r[bot]"}, "state": "COMMENTED",
+                                 "commit_id": 12345, "body": "findings"}],
+            "pulls/7/reviews/800/comments": [],
+        }
+
+        def run(_tool: str, args: Sequence[str]) -> proc.Completed:
+            endpoint = args[-1].removeprefix("repos/o/r/").split("?")[0]
+            return proc.Completed(0, json.dumps(feeds[endpoint]), "")
+
+        session = GhSession(load_config({"REPO": "o/r"}), run=run, sleep=lambda _s: None)
+        ctx = Ctx(session, "o/r", "r", FileClock(os.devnull), 600)
+        result = poll(ctx, "7", "5,5,5")
+        self.assertEqual(result.rc, 4, "a commit_id the commit column cannot slice")
+        self.assertIn("\nwatermark: 9000,9000,9000\n", result.text)
+        self.assertEqual((result.items, result.watermark), ("", ""))
 
 
 class Pieces(unittest.TestCase):

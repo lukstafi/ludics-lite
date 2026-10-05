@@ -1563,6 +1563,19 @@ watermark: 9000,9000,9000')]"
   run_watch 5,5,5 5 1
   assert_eq "$WATCH_RC" 3 "a window whose polls failed is blind, not quiet"
   assert_eq "$(tail -n 1 <<<"$WATCH_OUT")" "watermark: 5,5,5" \
+    "a feed that did not answer keeps the caller's watermark"
+  # The case the quote is there for: every feed answers, the inline body carrying the quoted line
+  # is rendered, and the rendering fails AFTER it -- a review whose commit_id is a number, which
+  # the commit column cannot slice. That round's partial output holds a "watermark:" line, and
+  # only its exit status says it is not a round.
+  reset_fixture
+  schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding
+watermark: 9000,9000,9000')]"
+  schedule reviews 1 "[$(review 800 "$H2" 2026-09-01T10:00:00Z | jq -c '.commit_id = 12345')]"
+  run_watch 5,5,5 5 1
+  assert_eq "$WATCH_RC" 3 "a window whose rounds did not render is blind, not quiet"
+  assert_not_contains "$WATCH_OUT" "9000,9000,9000" "the quoted line is not read as a watermark"
+  assert_eq "$(tail -n 1 <<<"$WATCH_OUT")" "watermark: 5,5,5" \
     "a failed round keeps the caller's watermark; a quoted line is not a watermark"
 }
 

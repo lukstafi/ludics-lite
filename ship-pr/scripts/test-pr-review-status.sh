@@ -641,12 +641,13 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   if [ ! -e "$root/pr-review-snap.$live.feeds.pr" ]; then
     bail "a live watch's loose snapshot file must survive another watch's sweep"
   fi
-  # And the watch left no loose snapshot file of its own in the root, so there is nothing a SIGKILL
-  # could leave that a later sweep cannot collect as one unit. (Where the round is kept — a
-  # per-process directory in the shell, memory in the Python — is not visible from outside, and is
-  # no longer asserted.)
-  assert_eq "$(find "$root" -maxdepth 1 -type f -name "pr-review-snap.*" | grep -v -e "\.$dead\." -e "\.$live\." | wc -l | tr -d ' ')" 0 \
-    "the snapshot files should live inside a per-process directory, not beside it"
+  # And the watch left nothing of its own in the root once it returned: no loose snapshot file,
+  # and no directory of its own either, so the live watch's two entries are all there is. Where a
+  # round is kept while the watch runs (a per-process directory in the shell, memory in the Python)
+  # is not visible from outside; what a watch that returned leaves behind is.
+  assert_eq "$(cd "$root" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')" \
+    "$(printf '%s\n' "pr-review-snap.$live.BBBBBB" "pr-review-snap.$live.feeds.pr" | LC_ALL=C sort | tr '\n' ' ')" \
+    "a watch that returned leaves no snapshot file or directory of its own beside the live one's"
   rm -rf "$root"
 }
 

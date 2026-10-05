@@ -489,8 +489,11 @@ class Watch:
     def post_request(self) -> tuple[bool, str]:
         """The watch's one write, ATTEMPTED ONCE: a gateway refusal that did land would otherwise
         be a second review run nobody asked for (review of #465, round 4). Returns whether it
-        posted, and its error line: the shell made this call outside a command substitution, so
-        its error was still what gh_err_line quoted after the drift read's own calls succeeded."""
+        posted, and its error line, which the failure message quotes. The shell's gh_err_line
+        quoted the LAST FAILED call's error: the post's when the drift read after it succeeded,
+        but the drift read's own when that failed too (its command substitutions wrote the shared
+        err file). That message says the re-request did not go through, so it quotes the
+        re-request's error either way; the drift read's is on stderr in its own UNKNOWN line."""
         session = self.ctx.session
         saved = session.config
         session.config = replace(saved, api_attempts=1)
