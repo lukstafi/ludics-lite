@@ -845,7 +845,6 @@ test_a_plain_retry_passes_the_answer_through() {
 # closes early (`| head -1`) ends it the way SIGPIPE ended the shell, 141, never 1, which in this CLI
 # says the API rejected the call.
 test_a_plain_retry_writes_as_the_shell_did() {
-  local statuses
   reset_fixture
   set +e
   cmd_retry --read api nul >"$TEST_ROOT/raw" 2>"$TEST_ROOT/raw-err"
@@ -855,11 +854,15 @@ test_a_plain_retry_writes_as_the_shell_did() {
   assert_eq "$(LC_ALL=C od -An -tx1 <"$TEST_ROOT/raw" | tr -s ' \n' ' ')" " 61 62 ff 63 0a " \
     "with its NUL dropped and its other bytes as they came"
   reset_fixture
+  # The status is written from inside the pipeline rather than read off PIPESTATUS, which the
+  # hostile pass hands in from the environment and bash 3.2 then never updates.
   set +e
-  cmd_retry --read api lines 2>"$TEST_ROOT/raw-err" | head -1 >"$TEST_ROOT/raw"
-  statuses="${PIPESTATUS[*]}"
+  {
+    (cmd_retry --read api lines 2>"$TEST_ROOT/raw-err")
+    echo "$?" >"$TEST_ROOT/raw-rc"
+  } | head -1 >"$TEST_ROOT/raw"
   set -e
-  assert_eq "$statuses" "141 0" "a closed reader ends the retry as SIGPIPE did ($(cat "$TEST_ROOT/raw-err"))"
+  assert_eq "$(cat "$TEST_ROOT/raw-rc")" 141 "a closed reader ends the retry as SIGPIPE did ($(cat "$TEST_ROOT/raw-err"))"
   assert_eq "$(cat "$TEST_ROOT/raw")" 1 "after the reader had its line"
   assert_not_contains "$(cat "$TEST_ROOT/raw-err")" "Traceback" "with no traceback"
 }
