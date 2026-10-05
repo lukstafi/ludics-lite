@@ -1,6 +1,7 @@
-"""Units of the ``checks``/``merge`` port: the advisory list as grep reads it, the shell readings, the workflow-YAML
-readers, the glob, the drift's hunk reader, the closing-keyword filter, and the gate's fold and
-wait loop driven through an in-process gh (``GhSession(run=...)``) and an injected clock.
+"""Units of the ``checks``/``merge`` port: the advisory list as grep reads it, the shell readings,
+the workflow-YAML readers, the glob, the drift's hunk reader, the closing-keyword filter, and the
+gate's fold and wait loop driven through an in-process gh (``GhSession(run=...)``) and an injected
+clock.
 
 The fixture suites (test-pr-review-checks-absent.sh, -merge.sh, -base-drift.sh) are the
 conformance suite; these pin the rules inside the port that a regression would bend first.
