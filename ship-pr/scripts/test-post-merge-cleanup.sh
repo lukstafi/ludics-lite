@@ -4749,6 +4749,227 @@ test_merge_options_cleanup() {
   echo "PASS: standard branch mergeOptions configuration is removed"
 }
 
+# --- cases pinned from the helper's fix history (ludics-lite#403) ------------------------------
+# The v2 rewrite ports this helper to Python behind its command line. Each case below pins, from
+# outside, a lesson a past round encoded in the helper's code that no case above asserted, so the
+# port cannot drop it quietly.
+
+# The option table (ludics-lite#332, after #302's `--force-integrated` listed bare over a valued
+# arm): one declaration drives the printed listing and the parser, and check-prompts reads the
+# PRINTED listing. So the text is pinned verbatim, every usage error is exit 2 with that text and
+# nothing on stdout, an option is matched in exactly its listed spelling, a valued option's value
+# may not be missing or empty, and the last occurrence wins. A usage error touches no repository.
+test_usage_and_option_errors() {
+  local expected local_master out rc
+  setup_case usage-and-option-errors merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  expected=$(cat <<'USAGE_TEXT'
+usage: post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> [options]
+
+Options:
+  --base <branch>       Base branch to refresh and verify (default: master)
+  --force-integrated <reason>
+                        Why this squash/rebase merge is confirmed
+  --regenerable <name>  A top-level directory of the session worktree that cleanup may
+                        REMOVE rather than refuse over or archive, such as a build tree.
+                        Repeatable, no default; the name must be one untracked directory
+                        of the worktree root and is never followed through a symlink.
+
+The ordinary path requires the topic branch to be an ancestor of origin/<base>. Use
+--force-integrated only after independently confirming a squash or rebase merge; its
+non-empty reason is printed in the cleanup record.
+USAGE_TEXT
+)
+  # usage_error <description> <args...>: exit 2, the usage text on stderr, nothing on stdout.
+  usage_error() {
+    local what="$1" err="$CASE_ROOT/usage.err" stdout
+    shift
+    rc=0
+    stdout=$("$HELPER" "$@" 2>"$err") || rc=$?
+    assert_eq "$rc" 2 "$what must be a usage error"
+    assert_eq "$stdout" "" "$what must print nothing on stdout"
+    assert_eq "$(cat "$err")" "$expected" "$what must print the usage text"
+  }
+  usage_error "no arguments"
+  usage_error "one argument" "$CASE_MAIN"
+  usage_error "two arguments" "$CASE_MAIN" "$CASE_SESSION"
+  usage_error "an unknown option" "$CASE_MAIN" "$CASE_SESSION" topic --keep-branch
+  usage_error "an option in another spelling" "$CASE_MAIN" "$CASE_SESSION" topic --base=master
+  usage_error "a stray positional argument" "$CASE_MAIN" "$CASE_SESSION" topic extra
+  usage_error "--base without a value" "$CASE_MAIN" "$CASE_SESSION" topic --base
+  usage_error "an empty --base" "$CASE_MAIN" "$CASE_SESSION" topic --base ''
+  usage_error "--force-integrated without a value" "$CASE_MAIN" "$CASE_SESSION" topic --force-integrated
+  usage_error "an empty --force-integrated" "$CASE_MAIN" "$CASE_SESSION" topic --force-integrated ''
+  # A valued option takes the next word whatever it looks like (#302): here an option-shaped
+  # reason, after which the stray word is what refuses.
+  usage_error "a word after a consumed option-shaped value" \
+    "$CASE_MAIN" "$CASE_SESSION" topic --force-integrated --base stray
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "a usage error must not advance the base"
+  assert_topic_preserved
+
+  # The last occurrence of a valued option wins: a base that does not exist, then the real one.
+  out=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base no-such-base --base master)
+  assert_cleaned
+  case "$out" in
+  "post-merge-cleanup.sh: cleaned topic and unregistered "*) ;;
+  *) fail "the last --base did not win: $out" ;;
+  esac
+  echo "PASS: usage text, usage errors (exit 2, no repository touched), last occurrence wins"
+}
+
+# What a successful run reports, which the skill reads: one stdout line naming the session, its
+# archive and both recovery refs; the --force-integrated reason on stderr as the cleanup record
+# (the usage text promises it); and, for an already-absent remote topic, that no deletion was sent.
+test_success_reports_its_record() {
+  local err out
+  setup_case success-record squash main-off
+  err="$CASE_ROOT/success.err"
+  out=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic \
+    --force-integrated "confirmed squash merge" 2>"$err")
+  assert_cleaned
+  assert_eq "$out" "post-merge-cleanup.sh: cleaned topic and unregistered $CASE_SESSION; session archived at $CASE_ARCHIVE/worktree; recovery retained at refs/ship-pr/recovery/topic/$CASE_TOPIC_OID and refs/ship-pr/session-recovery/topic/$CASE_TOPIC_OID" \
+    "the success line must name the session, its archive and both recovery refs"
+  grep -Fx "post-merge-cleanup.sh: FORCE-INTEGRATED override: confirmed squash merge" "$err" >/dev/null ||
+    fail "the --force-integrated reason was not recorded on stderr: $(cat "$err")"
+
+  setup_case success-record-absent-remote merge main-off
+  git -C "$CASE_MAIN" push --no-verify origin :refs/heads/topic >/dev/null 2>&1
+  err="$CASE_ROOT/success.err"
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>"$err"
+  assert_cleaned
+  grep -Fx "post-merge-cleanup.sh: origin/topic was already absent (no deletion sent)" "$err" >/dev/null ||
+    fail "an already-absent remote topic was not reported: $(cat "$err")"
+  ! grep -F "FORCE-INTEGRATED" "$err" >/dev/null || fail "an ordinary cleanup claimed an override"
+  echo "PASS: a successful cleanup reports its record"
+}
+
+# Review round 2 of #287: the finishing command a refusal prints names the validated push URL with
+# any http(s) userinfo removed, so no credential reaches the diagnostic, and the endpoint stays the
+# one the helper validated rather than the remote's name. The fixture's origin is an https URL
+# with a password; a fake git rewrites it to the case's bare repository through `insteadOf` for
+# every call but `remote get-url`, which expands `insteadOf` itself and would otherwise report
+# the local path. The pre-push hook refuses, which is the refusal that prints the command.
+test_finish_command_strips_url_credentials() {
+  local cred_url fake_bin finish hook log real_git
+  setup_case finish-url-credentials merge main-off
+  cred_url="https://ship-pr:s3cret@example.invalid/remote.git"
+  git -C "$CASE_MAIN" remote set-url origin "$cred_url"
+  real_git=$(command -v git)
+  fake_bin="$CASE_ROOT/bin"
+  log="$CASE_ROOT/cleanup.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case " $* " in' \
+    '*" remote get-url "*) exec "$REAL_GIT" "$@" ;;' \
+    'esac' \
+    'exec "$REAL_GIT" -c "url.$CRED_REMOTE.insteadOf=$CRED_URL" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+  hook="$CASE_MAIN/.git/hooks/pre-push"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$hook"
+  chmod +x "$hook"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" CRED_REMOTE="$CASE_REMOTE" CRED_URL="$cred_url" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "a refused remote deletion was reported as a cleanup"
+  fi
+  grep "was refused while it was still at the validated tip $CASE_TOPIC_OID" "$log" >/dev/null ||
+    { cat "$log" >&2; fail "the refusal was not the refused leased deletion"; }
+  finish=$(sed -n 's/.*, finish with: //p' "$log")
+  assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push --force-with-lease=refs/heads/topic:$CASE_TOPIC_OID https://example.invalid/remote.git :refs/heads/topic" \
+    "the finishing command must name the push URL without its userinfo"
+  ! grep -F "s3cret" "$log" >/dev/null || { cat "$log" >&2; fail "a credential reached the diagnostics"; }
+  echo "PASS: the finishing command strips http(s) userinfo from the validated push URL"
+}
+
+# Review rounds 2 and 7: the branch read and its deletion go through ONE push endpoint, so an
+# origin with several push URLs is refused as ambiguous before anything changes.
+test_multiple_push_endpoints_refusal() {
+  local local_master refusal second
+  setup_case multiple-push-endpoints merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  second="$CASE_ROOT/second.git"
+  git clone --bare "$CASE_REMOTE" "$second" >/dev/null 2>&1
+  git -C "$CASE_MAIN" remote set-url --add --push origin "$CASE_REMOTE"
+  git -C "$CASE_MAIN" remote set-url --add --push origin "$second"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "an origin with two push endpoints was accepted"
+  fi
+  case "$refusal" in
+  *"origin has multiple push endpoints; refusing ambiguous branch deletion"*) ;;
+  *) fail "the ambiguous push endpoints were not named: $refusal" ;;
+  esac
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "the endpoint refusal must precede the base fast-forward"
+  assert_topic_preserved
+  echo "PASS: several push endpoints are refused as ambiguous"
+}
+
+# The identity checks the first rounds added, each refused before anything changes: the branch
+# name's syntax, the base branch itself, a branch that does not exist, a session attached to
+# another branch or detached off the tip, and the two checkout arguments' shapes (round 3's
+# worktree root, round 1's canonical paths, the primary-checkout and same-repository rules).
+test_identity_refusals() {
+  local local_master refusal
+  setup_case identity-refusals merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" branch other refs/heads/topic
+  # refused <expected text> <args...>: the helper refuses with exit 1 and names the problem.
+  identity_refused() {
+    local expected="$1" rc=0
+    shift
+    refusal=$("$HELPER" "$@" 2>&1) || rc=$?
+    assert_eq "$rc" 1 "a refusal ($expected) must exit 1"
+    case "$refusal" in
+    *"$expected"*) ;;
+    *) fail "the refusal did not say '$expected': $refusal" ;;
+    esac
+  }
+  identity_refused "invalid branch name: bad..name" "$CASE_MAIN" "$CASE_SESSION" bad..name
+  identity_refused "refusing to clean up the base branch master" "$CASE_MAIN" "$CASE_SESSION" master
+  identity_refused "local branch does not exist: absent" "$CASE_MAIN" "$CASE_SESSION" absent
+  identity_refused "session worktree owns topic, not other" "$CASE_MAIN" "$CASE_SESSION" other
+  identity_refused "main checkout is not a git worktree: $CASE_ROOT" "$CASE_ROOT" "$CASE_SESSION" topic
+  identity_refused "session path is not a git worktree: $CASE_ROOT" "$CASE_MAIN" "$CASE_ROOT" topic
+  identity_refused "main-checkout is a linked worktree, not the primary checkout: $CASE_SESSION" \
+    "$CASE_SESSION" "$CASE_MAIN" topic
+  identity_refused "main checkout and session worktree must be different paths" "$CASE_MAIN" "$CASE_MAIN" topic
+  identity_refused "main checkout and session worktree belong to different repositories" \
+    "$CASE_MAIN" "$CASE_INTEGRATOR" topic
+  git -C "$CASE_SESSION" checkout --quiet --detach HEAD~1
+  identity_refused "detached session HEAD is not the tip of topic" "$CASE_MAIN" "$CASE_SESSION" topic
+  git -C "$CASE_SESSION" checkout --quiet topic
+  git -C "$CASE_MAIN" branch -D other >/dev/null
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "an identity refusal must precede the base fast-forward"
+  assert_topic_preserved
+  echo "PASS: identity refusals precede every mutation"
+}
+
+# Round 11 retains the validated tip under refs/ship-pr/recovery/<branch>/<oid>. A retry after an
+# interrupted cleanup finds that ref already there and accepts it; a ref of that name pointing
+# anywhere else is refused, before the topic is touched.
+test_preexisting_recovery_ref() {
+  local refusal
+  setup_case preexisting-recovery-ref merge main-off
+  git -C "$CASE_MAIN" update-ref "refs/ship-pr/recovery/topic/$CASE_TOPIC_OID" "$CASE_TOPIC_OID"
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+
+  setup_case unexpected-recovery-ref merge main-off
+  git -C "$CASE_MAIN" update-ref "refs/ship-pr/recovery/topic/$CASE_TOPIC_OID" refs/heads/master
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "a recovery ref pointing at another object was accepted"
+  fi
+  case "$refusal" in
+  *"recovery ref points at an unexpected object: refs/ship-pr/recovery/topic/$CASE_TOPIC_OID"*) ;;
+  *) fail "the unexpected recovery ref was not named: $refusal" ;;
+  esac
+  assert_topic_preserved
+  echo "PASS: an existing recovery ref is reused at the validated tip and refused elsewhere"
+}
+
 # --- runner self-cases (ludics-lite#9) -------------------------------------------------------
 # The runner's own behaviors used to be verified by hand from patched scratch copies, repeated by
 # nothing in CI. These point the runner at itself: a scratch COPY of this script and the helper,
@@ -5378,6 +5599,12 @@ TESTS=(
   test_dotted_branch_config
   test_custom_branch_config
   test_merge_options_cleanup
+  test_usage_and_option_errors
+  test_success_reports_its_record
+  test_finish_command_strips_url_credentials
+  test_multiple_push_endpoints_refusal
+  test_identity_refusals
+  test_preexisting_recovery_ref
   test_runner_names_a_setup_case_failure
   test_runner_reaps_a_statusless_case
   test_runner_cleans_up_after_a_closed_pipe
