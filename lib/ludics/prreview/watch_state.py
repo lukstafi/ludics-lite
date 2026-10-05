@@ -12,6 +12,7 @@ shell's string, with the leading ``|`` fields the ``failed``, ``nudged`` and ``u
 carry.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Literal, assert_never
 
@@ -703,7 +704,15 @@ def status_line(state: State, repo: str, pr: str) -> str:
 
 # --- open review threads under an approval (ludics-lite#289) -----------------------------------------
 
+# pr-review.sh's THREADS_PAGE_CAP, which is no environment knob there: the forwarder hands the
+# shell's value over under a private name, so a suite that retunes it moves this one too.
 THREADS_PAGE_CAP = 50
+THREADS_PAGE_CAP_ENV = "LUDICS_THREADS_PAGE_CAP"
+
+
+def threads_page_cap() -> int:
+    text = os.environ.get(THREADS_PAGE_CAP_ENV, "")
+    return int(text) if text.isdigit() and text.isascii() else THREADS_PAGE_CAP
 THREADS_QUERY = """query($owner:String!, $name:String!, $pr:Int!, $after:String) {
   repository(owner:$owner, name:$name) { pullRequest(number:$pr) {
     reviewThreads(first:100, after:$after) {
@@ -753,7 +762,8 @@ def unresolved_threads(ctx: Ctx, pr: str) -> ThreadsRead | ThreadsUnread:
     cursor = ""
     read_n = 0
     rows = ""
-    for page in range(1, THREADS_PAGE_CAP + 1):
+    cap = threads_page_cap()
+    for page in range(1, cap + 1):
         args = [
             "api", "graphql", "-f", f"query={THREADS_QUERY}", "-F", f"owner={owner}", "-F",
             f"name={name}", "-F", f"pr={pr}",
@@ -820,7 +830,7 @@ def unresolved_threads(ctx: Ctx, pr: str) -> ThreadsRead | ThreadsUnread:
                 False,
             )
     return ThreadsUnread(
-        f"the review-threads read was still paging after {THREADS_PAGE_CAP} pages of 100, so it is"
+        f"the review-threads read was still paging after {cap} pages of 100, so it is"
         f" refused rather than judged on its first {read_n} thread(s)",
         False,
     )

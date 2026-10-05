@@ -152,7 +152,14 @@ def item_about_head(stamp: str, head: str) -> bool:
 # SHARED-CANDIDATE: tmp_sweep_stale
 def tmp_sweep_stale(env: Mapping[str, str]) -> None:
     """Remove what a SIGKILLed run left in TMPDIR: every family keyed by an owning pid that is no
-    longer alive, this user's only. A name with no pid in it names no owner and is left alone."""
+    longer alive, this user's only. A name with no pid in it names no owner and is left alone.
+
+    Not on native Windows (Git Bash runs a native Python): the pids in those names are MSYS pids,
+    which a Windows process cannot ask about, and ``os.kill(pid, 0)`` there TERMINATES whatever
+    Windows process has that number. Leaving a leftover is the safe way round, as it is for a
+    reused pid."""
+    if os.name == "nt":
+        return
     root = env.get("TMPDIR", "") or "/tmp"
     if root.endswith("/"):
         root = root[:-1]

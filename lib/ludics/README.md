@@ -72,10 +72,11 @@ and the Python runs each such call as `<the same bash> -c '. <file>; gh "$@"'`. 
 shell's own `$(gh ...)` subshell saw, so a fixture that keeps its counters in files (they all do,
 for that reason) behaves the same. In production nothing is a function and `gh` is the binary.
 
-Not bridged: a suite's stub of a **time** command (`sleep() { SECONDS=...; }` in
-test-pr-review-watch.sh) or of `date`. The `watch`/`base` porters need a clock the suite can
-drive; design it in that port (an injectable clock in the session, set from the environment the
-forwarder passes) rather than bridging `sleep`.
+Not bridged: a suite's stub of a **time** command (`sleep`, `date`, SECONDS). The clock is an
+environment interface instead, `SHIP_PR_TEST_CLOCK` (the `watch` port, `prreview/watch_clock.py`):
+a file holding an epoch second that IS the clock -- every age and deadline is read from it -- and
+that a sleep advances instead of waiting. The shell's `clock_now` reads the same file, so a suite
+that exports it drives either implementation; test-pr-review-watch.sh runs every case on it.
 
 ## Helpers shared across subcommands
 
