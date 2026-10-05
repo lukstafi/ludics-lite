@@ -855,8 +855,10 @@ one call. `watch` used to hold its window blind and exit 3, the code that says r
 `test-pr-review-merge.sh` holds the merge call's half: the script's own flags refused is exit 2,
 and with the caller's flags forwarded after `--` the same refusal stays the ambiguous exit 3.
 
-`test-pr-review-budget.sh` drives the polling budget (ludics-lite#543) on a clock kept in a file,
-so the hold's end, its probes and the pauses are exact and nothing sleeps. A call GitHub refuses on
+`test-pr-review-budget.sh` drives the polling budget (ludics-lite#543) on a clock kept in a file
+(exported as `SHIP_PR_TEST_CLOCK`, with the suite's `sleep` bridged to the Python), so the hold's
+end, its probes and the pauses are exact and nothing sleeps. Every case drives a command, and the
+hold that stands is read off the state directory. A call GitHub refuses on
 quota is UNKNOWN (exit 3) and never merges. Its hold ends where the failing endpoint's own
 `X-RateLimit-Reset` says (never `/rate_limit`), and every caller during the hold, `merge` and
 `checks` alike, sends no request at all. A quota answer to the run await is exit 3, not the "no
@@ -867,14 +869,20 @@ operation need not show on the probe's GET), doubling from the last one. A later
 shortens a standing hold, a write never waits one out, a hold at the start of a `--wait` counts
 toward its ceiling even when a preflight read met it, a standing hold makes `base`'s repository
 resolution exit 3 rather than guess from the remote, a refusal landing during a probe survives the
-lift, a lock reaped by two processes at once keeps the one retaken meanwhile, another
-`--hostname` is outside the budget, and a GraphQL 200 carrying exhausted-quota headers is quota. A second build
+lift, a dead holder's lock is reaped with nothing left aside, a GraphQL 200 carrying
+exhausted-quota headers is quota, and a GH_HOST or a run's `-R` naming another host is refused
+with exit 2 before any request (ludics-lite#551). A first hold the state directory cannot record
+is an error naming it, with no resend, and a run that moves before any check row exists resets
+the pause. A second build
 observer of a PR is refused naming the first's pid before any read (the advisory list and the
 merge body included), a dead holder is replaced, while one process probes an ended hold the
 others send nothing, and a probe lock left without an owner is replaced after a second. A still queue backs
 off from the interval to the build cap with nothing printed per poll, a moving signal resets the
 pause, and a red still ends the wait at once. `test-pr-review-watch.sh` pins the same pause for a
-review window. A transport failure (a 502) stays exit 3 with no merge and sets no hold.
+review window, reset by a new head inside one state, and `test-pr-review-base-verdict.sh` pins it
+for `base --wait`, with its one observer per branch. What no command reaches (lock_reap's race, a
+run view's options before its id, the lift writing `quota-last` first) is in
+`lib/ludics/tests/test_prreview_budget.py`. A transport failure (a 502) stays exit 3 with no merge and sets no hold.
 
 `test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
 comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge

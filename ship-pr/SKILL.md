@@ -873,18 +873,20 @@ head returns 3, never superseded or green. Detection occurs on the next poll (af
 API calls), not through a push notification. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
 wait again instead.
 
-**The polling budget** (ludics-lite#543) is shared by every observer: `watch`, `checks --wait` and
-`merge --wait`. Each one reads at once, then pauses for its interval (`WATCH_INTERVAL`,
+**The polling budget** (ludics-lite#543) is shared by every observer: `watch`, `checks --wait`,
+`merge --wait` and `base --wait`. Each one reads at once, then pauses for its interval (`WATCH_INTERVAL`,
 `SHIP_PR_CHECKS_INTERVAL`). While nothing moves, the pause doubles up to 300 s for a review and
 600 s for a build (`SHIP_PR_REVIEW_POLL_CAP`, `SHIP_PR_BUILD_POLL_CAP`). A PR has ONE observer of each
-kind: a second `watch`, or a second `--wait` on a PR, exits 2 naming the first's pid, so wait on
-that one rather than arming another. A call GitHub refuses on quota is exit 3, never a verdict, and
+kind (and `base --wait` one per branch): a second `watch`, or a second `--wait` on a PR, exits 2
+naming the first's pid, so wait on that one rather than arming another. A call GitHub refuses on quota is exit 3, never a verdict, and
 it sets a hold for every `pr-review.sh` on the host. The hold ends where the failing endpoint's own
 headers say (never `/rate_limit`), and it lifts only when that endpoint answers a probe. An
 observer waits the hold out within its ceiling before a read (never before a write, which would act
 on stale reads). Any other command exits 3 at once without calling.
 So a quota exit 3 is not a reason to re-arm sooner: the next call waits for the same hold. The
-mechanism and its boundary are in `pr-review.sh` (*the polling budget*).
+budget covers github.com alone, so a `GH_HOST` (or a run's `-R`) naming another host is refused
+with exit 2 before anything is sent. The mechanism and its boundary are in
+`lib/ludics/prreview/budget.py`.
 
 **`ABSENT` seconds after a push used to be the trap here** — a push (a rebase before merging, or
 any other) creates a head whose checks do not EXIST yet, and a wait armed in that window saw
