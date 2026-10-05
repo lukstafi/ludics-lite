@@ -74,6 +74,16 @@ gh() {
     return 0
     ;;
   "run view") ;;
+  # Two answers for the plain retry's own output: one with a NUL byte and an invalid one in it, and
+  # one far longer than a pipe holds.
+  "api nul")
+    printf 'a\0b\377c\n'
+    return 0
+    ;;
+  "api lines")
+    awk 'BEGIN { for (i = 1; i <= 200000; i++) print i }'
+    return 0
+    ;;
   "api graphql")
     [ -n "$GQL_ERROR" ] || bail "fixture api graphql was called with no GQL_ERROR set: $*"
     printf '%s' "$GQL_OUT"
@@ -740,6 +750,12 @@ test_run_watch_refuses_what_it_does_not_take() {
   reset_fixture
   run_retry run watch example/repo#4242 -i 0
   assert_contains "$RETRY_OUT" "the interval must be at least 1 second" "a zero interval is refused as one"
+  # Past bash's integer, `[ "$interval" -gt 0 ]` failed as it does for 0: refused, nothing read.
+  reset_fixture
+  run_retry run watch example/repo#4242 -i 99999999999999999999
+  assert_eq "$RETRY_RC" 2 "an interval past bash's integer is refused ($RETRY_OUT)"
+  assert_contains "$RETRY_OUT" "the interval must be at least 1 second" "as the shell's test refused it"
+  assert_eq "$(gh_calls)" "" "and nothing is read"
   reset_fixture
   run_retry run watch example/repo#4242 -i 1.5
   assert_contains "$RETRY_OUT" "the interval must be seconds, got '1.5'" "and a fraction as not whole seconds"
@@ -822,6 +838,30 @@ test_a_plain_retry_passes_the_answer_through() {
     assert_contains "$RETRY_OUT" "usage: retry [--read] <gh args...>" "and says how it is used"
     assert_eq "$(gh_calls)" "" "and calls nothing ($spec)"
   done
+}
+
+# What the plain retry writes is what the shell's `printf '%s\n' "$out"` wrote: the answer as its
+# command substitution kept it, NUL bytes dropped and every other byte intact; and a reader that
+# closes early (`| head -1`) ends it the way SIGPIPE ended the shell, 141, never 1, which in this CLI
+# says the API rejected the call.
+test_a_plain_retry_writes_as_the_shell_did() {
+  local statuses
+  reset_fixture
+  set +e
+  cmd_retry --read api nul >"$TEST_ROOT/raw" 2>"$TEST_ROOT/raw-err"
+  RETRY_RC=$?
+  set -e
+  assert_eq "$RETRY_RC" 0 "the answer passes ($(cat "$TEST_ROOT/raw-err"))"
+  assert_eq "$(LC_ALL=C od -An -tx1 <"$TEST_ROOT/raw" | tr -s ' \n' ' ')" " 61 62 ff 63 0a " \
+    "with its NUL dropped and its other bytes as they came"
+  reset_fixture
+  set +e
+  cmd_retry --read api lines 2>"$TEST_ROOT/raw-err" | head -1 >"$TEST_ROOT/raw"
+  statuses="${PIPESTATUS[*]}"
+  set -e
+  assert_eq "$statuses" "141 0" "a closed reader ends the retry as SIGPIPE did ($(cat "$TEST_ROOT/raw-err"))"
+  assert_eq "$(cat "$TEST_ROOT/raw")" 1 "after the reader had its line"
+  assert_not_contains "$(cat "$TEST_ROOT/raw-err")" "Traceback" "with no traceback"
 }
 
 # The plain retry's failures, under each policy (9197c23): a 4xx is the API answering (exit 1, not
@@ -939,6 +979,7 @@ tests=(
   test_run_watch_sleeps_no_further_than_its_deadline
   test_a_plain_retry_passes_the_answer_through
   test_a_plain_retry_keeps_its_exits_apart
+  test_a_plain_retry_writes_as_the_shell_did
   test_parse_ref
 )
 

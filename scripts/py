@@ -24,6 +24,11 @@
 #                project checkouts, and a `json.py` or `ludics/` there must not shadow anything;
 #   -X utf8      UTF-8 for every stream and open(), whatever the locale (a hostile pass runs the
 #                suites under a non-C locale, and Windows defaults to a code page);
+#   PYTHONCOERCECLOCALE=0
+#                the caller's LC_CTYPE stays the C library's: Python would otherwise coerce the C
+#                locale to C.UTF-8, in its own C library calls and in the environment of every
+#                program it runs, so a check of [[:space:]] (lib/ludics/prreview/space.py) and a
+#                child's own locale would differ from the shell's (-X utf8 already covers streams);
 #   PYTHONPATH   exactly this checkout's lib/ (the package `ludics`), replacing any inherited one,
 #                since the rewrite is standard-library only and nothing else belongs on the path.
 #
@@ -122,7 +127,8 @@ if [ -n "$windows" ] && command -v cygpath >/dev/null 2>&1; then
   lib_dir=$(cygpath -w "$lib_dir")
 fi
 PYTHONPATH="$lib_dir"
-export PYTHONPATH
+PYTHONCOERCECLOCALE=0
+export PYTHONPATH PYTHONCOERCECLOCALE
 
 if [ -n "$chosen_arg" ]; then
   exec "$chosen_cmd" "$chosen_arg" -X utf8 -P "$@"

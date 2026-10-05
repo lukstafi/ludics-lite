@@ -154,7 +154,7 @@ class Reply(unittest.TestCase):
              "Comment 901 got nothing, so once the id is right, retry with: 901+902 --anchor 900"),
             ("gh: Internal Server Error (HTTP 500)", 3,
              "Read comment 901's thread: retry with: 901+902 --anchor 900 if the reply is not there;"
-             " retry with: 902 --anchor 900 if it is\n"),
+             " retry with: 902 --anchor 900 if it is  902\n"),
         )
         for message, want_rc, says in cases:
             with self.subTest(message=message):
@@ -169,7 +169,7 @@ class Reply(unittest.TestCase):
         gh = Gh(lambda call: err("gh: HTTP 500") if "/901/" in call[3] else reply_url(call))
         _, _, errs = invoke(lambda: reply.run(session(gh), ["7", "900+901", "x"]))
         self.assertIn(
-            "retry with: 901 --anchor 900 if the reply is not there; there is nothing else"
+            "retry with: 901 --anchor 900 if the reply is not there;  there is nothing else"
             " outstanding if it is\n", errs)
 
     def test_usage_is_checked_before_anything_is_sent(self) -> None:

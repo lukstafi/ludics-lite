@@ -46,6 +46,8 @@ from ludics.prreview.core import (
 )
 
 _WHOLE = re.compile(r"[0-9]+")
+# The largest integer bash's `test` reads; one digit more is an error there, not a number.
+_INTMAX = 2**63 - 1
 
 
 @dataclass(frozen=True)
@@ -69,7 +71,7 @@ def load_timing(env: Mapping[str, str]) -> Timing:
     interval = _env(env, "SHIP_PR_CHECKS_INTERVAL", "60")
     if not _WHOLE.fullmatch(interval):
         die(f"SHIP_PR_CHECKS_INTERVAL must be whole seconds, got '{interval}'")
-    if int(interval) <= 0:
+    if not 0 < int(interval) <= _INTMAX:
         die(f"SHIP_PR_CHECKS_INTERVAL must be at least 1 second, got '{interval}'")
     wait = _env(env, "SHIP_PR_CHECKS_WAIT", "7200")
     if not _WHOLE.fullmatch(wait):
@@ -171,7 +173,8 @@ def run(
     if not _WHOLE.fullmatch(interval_text):
         die(f"run watch: the interval must be seconds, got '{interval_text}'")
     interval = int(interval_text)
-    if interval <= 0:
+    # `[ "$interval" -gt 0 ]` was false past bash's integer, as it is for 0.
+    if not 0 < interval <= _INTMAX:
         die(f"run watch: the interval must be at least 1 second, got '{interval_text}'")
     # REPO= is a session default rather than a second target, so an argument overrides it.
     repo = ref.repo

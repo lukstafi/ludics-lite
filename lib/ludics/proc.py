@@ -85,5 +85,6 @@ def run_tool(
 
 
 def substitution(text: str) -> str:
-    """What the shell's ``$(...)`` keeps of a command's output: every trailing newline dropped."""
-    return text.rstrip("\n")
+    """What the shell's ``$(...)`` keeps of a command's output: every NUL byte dropped (bash drops
+    them as it reads, with a warning on 5.x) and then every trailing newline."""
+    return text.replace("\0", "").rstrip("\n")

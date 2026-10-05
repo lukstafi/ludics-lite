@@ -34,6 +34,7 @@ import re
 from typing import NoReturn, assert_never
 
 from ludics import cli
+from ludics.prreview import space
 from ludics.prreview.core import (
     GhFailed,
     GhOk,
@@ -50,17 +51,15 @@ from ludics.prreview.core import (
 # wrote it. It follows the body after one blank line.
 MARKER = "\n\n_🤖 Addressed by an automated coding agent_"
 
-# [[:space:]] as the shell's checks read it (the C locale's six).
-SPACE = " \t\n\r\f\v"
-
 _TOKEN = re.compile(r"[0-9]+(?:\+[0-9]+)*")
 _ID = re.compile(r"[0-9]+")
 _MENTION = re.compile(r"@[Cc][Oo][Dd][Ee][Xx]")
 
 
 def blank(body: str) -> bool:
-    """``[ -n "${body//[[:space:]]/}" ]`` failing: nothing in the body but whitespace."""
-    return body.strip(SPACE) == ""
+    """``[ -n "${body//[[:space:]]/}" ]`` failing: nothing in the body but whitespace, as the
+    caller's locale classes it (``space``: under en_US.UTF-8 a body of U+3000 is empty)."""
+    return space.blank(body)
 
 
 def split_ids(token: str, command: str) -> list[str]:
@@ -94,14 +93,15 @@ def mention_refusal(command: str, body: str) -> None:
 
     Boundary, as a fail-closed allowlist: the ONE body that passes with a mention in it is
     ``comment``'s bare nudge, exactly '@codex review' with trailing whitespace allowed (the shape
-    status_state reads as a request). Every other body holding the characters '@codex', in any
+    status_state reads as a request; whitespace as the caller's locale classes it, as the shell's
+    trim did). Every other body holding the characters '@codex', in any
     ASCII letter case, refuses: inside a code span or a fence, quoted, inside an email-like word, or
     as the prefix of a longer handle. Not read: Markdown structure, whether GitHub renders the
     mention as a link, or whether the connector would act on it. ``reply`` has no allowlisted body:
     the nudge goes to the PR conversation through ``comment``."""
     if not _MENTION.search(body):
         return
-    if command == "comment" and body.rstrip(SPACE) == "@codex review":
+    if command == "comment" and space.rstrip(body) == "@codex review":
         return
     if command == "comment":
         nudge = "the bare nudge is the one body that may mention it"
@@ -155,9 +155,10 @@ def reply_failed(
     answer, empty when none does yet. Once an answer stands in a thread, every retry keeps pointing
     at it with ``--anchor``.
 
-    One divergence from the shell, on purpose: the ambiguous message's second answer was
-    ``${after:-there is nothing else outstanding if it is}``, which, when ids DID remain, appended
-    their raw space-joined list after "if it is". It says only what it meant to now."""
+    The ambiguous message's last two parts are the shell's ``${after:+...}`` and ``${after:-...}``
+    as written, so the text is the shell's to the byte: when ids remain, the second appends their
+    raw space-joined list after "if it is"; on the last id the first is empty, which leaves a
+    double space before "there is nothing else outstanding"."""
     err = session.err_line()
     after = rest[1:]
     keep = f" --anchor {anchor}" if anchor else ""
@@ -182,16 +183,14 @@ def reply_failed(
                     f"Retrying prints the same thing — check the comment id and the PR. {landed}Comment {comment_id} got",
                     f"nothing, so once the id is right, retry with: {retry}",
                 )
-            if after:
-                second = f"retry with: {ids_token(after)} --anchor {anchor or comment_id} if it is"
-            else:
-                second = "there is nothing else outstanding if it is"
+            raw_after = "".join(f" {i}" for i in after)
             fail(
                 3,
                 f"reply to comment {comment_id} on {target} failed AMBIGUOUSLY: {err}.",
                 "That is not a gateway refusal, so the reply MAY have landed and this script will not post it",
                 f"twice. {landed}Read comment {comment_id}'s thread: retry with: {retry} if the reply is not there;",
-                second,
+                f"retry with: {ids_token(after)} --anchor {anchor or comment_id} if it is" if after else "",
+                raw_after or "there is nothing else outstanding if it is",
             )
         case _:
             assert_never(result)

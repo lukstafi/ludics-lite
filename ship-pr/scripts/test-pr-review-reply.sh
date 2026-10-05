@@ -425,6 +425,8 @@ test_an_ambiguous_write_never_claims_nothing_was_posted() {
   assert_contains "$ERR" "retry with: 900+901 if the reply is not there" "with both answers named"
   assert_contains "$ERR" "retry with: 901 --anchor 900 if it is" \
     "the second keeping the thread that may already hold the answer as the anchor"
+  # Byte for byte the shell's tail: its ${after:-...} appended the raw remaining ids.
+  assert_eq "${ERR##*if it is}" "  901" "and the shell's raw remainder ends the message"
   # The control on the pair: the gateway refusal at the same id DOES say nothing was posted, so
   # the two classifications are reported differently rather than by one hedged string.
   reset_fixture
@@ -812,7 +814,7 @@ test_body_invocation_errors_send_nothing() {
 # ISSUES endpoint, since pulls/<n>/comments takes inline review comments, which need a commit and a
 # path. It carries the same marker as `reply`.
 comment_attempts() {
-  wc -l <"$BODIES/comment-methods" 2>/dev/null | tr -d ' ' || echo 0
+  wc -l 2>/dev/null <"$BODIES/comment-methods" | tr -d ' ' || echo 0
 }
 
 test_comment_posts_to_the_issues_endpoint() {
@@ -1001,6 +1003,87 @@ test_the_bare_nudge_is_the_one_comment_that_passes() {
   done
 }
 
+# --- whitespace is the caller's locale's (ludics-lite#403) ------------------------------------
+# The shell read [[:space:]] through the C library under the caller's LC_CTYPE: under en_US.UTF-8 a
+# body of U+3000 or U+00A0 was empty, and '@codex review' followed by U+00A0 was the bare nudge;
+# under the C locale neither was. The port first read the C locale's six in every locale, so it
+# posted a body the shell refused and refused a nudge the shell posted. These cases ask THIS bash
+# what the class answers and hold the commands to it, so they pin one line on any C library.
+
+# The first UTF-8 locale whose [[:space:]] holds U+3000 here; empty when this box has none.
+space_locale() {
+  local loc
+  for loc in en_US.UTF-8 C.UTF-8 en_US.utf8 C.utf8; do
+    if shell_blank "$loc" $'\xe3\x80\x80'; then
+      printf '%s\n' "$loc"
+      return 0
+    fi
+  done
+}
+# <locale> <command...>: the command under that locale. LANG=C names the C locale through LANG
+# alone, with LC_ALL and LC_CTYPE empty: the one spelling Python would coerce to C.UTF-8 on its own
+# (PEP 538), which scripts/py turns off so the commands read the C locale the shell read.
+in_locale() {
+  local spec="$1"
+  shift
+  case "$spec" in
+  LANG=*) LC_ALL="" LC_CTYPE="" LANG="${spec#LANG=}" "$@" ;;
+  *) LC_ALL="$spec" "$@" ;;
+  esac
+}
+shell_blank() { # <locale> <body>: the shell's `[ -z "${body//[[:space:]]/}" ]`
+  in_locale "$1" "$BASH" -c 'b=$1; [ -z "${b//[[:space:]]/}" ]' _ "$2" 2>/dev/null
+}
+shell_trim() { # <locale> <body>: the shell's trim of trailing whitespace
+  in_locale "$1" "$BASH" -c 'b=$1; printf %s "${b%"${b##*[![:space:]]}"}"' _ "$2" 2>/dev/null
+}
+
+test_whitespace_is_the_locale_s() {
+  local utf8 loc body tail
+  utf8=$(space_locale)
+  # Not vacuous where it matters: macOS's en_US.UTF-8 holds U+3000, U+2003 and U+00A0.
+  if [ "$(uname -s)" = Darwin ]; then
+    assert_eq "$utf8" en_US.UTF-8 "this bash classes U+3000 as whitespace under en_US.UTF-8"
+  fi
+  for loc in ${utf8:+"$utf8"} C LANG=C; do
+    for body in $'\xe3\x80\x80' $'\xc2\xa0\xe2\x80\x83 '; do
+      reset_fixture
+      in_locale "$loc" run_cmd cmd_reply 900 "$body"
+      if shell_blank "$loc" "$body"; then
+        assert_eq "$RC" 2 "under $loc the shell read this reply body as empty ($ERR)"
+        assert_contains "$ERR" "the body is empty; there is nothing to post" "and says so"
+        assert_eq "$(writes_to 900)" 0 "and nothing is posted under $loc"
+      else
+        assert_eq "$RC" 0 "under $loc the shell posted this reply body ($ERR)"
+        assert_eq "$(writes_to 900)" 1 "once, under $loc"
+      fi
+      reset_fixture
+      in_locale "$loc" run_cmd cmd_comment "$body"
+      if shell_blank "$loc" "$body"; then
+        assert_eq "$RC" 2 "under $loc the shell read this comment body as empty ($ERR)"
+        assert_contains "$ERR" "the body is empty; there is nothing to post" "and says so"
+        assert_eq "$(comment_attempts)" 0 "and nothing is posted under $loc"
+      else
+        assert_eq "$RC" 0 "under $loc the shell posted this comment body ($ERR)"
+        assert_eq "$(comment_attempts)" 1 "once, under $loc"
+      fi
+    done
+    for tail in $'\xc2\xa0' $'\xe3\x80\x80' $'\xe2\x80\x83\n'; do
+      body="@codex review$tail"
+      reset_fixture
+      in_locale "$loc" run_cmd cmd_comment "$body"
+      if [ "$(shell_trim "$loc" "$body")" = "@codex review" ]; then
+        assert_eq "$RC" 0 "under $loc the shell trimmed this to the bare nudge and posted it ($ERR)"
+        assert_eq "$(comment_attempts)" 1 "once, under $loc"
+      else
+        assert_eq "$RC" 2 "under $loc the shell left the tail on, so a mention ($ERR)"
+        assert_contains "$ERR" "the body mentions '@codex'" "and refused it as one"
+        assert_eq "$(comment_attempts)" 0 "and nothing is posted under $loc"
+      fi
+    done
+  done
+}
+
 # --- what the fix rounds taught the writers, pinned before the port (ludics-lite#403) ----------
 # Each of these was a review round's finding, or a branch its fix added, that no case above
 # reached; the Python port has to keep every one of them.
@@ -1063,6 +1146,8 @@ test_an_ambiguous_last_write_leaves_nothing_outstanding() {
   assert_contains "$ERR" "Read comment 901's thread: retry with: 901 --anchor 900 if the reply is not there;" \
     "the first answer keeps the anchor that holds the answer"
   assert_contains "$ERR" "there is nothing else outstanding if it is" "and the second is that nothing is left"
+  # Byte for byte the shell's: its empty ${after:+...} left a double space before it.
+  assert_contains "$ERR" "if the reply is not there;  there is nothing else" "with the shell's spacing"
 }
 
 # The lookup's three ways to fail are three answers (9197c23): GraphQL rejecting the query says
@@ -1207,6 +1292,7 @@ tests=(
   test_resolve_keeps_its_failures_apart
   test_a_repeated_id_resolves_once
   test_resolve_reads_to_the_gate_s_page_cap
+  test_whitespace_is_the_locale_s
 )
 
 run_tests "${tests[@]}" -- "$@"
