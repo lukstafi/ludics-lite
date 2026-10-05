@@ -914,6 +914,8 @@ budget_endpoint() {
       *) [ -n "$id" ] || id="$a" ;;
       esac
     done
+    # gh reads GH_REPO when no -R names one (`gh help environment`).
+    [ -n "$repo" ] || repo="${GH_REPO:-}"
     [ -n "$repo" ] && [ -n "$id" ] && printf 'repos/%s/actions/runs/%s' "$repo" "$id"
     ;;
   *) printf 'graphql' ;;
@@ -950,10 +952,12 @@ budget_scope() {
 # the words quota_failure reads.
 budget_probe() {
   local out head body status="" remaining="" reset="" after="" line name value now quota=""
+  # github.com by name: the budget covers that host only (budget_scope), and a GH_HOST naming
+  # another would send the probe there.
   if [ "$1" = graphql ]; then
-    out=$(gh api -i graphql -f query='query{viewer{login}}' 2>/dev/null)
+    out=$(gh api -i --hostname github.com graphql -f query='query{viewer{login}}' 2>/dev/null)
   else
-    out=$(gh api -i "$1" 2>/dev/null)
+    out=$(gh api -i --hostname github.com "$1" 2>/dev/null)
   fi
   out=$(printf '%s\n' "$out" | tr -d '\r')
   # The header block alone, lowercased once (header names are case-insensitive); the body after it.
@@ -1067,6 +1071,7 @@ hold_set() {
     case "$verdict" in
     "quota "*) src="no header names its end; backing off" ;;
     ok) src="a probe of another operation answered, so no header names this one's end; backing off" ;;
+    unprobed) src="refused while another hold or probe stood, so not probed; backing off" ;;
     *) src="the probe got no reading; backing off" ;;
     esac
   fi
@@ -1159,7 +1164,7 @@ budget_at() { date -u -r "$1" '+%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%H:
 # minutes or hours later would act on reads the hold has made stale (a merge on its gate, a
 # review request over an approval that landed meanwhile).
 budget_gate() {
-  local mode="${1:-read}" now nap verdict noted="" probe_start
+  local mode="${1:-read}" now nap verdict noted="" probe_start rc
   [ -n "$BUDGET_DIR" ] || return 0
   while hold_read; do
     now=$(budget_now)
@@ -1180,8 +1185,9 @@ budget_gate() {
       return 3
     fi
     # The hold has ended. One process probes its endpoint; the rest wait for that probe's answer.
-    lock_take "$BUDGET_DIR/quota-probe"
-    case $? in
+    rc=0
+    lock_take "$BUDGET_DIR/quota-probe" || rc=$?
+    case "$rc" in
     2)
       GH_ERR="quota hold: cannot take the probe lock $BUDGET_DIR/quota-probe (SHIP_PR_STATE_DIR); no call was made"
       printf '%s' "$GH_ERR" >"$GH_ERR_FILE" 2>/dev/null
@@ -1215,13 +1221,26 @@ budget_gate() {
 # budget_quota_hit <gh args...>: a call was refused on quota. Probe its endpoint and set the hold
 # its headers name. A probe that answers sets the backoff hold all the same: the probe is a GET,
 # or GraphQL's viewer query, and a secondary limit on the refused operation itself (a write, an
-# expensive query) need not show on it.
+# expensive query) need not show on it. Only one probe at a time, and none while a hold stands:
+# requests in flight when the quota ran out come back refused together, and each probing would be
+# the burst the hold exists to stop. Such a refusal adds its endpoint's backoff entry unprobed,
+# which the gate probes in turn once it has ended. A call whose endpoint cannot be told (a
+# caller's `run view` with no repository) sets nothing: no probe could verify its recovery.
 budget_quota_hit() {
   local ep
   [ -n "$BUDGET_DIR" ] || return 0
   ep=$(budget_endpoint "$@")
-  [ -n "$ep" ] || ep=graphql
+  [ -n "$ep" ] || return 0
+  if hold_read && [ "$HOLD_UNTIL" -gt "$(budget_now)" ]; then
+    hold_set "$ep" unprobed
+    return 0
+  fi
+  if ! lock_take "$BUDGET_DIR/quota-probe"; then
+    hold_set "$ep" unprobed
+    return 0
+  fi
   hold_set "$ep" "$(budget_probe "$ep")"
+  rm -rf "$BUDGET_DIR/quota-probe"
 }
 
 # observer_claim <kind>: take this PR's observer lock of <kind> for this process, or refuse with
@@ -1234,8 +1253,9 @@ observer_claim() {
   dir="$BUDGET_DIR/observers/$key"
   [ "$BUDGET_OBSERVER" != "$dir" ] || return 0
   mkdir -p "$BUDGET_DIR/observers" 2>/dev/null || die "cannot create $BUDGET_DIR/observers for the observer lock"
-  lock_take "$dir"
-  case $? in
+  local rc=0
+  lock_take "$dir" || rc=$?
+  case "$rc" in
   0) ;;
   1) die "PR $REPO#$PR_NUM already has a $kind observer: pid $LOCK_HOLDER${LOCK_SINCE:+, since $(budget_at "$LOCK_SINCE")}." \
     "One observer per PR: wait on that one, or stop it, rather than reading the PR twice." \

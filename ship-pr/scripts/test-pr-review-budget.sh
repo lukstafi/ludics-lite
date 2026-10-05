@@ -146,7 +146,13 @@ gh() {
     printf 'completed\tsuccess\n'
     return 0
   fi
-  for a in "$@"; do case "$a" in -i | --include) include=1 ;; esac; done
+  local host="" next=""
+  for a in "$@"; do
+    [ -z "$next" ] || { host="$a" next=""; }
+    case "$a" in -i | --include) include=1 ;; --hostname) next=1 ;; esac
+  done
+  # A probe names github.com itself, whatever GH_HOST says.
+  [ -z "$include" ] || [ "$host" = github.com ] || printf 'probe to %s\n' "${host:-GH_HOST}" >>"$CALL_LOG"
   gh_fixture_parse "$@"
   if [ -n "$FAIL_502" ]; then
     # shellcheck disable=SC2254 # a glob on purpose
@@ -520,6 +526,44 @@ test_a_run_view_probe_finds_the_run_id() {
 
 # A lock that cannot be made at all (here: its parent is a file) is an error, status 2, at once:
 # not a holder to wait on forever.
+# Requests in flight when the quota ran out come back refused together. Only one of them probes:
+# a refusal while a hold already stands, or while another probe runs, adds its endpoint's backoff
+# entry unprobed, for the gate to probe in turn once it has ended.
+test_refusals_behind_a_hold_or_a_probe_are_not_probed() {
+  local holder
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 7200))
+  plant_hold "$((T0 + 600))" graphql 600
+  budget_quota_hit api "repos/$REPO/pulls/7" 2>/dev/null
+  assert_eq "$(requests)" "" "no probe while a hold stands"
+  assert_eq "$(cat "$STATE_DIR/quota-holds"/[0-9]* | cut -f1 | sort | tr '\n' ' ')" "graphql repos/$REPO/pulls/7 " \
+    "but the endpoint's own entry is added beside the standing one, for its turn"
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 7200))
+  command sleep 300 &
+  holder=$!
+  mkdir -p "$STATE_DIR/quota-probe"
+  printf '%s\n%s\n' "$holder" "$T0" >"$STATE_DIR/quota-probe/owner"
+  budget_quota_hit api "repos/$REPO/pulls/7" 2>/dev/null
+  kill "$holder" 2>/dev/null || :
+  wait "$holder" 2>/dev/null || :
+  assert_eq "$(requests)" "" "no probe while another one runs"
+  assert_eq "$(standing | cut -f2)" "repos/$REPO/pulls/7" "and the entry is there all the same"
+  # A run view with no repository named anywhere has no endpoint to probe: no hold at all.
+  reset_fixture
+  QUOTA_UNTIL=$((T0 + 7200))
+  (unset GH_REPO; budget_quota_hit run view 123) 2>/dev/null
+  assert_eq "$(requests)$(standing)" "" "an endpoint that cannot be told sets nothing"
+}
+
+# GH_REPO names a run view's repository when no -R does, and GH_HOST never redirects a probe.
+test_a_probe_follows_the_environment_gh_reads() {
+  reset_fixture
+  assert_eq "$(GH_REPO=o/r budget_endpoint run view 123)" "repos/o/r/actions/runs/123" "GH_REPO names the run's repository"
+  assert_eq "$(GH_HOST=ghe.example.com budget_probe "repos/$REPO/pulls/7")" ok "the probe answers"
+  assert_not_contains "$(requests)" "probe to" "on github.com, named on the probe itself"
+}
+
 test_a_lock_that_cannot_be_made_is_an_error() {
   local rc=0
   reset_fixture
@@ -637,6 +681,8 @@ run_tests \
   test_the_run_await_backs_off_on_a_still_run \
   test_a_run_view_probe_finds_the_run_id \
   test_a_lock_that_cannot_be_made_is_an_error \
+  test_refusals_behind_a_hold_or_a_probe_are_not_probed \
+  test_a_probe_follows_the_environment_gh_reads \
   test_a_still_queue_backs_off_and_a_red_still_ends_the_wait \
   test_a_moving_signal_is_read_at_the_interval \
   test_a_hold_inside_a_wait_is_one_line_and_no_exit \
