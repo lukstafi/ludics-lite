@@ -940,7 +940,7 @@ strip_check() {
 }
 BROKEN="$TMP/broken"
 mkdir -p "$BROKEN/scripts"
-cp "$HERE/check-prompts.sh" "$BROKEN/scripts/check-prompts.sh"
+copy_checker "$BROKEN"
 strip_marked_block kind-guard "$BROKEN/scripts/sync-routines.sh"
 strip_check kind-guard "$BROKEN/scripts/sync-routines.sh" \
   "a copy of the script without the file-kind guard was built"
@@ -965,7 +965,7 @@ contains "$out" "$R1: republished to" \
 # pruning pass.
 NOPRUNE="$TMP/noprune"
 mkdir -p "$NOPRUNE/scripts"
-cp "$HERE/check-prompts.sh" "$NOPRUNE/scripts/check-prompts.sh"
+copy_checker "$NOPRUNE"
 strip_marked_block prune-guard "$NOPRUNE/scripts/sync-routines.sh"
 strip_check prune-guard "$NOPRUNE/scripts/sync-routines.sh" \
   "a copy of the script that publishes without pruning was built"
