@@ -5005,6 +5005,7 @@ run_signal() {
 gate_checks() {
   local pr="$1" wait_for="${2:-0}" sha lines rc deadline started beat now sleep_for remaining
   local run_why="" run_info note pr_at="" base_sha="" head_ref="" current_sha waived_runs rname rid
+  GATE_BASE=""
   WAIVED=$'\n'
   RUN_WAIVED=0
   CHECK_WAIVED=0
@@ -5069,6 +5070,10 @@ gate_checks() {
     # where the honest answer to "is there a signal here" is 4, not a 0 the merge gate would take
     # for "nothing is red".
     RUN_WAIVED=0
+    # The base THIS round's run read is about, for cmd_merge: an ABSENT verdict can rest on it (the
+    # paths-ignore recognition reads the base's workflows), and the merge call binds only the head,
+    # so merge re-reads the base before each attempt and re-gates when it moved (ludics-lite#523).
+    GATE_BASE="$base_sha"
     if [ "$VERDICT" != red ]; then
       run_info=$(run_signal "$sha" "$pr_at" "$CHECK_TOTAL" "$base_sha" "$head_ref" "$pr")
       rc=$?
@@ -6267,6 +6272,30 @@ warn_series_close() { # <pr> <gated head>; always 0 -- a warning that can refuse
   return 0
 }
 
+# absent_base_holds: is the PR's base still GATE_BASE, the one the ABSENT verdict was read against?
+# 0 = yes, merge on it. A moved base is gated again (no wait, no waiver: the verdict being
+# replaced had no red to waive) and answers 1 once that read passes on the SAME head, for the
+# caller to rescan and retry; any other outcome is a refusal here, exiting with the gate's status.
+absent_base_holds() {
+  local base gated="$CHECK_SHA" was="$GATE_BASE" rc
+  base=$(gh_retry read api "repos/$REPO/pulls/$PR_NUM" --jq '.base.sha // "-"') &&
+    [ -n "$base" ] && [ "$base" != - ] ||
+    fail 3 "NOT merged: $REPO#$PR_NUM's base could not be re-read ($(gh_err_line)), and its ABSENT" \
+      "verdict holds only on the base it was read against. Re-run merge."
+  [ "$base" != "$was" ] || return 0
+  warn "$REPO#$PR_NUM's base moved since its ABSENT verdict was read (${was:0:8} -> ${base:0:8});" \
+    "gating the head again against the new base"
+  gate_checks "$PR_NUM" 0
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "$rc" "NOT merged: $REPO#$PR_NUM's base moved since its ABSENT verdict" \
+    "was read, and the gate read against the new base is $VERDICT (above). Re-run merge" \
+    "(--wait to wait for a run the new base's workflows may create)."
+  [ "$CHECK_SHA" = "$gated" ] || fail 5 "NOT merged: $REPO#$PR_NUM's head moved too (${gated:0:8}" \
+    "-> ${CHECK_SHA:0:8}) while its base was re-gated; re-run merge to judge the new head."
+  warn_base_drift "$PR_NUM" || true
+  return 1
+}
+
 cmd_merge() {
   local pr="${1:?usage: merge <pr> [--override <reason>] [--wait[=seconds]] [--allow-no-verdict] [-- <gh pr merge args...>]}"
   shift
@@ -6471,6 +6500,17 @@ cmd_merge() {
     # loop, so the ordinary path still makes exactly one queue read -- only a retry adds another,
     # which is a retry that has already waited for a mergeability recompute.
     [ -z "$require_green" ] || refuse_merge_queue "$PR_NUM"
+    # ABSENT is the one verdict that rests on the BASE (the paths-ignore recognition read its
+    # workflows), and the merge call binds only the head: a base that advanced since the gate's
+    # read can have added a workflow that would run on this head (ludics-lite#523). So the base is
+    # re-read last before the call, and a moved one is gated again, without a wait, before any
+    # merge. A new verdict that does not pass refuses with the gate's own exit status.
+    if [ "$VERDICT" = absent ] && ! absent_base_holds; then
+      [ "$attempt" -ge 3 ] && fail 1 "NOT merged: $REPO#$PR_NUM's base kept moving under its ABSENT" \
+        "verdict ($attempt gate reads). Re-run merge."
+      attempt=$((attempt + 1))
+      continue
+    fi
     out=$(GH_RETRY_CALLER_ARGS="$merge_args" gh_retry write pr merge "$PR_NUM" --repo "$REPO" \
       --match-head-commit "$CHECK_SHA" "${gh_args[@]}")
     rc=$?

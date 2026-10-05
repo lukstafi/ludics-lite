@@ -3,7 +3,9 @@
 # list alone cannot say about a head: "no workflow covers this commit" versus "the run for this
 # commit has not created its checks yet" (ludics-lite#24), a run that failed or was stopped before
 # any check existed, and a green check standing over a sibling run that has not judged the head
-# (ludics-lite#38, round 2). None of those may leave the gate as exit 0.
+# (ludics-lite#38, round 2). None of those may leave the gate as exit 0. And the one place `merge`
+# has to act on what this gate read: an ABSENT verdict whose base moves before the merge call
+# (ludics-lite#523), run through cmd_merge with its other scans stubbed out.
 
 set -euo pipefail
 
@@ -94,6 +96,33 @@ SAMPLE_CHECKS_TOTAL=""
 PR_BASE_NEXT=""
 COMPARE_COMMITS=""
 FILES_JSON=""
+# The base the PR names once it has ADVANCED between the gate's read and the merge call
+# (ludics-lite#523): served by every PR read after the advance (the stubbed warn_base_drift, which
+# cmd_merge runs right after the gate, makes it). ADVANCE_ADDS_WORKFLOW nonempty = the advance adds
+# a workflow, docs-check.yml, whose `paths:` cover this head's docs-only diff; the head lacks it.
+BASE_ADVANCED=""
+ADVANCE_ADDS_WORKFLOW=""
+DOCS_PATHS_YAML='name: docs-check
+on:
+  pull_request:
+    paths: ["docs/**"]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+'
+MERGE_LOG="$TEST_ROOT/merge-calls"
+
+# cmd_merge's scans that are not about the build signal, stubbed for the merge cases (#523): the
+# body, the commit series and the review threads are test-pr-review-merge.sh's. warn_base_drift
+# runs right after the gate and before the merge loop, so it is where the base advances.
+stub warn_multi_close warn_series_close merge_threads_gate warn_base_drift
+warn_multi_close() { :; }
+warn_series_close() { :; }
+merge_threads_gate() { :; }
+warn_base_drift() {
+  [ -z "$BASE_ADVANCED" ] || : >"$TEST_ROOT/base-advanced"
+}
+advanced_adds() { [ -n "$ADVANCE_ADDS_WORKFLOW" ] && [ -e "$TEST_ROOT/base-advanced" ]; }
 
 # A workflow with NO path filter at all, which is what this repository's own CI looks like and
 # what every case here that is about the CLOCK needs: nothing about it can explain an absence, so
@@ -162,6 +191,7 @@ next_of() {
 # here does: each read is a command substitution, where an incremented variable dies.
 next_base() {
   local n
+  if [ -e "$TEST_ROOT/base-advanced" ]; then printf '%s' "$BASE_ADVANCED"; return 0; fi
   [ -n "$PR_BASE_NEXT" ] || { printf '%s' "$PR_BASE"; return 0; }
   n=$(cat "$TEST_ROOT/pulls.calls" 2>/dev/null) || n=0
   case "$n" in '' | *[!0-9]*) n=0 ;; esac
@@ -199,6 +229,10 @@ reset_fixture() {
   PR_BASE_NEXT=""
   COMPARE_COMMITS=$(jq -cn --arg h "$HEAD_SHA" '[$h]')
   FILES_JSON='[{"filename":"docs/notes.md"}]'
+  BASE_ADVANCED=""
+  ADVANCE_ADDS_WORKFLOW=""
+  rm -f "$TEST_ROOT/base-advanced" "$TEST_ROOT/merged"
+  : >"$MERGE_LOG"
   rm -f "$TEST_ROOT/pulls.calls" "$TEST_ROOT/CHECK_RUNS_SEQ.calls" "$TEST_ROOT/RUNS_SEQ.calls" "$TEST_ROOT/HEAD_SEQ.calls"
   retune ABSENT_GRACE=300 CHECKS_INTERVAL=1 CHECKS_HEARTBEAT=600
   : >"$REQUEST_LOG"
@@ -206,7 +240,13 @@ reset_fixture() {
 }
 
 gh() {
-  local response="" fixture_head wid fixture_wpath
+  local response="" fixture_head wid fixture_wpath merged=false
+  # cmd_merge's own call, the one non-api call here: logged, and the PR reads answer merged after.
+  if [ "${1:-} ${2:-}" = "pr merge" ]; then
+    printf '%s\n' "$*" >>"$MERGE_LOG"
+    : >"$TEST_ROOT/merged"
+    return 0
+  fi
   gh_fixture_parse "$@"
   # A GLOB, deliberately unquoted: "repos/o/n/commits/<sha>" is a prefix of the check-runs
   # endpoint, so a substring match could not fail the commit read alone — and a case that failed
@@ -237,10 +277,13 @@ gh() {
   "repos/$REPO/pulls/7")
     fixture_head=$(next_of HEAD_SEQ)
     if [ "$fixture_head" = UNREADABLE ]; then return 1; fi
+    [ ! -e "$TEST_ROOT/merged" ] || merged=true
     if [ -n "$PR_UPDATED_AGE" ]; then
       response=$(jq -cn --arg sha "$fixture_head" --arg at "$(iso_ago "$PR_UPDATED_AGE")" \
         --arg base "$(next_base)" --arg ref "$PR_HEAD_REF" \
-        '{head:({sha:$sha} + (if $ref == "" then {} else {ref:$ref} end)), updated_at:$at}
+        --argjson m "$merged" \
+        '{head:({sha:$sha} + (if $ref == "" then {} else {ref:$ref} end)), updated_at:$at,
+          merged:$m, state:(if $m then "closed" else "open" end)}
          + (if $base == "" then {} else {base:{sha:$base}} end)')
     else
       response=$(jq -cn --arg sha "$fixture_head" --arg base "$(next_base)" --arg ref "$PR_HEAD_REF" \
@@ -260,8 +303,9 @@ gh() {
     ;;
   # --- the recognition's feeds ---------------------------------------------------------------
   "repos/$REPO/actions/workflows?per_page=100")
-    response=$(jq -c --arg t "$WORKFLOW_TOTAL" \
-      '. + {total_count: (if $t == "" then (.workflows | length) else ($t | tonumber) end)}' \
+    response=$(jq -c --arg t "$WORKFLOW_TOTAL" --arg added "$(advanced_adds && echo 1)" \
+      '(if $added == "" then . else .workflows += [{id:2,name:"docs-check",state:"active"}] end)
+       | . + {total_count: (if $t == "" then (.workflows | length) else ($t | tonumber) end)}' \
       <<<"$WORKFLOWS_JSON")
     ;;
   # The workflow's own file: where it lives, then what it says AT THE HEAD. Served raw, as the
@@ -276,6 +320,20 @@ gh() {
     ;;
   # Entries, not only files: the endpoint's cap is on the array, and a response holding
   # directories can carry fewer files than the cap and still be truncated.
+  # The advanced base (ludics-lite#523), above every contents arm it would fall into: its directory
+  # carries docs-check.yml when the advance added it, and the head never does (a 404 at the head).
+  "repos/$REPO/contents/.github/workflows?ref=${BASE_ADVANCED:-unset}")
+    response=$(jq -cn --argjson f "$WORKFLOW_DIR_HEAD" --arg added "$ADVANCE_ADDS_WORKFLOW" \
+      '[($f + (if $added == "" then [] else [".github/workflows/docs-check.yml"] end))[]
+        | {type:"file", path:.}]')
+    ;;
+  "repos/$REPO/contents/.github/workflows/docs-check.yml?ref=${BASE_ADVANCED:-unset}")
+    response="$DOCS_PATHS_YAML"
+    ;;
+  "repos/$REPO/contents/.github/workflows/docs-check.yml?ref=$HEAD_SHA")
+    echo "gh: Not Found (HTTP 404)" >&2
+    return 1
+    ;;
   "repos/$REPO/contents/.github/workflows?ref=$BASE_SHA")
     response=$(jq -cn --argjson f "${WORKFLOW_DIR_BASE:-$WORKFLOW_DIR_HEAD}" \
       --argjson d "$WORKFLOW_DIR_OTHER" \
@@ -334,6 +392,17 @@ advisory_listing() { # <names as a JSON array, or an HTTP status>
   500) echo "gh: unavailable (HTTP 500)" >&2; return 1 ;;
   esac
   jq -c '[.[] | {name: ., type: "file"}]' <<<"$1"
+}
+
+run_merge() {
+  local rc
+  set +e
+  (cmd_merge "$REPO#7" "$@") >"$TEST_ROOT/merge-out" 2>&1
+  rc=$?
+  set -e
+  MERGE_OUTPUT=$(cat "$TEST_ROOT/merge-out")
+  MERGE_RC="$rc"
+  MERGE_CALLS=$(cat "$MERGE_LOG")
 }
 
 run_gate() {
@@ -719,6 +788,48 @@ test_a_base_that_moves_under_the_recognition_settles_nothing() {
   run_gate
   assert_eq "$GATE_RC" 4 "evidence about a target the PR no longer has settles nothing"
   assert_not_contains "$GATE_OUTPUT" ": ABSENT" "and nothing is called absent on it"
+}
+
+# --- ludics-lite#523: an ABSENT verdict whose base moves before the merge call ----------------
+# The recognition read the base's workflows, and the merge call binds only the head. The base here
+# advances between the gate's read and the merge call, adding a workflow whose `paths:` cover this
+# head's docs-only diff — so a run CAN be created now, and the absence the gate settled is about a
+# base the PR no longer has. Merge re-reads the base before the call, gates again, and refuses.
+test_merge_regates_an_absent_verdict_when_the_base_moved() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  BASE_ADVANCED=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+  ADVANCE_ADDS_WORKFLOW=1
+  WORKFLOW_PATH_2=.github/workflows/docs-check.yml
+  run_merge
+  assert_eq "$MERGE_RC" 4 "an absence read on the old base is not merged on the new one ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" ": ABSENT" "the first read settled the absence"
+  assert_contains "$MERGE_OUTPUT" "base moved since its ABSENT verdict was read (babababa -> cdcdcdcd)" \
+    "the move is named"
+  assert_contains "$MERGE_OUTPUT" "creation grace" "the second read, on the new base, waits"
+  assert_eq "$MERGE_CALLS" "" "no merge call is made"
+}
+
+# A base that moved without touching what the recognition reads is gated again and merged: the
+# second read settles the same absence against the new base, and the merge goes on it.
+test_merge_lands_an_absent_verdict_the_moved_base_still_settles() {
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  BASE_ADVANCED=cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+  run_merge
+  assert_eq "$MERGE_RC" 0 "the absence holds on the new base too ($MERGE_OUTPUT)"
+  assert_contains "$MERGE_OUTPUT" "gating the head again against the new base" "the base was re-gated"
+  assert_eq "$(grep -c ': ABSENT' <<<"$MERGE_OUTPUT")" 2 "two reads, each settling the absence"
+  assert_contains "$MERGE_CALLS" "--match-head-commit $HEAD_SHA" "one merge, bound to the gated head"
+  # And an unmoved base costs the one read and nothing more.
+  reset_fixture
+  COMMIT_AGE=5
+  WORKFLOW_YAML="$DOCS_IGNORED_YAML"
+  run_merge
+  assert_eq "$MERGE_RC" 0 "an unmoved base merges ($MERGE_OUTPUT)"
+  assert_not_contains "$MERGE_OUTPUT" "gating the head again" "and is not gated twice"
 }
 
 # --- review round 8 ---------------------------------------------------------------------------
@@ -1867,6 +1978,8 @@ tests=(
   test_an_untimed_job_holds_its_run
   test_wait_holds_until_the_checks_appear
   test_wait_ceiling_with_a_queued_run_is_no_verdict
+  test_merge_regates_an_absent_verdict_when_the_base_moved
+  test_merge_lands_an_absent_verdict_the_moved_base_still_settles
 )
 
 run_tests "${tests[@]}" -- "$@"
