@@ -167,11 +167,9 @@ bytes and ANSI control sequences: keep the raw log in a file and make a sanitize
 text inspection rather than placing raw output in shell variables or command substitutions.
 Continue to gate on the exact-head workflow and required jobs.
 
-OCANNL's “full matrix” is its Linux/macOS PR matrix; Windows runs on its schedule, not per PR.
-When a change does need Windows evidence, OCANNL's AGENTS.md (*Windows verification placement*)
-says where it comes from; its `windows_only: true` dispatch, with the full `expected_sha`, can
-check an existing commit without a new push. Ordinary current-head PR checks remain required. A
-fleet leg runs as [native Windows verification](executions.md#bounded-native-windows-verification) says.
+Which jobs a project's PR matrix carries, and where evidence it does not carry comes from, is the
+project's AGENTS.md's to say (OCANNL: *Windows verification placement*). Ordinary current-head PR
+checks remain required. A fleet leg runs as [native Windows verification](executions.md#bounded-native-windows-verification) says.
 
 If sibling fixes become mutually gated on red branches, freeze both writers and confirm their
 remote SHAs, unpushed commits, and staged, unstaged and untracked state before changing ownership.

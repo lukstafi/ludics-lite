@@ -357,8 +357,8 @@ ceiling and refuse every launch (20-40 min per launch on 09-24 and 09-25). The g
 nothing else in flight, is green meanwhile when it is GitHub's clean merge of a PR whose head
 built that workflow green, and the verdict line reads `green, interim (...; judged meanwhile by
 PR #N's head run ...)`. A tip that is not such a merge stays pending and refused, and so does one
-with a run at an older merge still going, which a burst leaves in OCANNL and ludics-lite alike
-(ship-pr's *Read the base before you branch*). The integration
+with a run at an older merge still going, which a burst leaves wherever push CI does not cancel a
+running run (ship-pr's *Read the base before you branch*). The integration
 loop, which reads `base --wait` WITHOUT `--interim`, still waits for the tip's own run: an interim is
 never its verdict. This is a bounded pre-dispatch check, not another observer, and it is
 point-in-time: not atomic with the spawn or launch that follows, so an adoption reconciles
@@ -391,9 +391,9 @@ requirements for every transport with transport-specific setup and identity, and
   summary (ludics-lite#70 and #76, 2026-09-10).
 - Verification expectations: scoped test runs, negative controls where the work is a checker
   (new fixtures shown to FAIL on base: `~/ludics-lite/scripts/run-against-base.sh <suite>`, slot-wrapped),
-  and the box's known environmental traps. **OCANNL's formatter batch** is `tools/fmt-check.sh`,
-  run last, slot-wrapped and read by its final `fmt-check: PASSED|FAILED` line (its AGENTS.md
-  says why), never the `build @fmt` alias, which passes trees CI rejects. **On mac-studio**:
+  and the box's known environmental traps. **The formatter batch** is the one the project's
+  AGENTS.md names, run last, slot-wrapped and read as it says (OCANNL: *Format before the first
+  push*). **On mac-studio**:
   Gatekeeper/XProtect stalls fresh executables for minutes - sample the pid before assuming a
   hang; never start a second dune against a running _build; and **targeted test aliases only**
   (`dune build @<dir>/runtest-<name>` for the tests the change reaches, plus the scanners), never a full
@@ -670,8 +670,8 @@ controlled through the tools in your coordinator's file, never through those com
   repository's own full integration suite to completion in a checkout that owes the same proof
   as the launch preflight - clean porcelain, expected branch, HEAD equal to the remote master
   just merged - because a suite run atop local edits or the wrong branch verifies nothing. For
-  OCANNL that is the `@runtest @train` aliases, as an unpiped ssh command with its own exit
-  sentinel per the OCANNL agent-notes, and on a GPU box it also runs that box's backend, which
+  OCANNL that is the `@runtest @train` aliases, run over ssh through its `tools/test-run.sh` as
+  its AGENTS.md says, and on a GPU box it also runs that box's backend, which
   GitHub CI never covers (a bonus, not the reason for the pick); for a repo whose CI already is
   its fullest suite (ludics, flotilla, this one), the merged tip's CI run is the verdict,
   awaited with `pr-review.sh base owner/repo --wait` rather than re-run locally. Where the
