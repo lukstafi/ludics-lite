@@ -61,6 +61,83 @@ def bridge_argv(name: str, args: Sequence[str], env: Mapping[str, str]) -> list[
     return [shell, "-c", script, name, state, *args]
 
 
+_WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".com", ".bat", ".cmd")
+
+
+def is_script(path: str) -> bool:
+    """A file Windows cannot start by itself: no executable suffix, and a ``#!`` line."""
+    if path.lower().endswith(_WINDOWS_EXECUTABLE_SUFFIXES):
+        return False
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def windows_lookup(name: str, env: Mapping[str, str] | None = None) -> str | None:
+    """PATH as Git Bash searches it: in each directory, the bare name (a ``#!`` script such as a
+    suite's fake ``gh`` or ``git``) and then the name with each executable suffix, first match
+    winning. ``shutil.which`` tries the suffixes only, so it passes over a fake ``gh`` to the real
+    ``gh.exe`` further along PATH."""
+    environ = os.environ if env is None else env
+    suffixes = [s for s in environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if s]
+    for directory in environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        for candidate in [name, *(name + suffix.lower() for suffix in suffixes)]:
+            path = os.path.join(directory, candidate)
+            if os.path.isfile(path) and (candidate != name or is_script(path)):
+                return path
+    return None
+
+
+def command_argv(name: str, env: Mapping[str, str] | None = None) -> list[str] | None:
+    """The argv prefix that runs ``name`` as the shell found it on PATH.
+
+    Under Git Bash the shell ran a ``#!`` script on PATH -- a suite's fake ``gh`` or ``git``, a
+    wrapper a box installs -- through its own exec, which reads the line; Windows cannot start such
+    a file, so a native interpreter hands it to the bash on PATH, which is Git Bash's own.
+    Elsewhere the file is started directly, as the shell started it."""
+    environ = os.environ if env is None else env
+    if os.name != "nt":
+        exe = shutil.which(name, path=environ.get("PATH"))
+        return None if exe is None else [exe]
+    exe = windows_lookup(name, environ)
+    if exe is None:
+        return None
+    if is_script(exe):
+        shell = shutil.which("bash", path=environ.get("PATH"))
+        if shell is not None:
+            return [shell, exe]
+    return [exe]
+
+
+def windows_command_line(argv: Sequence[str]) -> str:
+    """Every argument double-quoted, by the C runtime's rules. A Cygwin/MSYS program started by a
+    native one parses its own command line and expands each UNQUOTED word as a glob, braces
+    included -- `<oid>^{object}` arrived at a fake git as `<oid>^object`, and a GraphQL query with
+    no space in it arrived at a bridged gh as two words -- so a program that Git Bash's runtime
+    starts (its bash, a #! script through it) gets nothing unquoted. subprocess's own rendering
+    quotes only a word with a space or a tab in it."""
+    words: list[str] = []
+    for arg in argv:
+        out: list[str] = []
+        slashes = 0
+        for char in arg:
+            if char == "\\":
+                slashes += 1
+                continue
+            if char == '"':
+                out.append("\\" * (2 * slashes + 1) + '"')
+            else:
+                out.append("\\" * slashes + char)
+            slashes = 0
+        out.append("\\" * (2 * slashes))
+        words.append('"' + "".join(out) + '"')
+    return " ".join(words)
+
+
 def run_tool(
     name: str,
     args: Sequence[str],
@@ -79,17 +156,20 @@ def run_tool(
     environ = dict(os.environ if env is None else env)
     argv = bridge_argv(name, args, environ)
     if argv is None:
-        exe = shutil.which(name, path=environ.get("PATH"))
-        if exe is None:
+        prefix = command_argv(name, environ)
+        if prefix is None:
             return Completed(127, "", f"{name}: command not found\n")
-        argv = [exe, *args]
+        argv = [*prefix, *args]
+    # Under Windows the bridge's bash, and a #! tool handed to it, are MSYS programs: each word
+    # must reach them quoted (``windows_command_line``).
+    spawn: list[str] | str = windows_command_line(argv) if os.name == "nt" else argv
     if isinstance(stdin, bytes):
         proc = subprocess.run(
-            argv, input=stdin, capture_output=True, env=environ, cwd=cwd, check=False
+            spawn, input=stdin, capture_output=True, env=environ, cwd=cwd, check=False
         )
     else:
         proc = subprocess.run(
-            argv, stdin=stdin, capture_output=True, env=environ, cwd=cwd, check=False
+            spawn, stdin=stdin, capture_output=True, env=environ, cwd=cwd, check=False
         )
     return Completed(proc.returncode, decode(proc.stdout), decode(proc.stderr))
 

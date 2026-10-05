@@ -25,11 +25,13 @@ import glob
 import os
 import re
 import shutil
+import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import assert_never
 
+from ludics.proc import windows_command_line
 from ludics.prreview import knobs
 from ludics.prreview.core import (
     GhOk,
@@ -142,45 +144,84 @@ def item_about_head(stamp: str, head: str) -> bool:
     return head.startswith(stamp) or stamp.startswith(head)
 
 
+# The forwarding shell's own bash, handed over by pr-review.sh under Git Bash only (py_forward).
+CALLER_SHELL = "LUDICS_CALLER_SHELL"
+
+
+def _live_msys_pids(env: Mapping[str, str], pids: set[str]) -> set[str] | None:
+    """Which of these MSYS pids are alive, asked of the caller's own Git Bash with the shell's
+    ``kill -0``: a native Windows interpreter cannot ask about an MSYS pid itself, and its
+    ``os.kill(pid, 0)`` TERMINATES whatever Windows process has that number. None when there is
+    no such bash or it did not answer, which sweeps nothing."""
+    shell = env.get(CALLER_SHELL, "")
+    if not shell:
+        return None
+    script = 'for p; do kill -0 "$p" 2>/dev/null && printf "%s\\n" "$p"; done; exit 0'
+    try:
+        done = subprocess.run(
+            windows_command_line([shell, "-c", script, "_", *sorted(pids)]),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if done.returncode != 0:
+        return None
+    return set(done.stdout.decode("ascii", "replace").split())
+
+
 def tmp_sweep_stale(env: Mapping[str, str]) -> None:
     """Remove what a SIGKILLed run left in TMPDIR: every family keyed by an owning pid that is no
     longer alive, this user's only. A name with no pid in it names no owner and is left alone.
 
-    Not on native Windows (Git Bash runs a native Python): the pids in those names are MSYS pids,
-    which a Windows process cannot ask about, and ``os.kill(pid, 0)`` there TERMINATES whatever
-    Windows process has that number. Leaving a leftover is the safe way round, as it is for a
-    reused pid."""
-    if os.name == "nt":
-        return
+    Under Git Bash (a native Python) the pids in those names are MSYS pids, so their liveness is
+    the caller's bash's ``kill -0`` (``_live_msys_pids``), and ownership is not read: Windows
+    reports no owner through ``stat`` and the scratch root is the user's own. Without that bash a
+    leftover stays, the safe way round, as it is for a reused pid."""
     root = env.get("TMPDIR", "") or "/tmp"
     if root.endswith("/"):
         root = root[:-1]
     if not root or not os.path.isdir(root):
         return
-    uid = os.geteuid()
+    windows = os.name == "nt"
+    uid = None if windows else os.geteuid()
+    found: list[tuple[str, str]] = []
     for family in ("snap", "err", "gh", "probe", "test"):
         prefix = f"pr-review-{family}."
         for path in sorted(glob.glob(os.path.join(glob.escape(root), prefix + "*"))):
             try:
-                if not os.path.exists(path) or os.stat(path).st_uid != uid:
+                if not os.path.exists(path) or (uid is not None and os.stat(path).st_uid != uid):
                     continue
             except OSError:
                 continue
             pid_text = os.path.basename(path)[len(prefix):].split(".", 1)[0]
-            if not (pid_text.isdigit() and pid_text.isascii()):
+            if pid_text.isdigit() and pid_text.isascii():
+                found.append((path, pid_text))
+    if not found:
+        return
+    live: set[str] | None = None
+    if windows:
+        live = _live_msys_pids(env, {pid for _, pid in found})
+        if live is None:
+            return
+    for path, pid_text in found:
+        if live is not None:
+            if pid_text in live:
                 continue
+        else:
             try:
                 os.kill(int(pid_text), 0)
                 continue
             except (OSError, OverflowError, ValueError):
                 pass
-            if os.path.isdir(path) and not os.path.islink(path):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 @dataclass

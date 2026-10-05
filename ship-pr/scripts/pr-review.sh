@@ -4557,6 +4557,11 @@ py_forward() { # <exec|call> <subcommand> <args...>
     name=${pair%%=*}
     env_args+=("${pair#*=}=${!name-}")
   done
+  # Under Git Bash, this bash: the native Python asks it `kill -0` about the MSYS pids in a
+  # leftover's name (tmp_sweep_stale), which a Windows process cannot ask about itself.
+  case "${OSTYPE:-}" in
+  msys* | cygwin*) env_args+=("LUDICS_CALLER_SHELL=$(py_native_path "$BASH")") ;;
+  esac
   for fn in "${PY_BRIDGE_COMMANDS[@]}"; do
     if declare -F "$fn" >/dev/null; then bridged="$bridged $fn"; fi
   done

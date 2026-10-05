@@ -32,7 +32,7 @@ lib/ludics/cli.py                shared by every entry point: Exit, main (the ca
                                  PYTHONPATH back, then main_guard), main_guard (an Exit's message
                                  and status; a closed stdout ends the command by SIGPIPE, 141, as
                                  it ended the shell's printf), say/emit/note
-lib/ludics/proc.py               run_tool and the shell bridge
+lib/ludics/proc.py               run_tool, the shell bridge, and Git Bash's PATH lookup and quoting
 lib/ludics/prreview/core.py      pr-review.sh's prelude: fail/die/warn, Config, GhSession
                                  (gh_retry and its classification), parse_ref/pr_arg,
                                  repo_from_cwd, api_list, mark_of

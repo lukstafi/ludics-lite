@@ -29,6 +29,32 @@ class RunTool(unittest.TestCase):
         self.assertEqual(done.rc, 127)
         self.assertIn("command not found", done.stderr)
 
+    def test_the_windows_lookup_finds_a_bare_script_before_a_later_exe(self) -> None:
+        # Git Bash's own search: a fake `gh` (#!, no suffix) first on PATH wins over the real
+        # gh.exe further along it, which shutil.which (suffixes only) picked instead -- the run
+        # that reached the real CLI and its "gh auth login" (windows git bash run 37377447173).
+        with tempfile.TemporaryDirectory() as root:
+            fake, real, plain = (os.path.join(root, d) for d in ("fake", "real", "plain"))
+            for d in (fake, real, plain):
+                os.mkdir(d)
+            with open(os.path.join(fake, "gh"), "w", encoding="utf-8") as f:
+                f.write("#!/usr/bin/env bash\n")
+            with open(os.path.join(real, "gh.exe"), "wb") as f:
+                f.write(b"MZ")
+            with open(os.path.join(plain, "gh"), "w", encoding="utf-8") as f:
+                f.write("not a script\n")
+            env = {"PATH": os.pathsep.join([fake, real]), "PATHEXT": os.pathsep.join([".COM", ".EXE"])}
+            self.assertEqual(proc.windows_lookup("gh", env), os.path.join(fake, "gh"))
+            env["PATH"] = os.pathsep.join([plain, real])
+            self.assertEqual(proc.windows_lookup("gh", env), os.path.join(real, "gh.exe"))
+
+    def test_every_word_of_a_windows_command_line_is_quoted(self) -> None:
+        # Unquoted, Git Bash's runtime brace-expanded a space-free GraphQL query into two words.
+        self.assertEqual(
+            proc.windows_command_line(["gh", "query={a(b:1,c:2){id}}", 'q"t', "end\\"]),
+            '"gh" "query={a(b:1,c:2){id}}" "q\\"t" "end\\\\"',
+        )
+
     def test_substitution_drops_trailing_newlines_only(self) -> None:
         self.assertEqual(proc.substitution("\na\n\nb\n\n"), "\na\n\nb")
 
