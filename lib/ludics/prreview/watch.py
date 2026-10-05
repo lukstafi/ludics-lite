@@ -640,8 +640,10 @@ class Watch:
                     assert_never(tok)
 
             # The budget's pause: back to the interval after a round whose state moved, doubling
-            # toward the review cap while it does not.
-            key = tok
+            # toward the review cap while it does not. Moved is the token, the head or the state's
+            # detail -- never its age, which moves on every read (ludics-lite#551: a new head inside
+            # one token was read at the doubled pause).
+            key = "\t".join((tok, self.polled.head, state.detail))
             pause = budget_pause(interval, cap, last_pause, key != last_key)
             last_key = key
             last_pause = pause

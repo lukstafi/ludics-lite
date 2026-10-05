@@ -234,7 +234,10 @@ gh() {
       echo "gh: pull request unavailable (HTTP 500)" >&2
       return 1
     fi
-    response=$(jq -cn --arg h "$HEAD_SHA" --arg m "$MERGEABLE_STATE" --arg c "$PR_CREATED_AT" \
+    # The head per round when a case schedules one (`schedule head <round> <sha>`), else HEAD_SHA.
+    local head="$HEAD_SHA"
+    [ ! -e "$FEEDS/head.0" ] || head=$(feed_answer head)
+    response=$(jq -cn --arg h "$head" --arg m "$MERGEABLE_STATE" --arg c "$PR_CREATED_AT" \
       '{base:{ref:"main",sha:"stale-base-sha"}, head:{sha:$h}, mergeable_state:$m, created_at:$c}')
     ;;
   "repos/$REPO/commits/$H1" | "repos/$REPO/commits/$H2")
@@ -649,6 +652,27 @@ test_an_unmoving_window_backs_off_to_the_review_cap() (
   assert_eq "$([ "${last:-0}" -ge 1 ] && [ "$last" -le 30 ] && echo cut)" cut \
     "and the last is cut to the window's end (got '$last')"
   assert_eq "$(poll_rounds)" 7 "six reads in the window, the last at its end, and the settle"
+)
+
+# A new head is movement even when the state's token stays put (ludics-lite#551): the pause keys on
+# the head and the state's detail, without its age, and goes back to the interval. A subshell case
+# for its sleep, like the one above.
+test_a_new_head_in_one_state_resets_the_pause() (
+  sleep() {
+    printf '%s\n' "$1" >>"$TEST_ROOT/sleeps"
+    SECONDS=$((SECONDS + $1))
+    [ -z "${SHIP_PR_TEST_CLOCK:-}" ] ||
+      printf '%s\n' "$(($(cat "$SHIP_PR_TEST_CLOCK") + $1))" >"$SHIP_PR_TEST_CLOCK"
+  }
+  reset_fixture
+  : >"$TEST_ROOT/sleeps"
+  REVIEW_POLL_CAP=300
+  schedule head 0 "$H2"
+  schedule head 3 "$H1"
+  run_watch 0,0,0 90 900
+  assert_eq "$WATCH_RC" 1 "nothing about either head is a quiet window ($WATCH_ERR)"
+  assert_eq "$(sed -n 1,4p "$TEST_ROOT/sleeps" | tr '\n' ' ')" "90 180 90 180 " \
+    "the pause doubles while the head stands, and the new head's round is read at the interval"
 )
 
 # --- one final poll before any verdict ------------------------------------------------------------
@@ -2030,6 +2054,7 @@ tests=(
   test_the_round_label_costs_no_request
   test_the_round_span_is_the_whole_watch
   test_an_unmoving_window_backs_off_to_the_review_cap
+  test_a_new_head_in_one_state_resets_the_pause
   test_the_missing_environment_ends_the_wait_with_the_nudge
   test_the_connector_thread_reply_opens_no_round
   test_an_extension_holds_through_unknown_status
