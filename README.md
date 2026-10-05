@@ -1202,10 +1202,12 @@ standard-library-only Python 3.12 in one package, `lib/ludics/`, one script (and
 one subcommand) at a time behind unchanged command lines. Every Python entry point runs through
 `scripts/py`, which picks the first interpreter >= 3.12 (`scripts/test-py.sh`); a script's shell
 file stays the entry point and forwards to its module: `pr-review.sh` forwards the subcommands
-named in its `PY_PORTED` (today: `body`); `check-prompts.sh` forwards whole, to
-`ludics.checkprompts`, and `post-merge-cleanup.sh` its whole command line, to
-`ludics.postmergecleanup`. The shell suites above are the conformance suite for a
-port, unchanged. The package's own checks are `npx --yes pyright@1.1.414` (strict, `pythonVersion`
+named in its `PY_PORTED` (today: every one of them) to `ludics.prreview`; `fleet-worker.sh` the
+verbs its forwarder names (claim, release, coordinator, halt, resume-launches, halted, gate and
+every `execution` action but `slot --probe`) to `ludics.fleetworker`; `check-prompts.sh` forwards
+whole, to `ludics.checkprompts`, and `post-merge-cleanup.sh` its whole command line, to
+`ludics.postmergecleanup`. The shell suites above are the conformance suite for a port,
+unchanged. The package's own checks are `npx --yes pyright@1.1.414` (strict, `pythonVersion`
 3.12, from `pyrightconfig.json`) and `scripts/py -m unittest discover -s lib -t lib -p 'test_*.py'`,
 both run by CI's `python` job. Where a port's code goes, how forwarding and the suites' shell
 bridge work, and the rule for helpers shared across subcommands: `lib/ludics/README.md`.

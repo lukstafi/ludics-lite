@@ -1093,12 +1093,9 @@ review_comments() { # <pr> <review id>
 # --- poll ---------------------------------------------------------------------------------------
 # Served by Python since ludics-lite#403: lib/ludics/prreview/poll.py, whose module keeps the
 # comments that stood here (the commit each item is about, the fold of threads at one anchor, the
-# About-Codex fold, the items line, the per-feed watermark). A watch round still runs it here, in a
-# command substitution: when the round has armed its snapshot, the snapshot's path goes with the
-# call, and the Python writes this round's feeds and review cache into it in the format
-# state_comments, state_reviews and review_comments read (see "the round snapshot" above). Its
-# last gh error comes back the same way, through GH_ERR_FILE, which watch quotes through
-# $(gh_err_line) when a poll did not answer.
+# About-Codex fold, the items line, the per-feed watermark). `watch` is Python as well and polls in
+# process, so the snapshot and GH_ERR_FILE hand-over below served only the shell watch round this
+# file no longer runs; they are inert until the shell half of this file is retired.
 cmd_poll() {
   local err_file
   err_file=$(py_native_path "$GH_ERR_FILE")
@@ -2573,9 +2570,10 @@ merge_threads_gate() { # <pr>
     "${named#*|}. $(threads_advice)."
 }
 
-# Served by Python since ludics-lite#403 (lib/ludics/prreview/status.py and state.py).
-# status_state, status_line, gated_state and the thread reads above stay for `watch` and `merge`,
-# which are still shell.
+# Served by Python since ludics-lite#403 (lib/ludics/prreview/status.py). `watch` and `merge` are
+# Python too, so status_state, status_line, gated_state and the thread reads above no longer serve
+# any subcommand: they are the shell implementation the ports were made from, until the shell half
+# of this file is retired.
 cmd_status() { py_forward call status "$@"; }
 
 # `watch` — poll on a timer so a round's arrival wakes the caller instead of the caller re-deriving
