@@ -62,6 +62,7 @@ def clock_from_env(env: Mapping[str, str] | None = None) -> Clock:
     return FileClock(path) if path else SystemClock()
 
 
+# SHARED-CANDIDATE: age_of
 def age_of(timestamp: str, clock: Clock) -> int | None:
     """``age_of``: whole seconds since an ISO timestamp, or None ("-") when there is nothing to
     measure from -- empty, unparseable, or in the future. None is deliberately not 0."""
@@ -80,6 +81,7 @@ def age_text(age: int | None) -> str:
     return "-" if age is None else str(age)
 
 
+# SHARED-CANDIDATE: freshest_age
 def freshest_age(clock: Clock, *timestamps: str) -> int | None:
     """``freshest_age``: each clock validated on its own, then the smallest age."""
     best: int | None = None
@@ -92,6 +94,7 @@ def freshest_age(clock: Clock, *timestamps: str) -> int | None:
     return best
 
 
+# SHARED-CANDIDATE: fmt_age
 def fmt_age(age: int | None) -> str:
     """``fmt_age``: "20m" for 1203 seconds, "45s" under a minute."""
     if age is None:
@@ -99,6 +102,7 @@ def fmt_age(age: int | None) -> str:
     return f"{age // 60}m" if age >= 60 else f"{age}s"
 
 
+# SHARED-CANDIDATE: newest
 def newest(*timestamps: str) -> str:
     """``newest``: the greatest non-empty string (ISO UTC timestamps sort as strings)."""
     best = ""

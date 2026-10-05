@@ -4,7 +4,8 @@ Ported from ``cmd_watch``, ``watch_loop`` and their helpers (``watch_round``, ``
 ``watch_quiet_line``, ``watch_act``, ``watch_round_counts``/``_trailer``/``_note``,
 ``watch_settle``, ``watch_preserve_unarmed_nudge``, ``watch_end``, ``watch_grace_deadline``,
 ``watch_post_request``, ``item_about_head``, ``tmp_sweep_stale``). The shell's comments above each
-of them carry the incidents behind every rule kept here; read them there before changing one:
+of them carry the incidents behind every rule kept here -- they are pr-review.sh as of the port's
+parent commit (``git show 14f2ca7:ship-pr/scripts/pr-review.sh``); read them before changing one:
 
 - the wait ends only on reviewer activity ABOUT the head being watched (ludics-lite#72); items
   about another commit are printed for the record on stderr and the watermark moves past them;

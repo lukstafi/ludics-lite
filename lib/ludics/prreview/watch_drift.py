@@ -24,6 +24,7 @@ from ludics.prreview.watch_jq import JqError, as_list, idx, member, tojson, type
 _HUNK = re.compile(r"^@@ -(?P<s>[0-9]+)(,(?P<n>[0-9]+))? \+[0-9]+(,(?P<m>[0-9]+))? @@")
 
 
+# SHARED-CANDIDATE: encode_ref
 def encode_ref(ref: str) -> str:
     """``encode_ref``: every byte outside ``[a-zA-Z0-9._~/-]`` as ``%XX``."""
     return urllib.parse.quote(ref.encode("utf-8", "surrogateescape"), safe="._~/-")
@@ -73,6 +74,7 @@ def _ranges(entry: Json) -> list[Range] | None:
     return None
 
 
+# SHARED-CANDIDATE: compare_hunks
 def compare_hunks(doc: Json) -> dict[str, list[Range] | None]:
     """``compare_hunks``: each file's old-side hunk ranges, None where they cannot be read."""
     out: dict[str, list[Range] | None] = {}
@@ -88,6 +90,7 @@ class FileSet:
     paths: list[Json]
 
 
+# SHARED-CANDIDATE: compare_file_set
 def compare_file_set(doc: Json) -> FileSet | None:
     """``compare_file_set``: the count and the paths (old names included), or None when the files
     list is missing or holds an entry without a usable name."""

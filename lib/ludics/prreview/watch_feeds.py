@@ -53,6 +53,7 @@ class Head:
 
 
 @dataclass
+# SHARED-CANDIDATE: snapshot_arm snapshot_drop snapshot_off snapshot_put_feeds snapshot_put_head snapshot_has
 class Snapshot:
     armed: bool = False
     feeds_pr: str = ""
@@ -136,12 +137,14 @@ def feed(ctx: Ctx, path: str) -> list[Json]:
             assert_never(result)
 
 
+# SHARED-CANDIDATE: state_comments
 def state_comments(ctx: Ctx, pr: str) -> list[Json]:
     if ctx.snap.has_feeds(pr):
         return ctx.snap.comments
     return feed(ctx, f"issues/{pr}/comments?per_page=100")
 
 
+# SHARED-CANDIDATE: state_reviews
 def state_reviews(ctx: Ctx, pr: str) -> list[Json]:
     if ctx.snap.has_feeds(pr):
         return ctx.snap.reviews
@@ -166,6 +169,7 @@ def ifs_read(line: str, count: int, ifs: str = "\t") -> list[str]:
     return out
 
 
+# SHARED-CANDIDATE: pr_head_read
 def pr_head_read(ctx: Ctx, pr: str) -> Head:
     result = ctx.session.retry(
         "read",
@@ -191,6 +195,7 @@ def pr_head_read(ctx: Ctx, pr: str) -> Head:
             assert_never(result)
 
 
+# SHARED-CANDIDATE: state_head_read
 def state_head_read(ctx: Ctx, pr: str) -> Head:
     if ctx.snap.has_head(pr) and ctx.snap.head is not None:
         h = ctx.snap.head
@@ -198,6 +203,7 @@ def state_head_read(ctx: Ctx, pr: str) -> Head:
     return pr_head_read(ctx, pr)
 
 
+# SHARED-CANDIDATE: review_comments
 def review_comments(ctx: Ctx, pr: str, review_id: str) -> list[Json]:
     """A review's own comments endpoint, read at most once per round for a given review: only a
     read that answered is cached, so a failure is never served as a review with no findings."""

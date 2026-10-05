@@ -579,6 +579,7 @@ def _init_failure(comments: list[Json], rev: str) -> tuple[str, str, str]:
 # --- the rendering ----------------------------------------------------------------------------------
 
 
+# SHARED-CANDIDATE: conflict_note
 def conflict_note(merge: str, repo: str, pr: str) -> str:
     match merge:
         case "dirty":
@@ -609,6 +610,7 @@ def conflict_note(merge: str, repo: str, pr: str) -> str:
             return ""
 
 
+# SHARED-CANDIDATE: threads_advice
 def threads_advice(repo: str, pr: str) -> str:
     p = pr or "<pr>"
     return (
@@ -841,6 +843,7 @@ def _page_info(doc: dict[str, Json]) -> dict[str, Json]:
     return info if isinstance(info, dict) else {}
 
 
+# SHARED-CANDIDATE: threads_named
 def threads_named(rows: str) -> tuple[int, str]:
     """``threads_named``: the count, and the first ten named (the path shell-quoted)."""
     from ludics.prreview.watch_feeds import ifs_read

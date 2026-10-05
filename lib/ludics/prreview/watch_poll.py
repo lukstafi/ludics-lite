@@ -145,6 +145,7 @@ class Entry:
     thread_bodies: list[tuple[Json, Json]]
 
 
+# SHARED-CANDIDATE: POLL_ITEM_DEFS fold_inline
 def fold_inline(items: list[Json]) -> list[Entry]:
     """``fold_inline``: threads at one anchor (identical in every field but the deny-list) are one
     entry, in the order the first of them arrived."""
@@ -182,6 +183,7 @@ def dupe_note(entry: Entry) -> str:
     return f" ({n} threads at one location, {k} findings as written; one reply answers all)"
 
 
+# SHARED-CANDIDATE: POLL_ITEM_DEFS fold_codex_about
 def fold_codex_about(body: Json) -> str:
     """The connector's trailing "About Codex in GitHub" block, folded to one line when -- and only
     when -- it is exactly the allowlisted shape (see the shell's comment on ``fold_codex_about``)."""
