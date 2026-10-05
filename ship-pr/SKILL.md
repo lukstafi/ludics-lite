@@ -177,11 +177,10 @@ it always did.
 
 A tip whose own run is **in flight** over a window with no judged run reads **pending** — `NO
 VERDICT YET`, exit 4 — not "never judged": the run that will judge it is running (ludics-lite#308).
-A merge burst makes that window, and since neither repository's push CI cancels a running run, it
-also leaves runs at older merges going: one, with the tip's run pending behind it, where pushes share one
-group (OCANNL's `ci`, where a newer push replaces only a pending run, so a verdict covers a span of
-merges); several beside the tip's where each push has its own (this repository's `main`,
-ludics-lite#517). With `--interim` such a tip is green meanwhile when it is GitHub's clean merge of
+A merge burst makes that window, and where push CI does not cancel a running run, it also leaves
+runs at older merges going: one, with the tip's run pending behind it, where pushes share one group
+(a newer push replaces only a pending run, so a verdict covers a span of merges); several beside
+the tip's where each push has its own (this repository's `main`, ludics-lite#517). With `--interim` such a tip is green meanwhile when it is GitHub's clean merge of
 a PR whose head built that workflow green and no run at an older commit is still in flight (that
 run judges base changes the PR head may never have met); the verdict line says `green, interim`
 and names the PR. That is the wave gate's opt-in and the base watch's; it is never the tip's own verdict, so a
@@ -208,8 +207,7 @@ If the branch already has a PR, push to it and reuse it — never open a second 
 branch.
 
 Before **every** push that touches code, run the gates the repository's CI judges the head by:
-the formatter check if it has one — its AGENTS.md or CLAUDE.md names it (OCANNL:
-`tools/fmt-check.sh`) — and in this repository, the skills repo, `scripts/preflight.sh`, which *is* CI's `lint`
+the formatter check if it has one — its AGENTS.md or CLAUDE.md names it — and in this repository, the skills repo, `scripts/preflight.sh`, which *is* CI's `lint`
 job rather than a reconstruction of it (shell syntax, the mode bits, shellcheck at error
 severity, the PowerShell parse, the parse guard and the prompt, jq-shape and scratch-directory
 guards). A push that CI reds on a syntax error or a lost mode bit costs a CI round and, since
@@ -851,7 +849,7 @@ The other verdicts are not refusals, and none of them is a green light either:
 | exit | verdict | what it is |
 | --- | --- | --- |
 | 0 | green | every build check on the head passed |
-| 0 | absent | no build check ran on this commit, and the run list confirms none is coming — path filters (ocannl's `ci` ignores `docs/**`), or CI never started |
+| 0 | absent | no build check ran on this commit, and the run list confirms none is coming — path filters (a workflow that ignores `docs/**`), or CI never started |
 | 1 | RED | a build check concluded `failure`, or a workflow run for the head concluded red without producing one — refused |
 | 3 | unknown | the checks or the head's runs could not be read — refused |
 | 5 | superseded | the PR head moved from the observed SHA — refused; re-run to judge the successor |
@@ -962,9 +960,10 @@ tree, and "I tested it earlier" is the stale test claim of #745. It is not for "
 that is the day it exists to refuse.
 
 `cancelled` is deliberately neither red nor green — a cancel is a job that was stopped, not one
-that found something, and ocannl's `ci` sets `fail-fast: false` precisely so a red matrix leg does
-not cancel its siblings and destroy the information. A cancel here comes from a superseding push or
-a manual stop, and re-running is what turns it into an answer; it is exit 4 like a running job, and
+that found something. A matrix left at GitHub's default `fail-fast: true` cancels its siblings when
+one leg fails; that leg's failure is the red the gate reports (exit 1), and the cancelled siblings
+are the information `fail-fast: false` keeps. Any other cancel comes from a superseding push or a
+manual stop, and re-running is what turns it into an answer; it is exit 4 like a running job, and
 `--allow-no-verdict` is no more acceptable for it.
 
 `--require-green` is the opposite hatch: it makes `absent` a refusal too (exit 4), and so is a
@@ -1032,7 +1031,7 @@ and the PR's `pull_request` run already built `refs/pull/N/merge`, the head merg
 it stood then. A push that moves the head to a commit no run has built restarts the wait, a clean
 rebase included (until #496), which is why the head moves only for a conflict (below). What owns
 semantic drift instead is the wave coordinator's post-merge **integration loop** (issue-wave skill):
-the full `@runtest @train` suites on merged master, on a quiet, strong fleet machine, with
+the repository's full suite on merged master, on a quiet, strong fleet machine, with
 stop-the-world triage on a regression.
 
 **When a wave coordinator is actively running that integration loop**, the division is strict
@@ -1188,7 +1187,8 @@ cleanup removes it rather than refusing over it:
   --base main --regenerable _build
 ```
 
-The OCANNL notes pass `--regenerable _build`; `_opam` and `node_modules` are the same shape. The
+Which directories `--regenerable` names is the project's to say, in its AGENTS.md (OCANNL's
+names `_build`); `_opam` and `node_modules` are the same shape. The
 flag is repeatable and has no default, and the helper learns no build system from it — it names a
 class of paths, not a command to run inside a checkout it is about to judge. Each value must be
 ONE top-level directory of the SESSION worktree: a value carrying a separator — `/`, and `\` too,
