@@ -253,6 +253,20 @@ class Locks(Scratch):
         self.assertEqual(self.budget().lock_take(os.path.join(self.dir, "a-file", "lock")).rc, 2)
         self.assertEqual(self.clock.slept, [])
 
+    def test_an_owner_that_cannot_be_written_is_status_2_and_no_lock(self) -> None:
+        # A lock left ownerless is reaped by the next claimant a second later, while its taker
+        # still acts on it: the take fails instead, and gives the directory back.
+        lock = os.path.join(self.dir, "lock")
+        real_open = open
+
+        def refuse(path: str, *args: object, **kwargs: object) -> object:
+            if path == os.path.join(lock, "owner"):
+                raise OSError(28, "No space left on device")
+            return real_open(path, *args, **kwargs)  # type: ignore[call-overload]
+        with mock.patch("builtins.open", refuse):
+            self.assertEqual(self.budget().lock_take(lock).rc, 2)
+        self.assertFalse(os.path.exists(lock))
+
     def test_a_live_holder_is_named_and_a_dead_one_replaced(self) -> None:
         lock = os.path.join(self.dir, "lock")
         os.makedirs(lock)

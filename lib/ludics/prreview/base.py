@@ -218,6 +218,27 @@ def page_judged(rows: Sequence[RunRow]) -> bool:
     return any(r.status == "completed" and r.conclusion in _JUDGED for r in rows)
 
 
+def _deeper_stale(first: Sequence[RunRow], deeper: Sequence[RunRow]) -> list[str]:
+    """Where a workflow's hundred-deep page is OLDER than the page of ten read just before it: a
+    run of the first page that the deeper one lacks, reads at an earlier ``run_attempt``, or reads
+    unfinished or with another conclusion at the same attempt. Runs only accumulate, and a hundred
+    rows hold the newest ten, so a fresh deeper read has every one of them, as new or newer."""
+    by_id = {r.run_id: r for r in deeper}
+    stale: list[str] = []
+    for r in first:
+        d = by_id.get(r.run_id)
+        if d is None:
+            stale.append(f"run {r.run_id} on the page of ten is not on the deeper page")
+        elif d.attempt < r.attempt:
+            stale.append(f"run {r.run_id} reads at attempt {d.attempt} on the deeper page, {r.attempt}"
+                         " on the page of ten")
+        elif (d.attempt == r.attempt and r.status == "completed"
+              and (d.status != "completed" or d.conclusion != r.conclusion)):
+            stale.append(f"run {r.run_id} reads {d.status}/{d.conclusion} on the deeper page,"
+                         f" {r.status}/{r.conclusion} on the page of ten")
+    return stale
+
+
 def page_green(rows: Sequence[RunRow]) -> bool:
     """A row that judged the branch GREEN: what bounds a red streak from below. A full page without
     one is read deeper, a page that judged nothing included."""
@@ -1020,6 +1041,11 @@ class Wait:
         tip = ""
         while True:
             rnd = _Round()
+            # A round that waits a quota hold out between its reads is two moments, not one: what it
+            # read before the hold may have moved by its end. No verdict is taken from such a round;
+            # it is read again whole (``held_over``), as the checks gate does.
+            if budget is not None:
+                budget.waited = False
             # Re-read every round: a push during the wait moves the goal with it.
             tip = self.tip_read()
             if not tip and wait_for != 0:
@@ -1059,11 +1085,16 @@ class Wait:
                         self.last_tip = tip
                     continue
             if interim_green:
+                if self.held_over():
+                    interim_green = False
+                    continue
                 break
             if wait_for <= 0:
                 break
             # Only a red AT THE TIP ends the wait early, and only once the tip is confirmed.
             if rnd.red_at_tip > 0 and self.tip_read() == tip:
+                if self.held_over():
+                    continue
                 break
             now = b.clock.now()
             # The grace runs from the last time the tip MOVED; the first observation does not
@@ -1090,6 +1121,8 @@ class Wait:
                     if age is not None and age < grace:
                         hold = True
                 if not hold and self.tip_read() == tip:
+                    if self.held_over():
+                        continue
                     if rnd.norun > 0:
                         # Settled over a workflow's ABSENCE from the branch: its empty page is
                         # evidence the way an uncovered tip's is (ludics-lite#550).
@@ -1110,6 +1143,8 @@ class Wait:
                                   " none is in flight for it — the verdicts above may trail it)")
                 # The settle accepts verdicts about an OLDER commit: confirm the tip first.
                 if settle_why and self.tip_read() == tip:
+                    if self.held_over():
+                        continue
                     waited_note = settle_why
                     self.keep_pages(rnd, tip, settle_why)
                     break
@@ -1144,6 +1179,15 @@ class Wait:
             b.clock.sleep(min(sleep_for, remaining))
         return self.report(rnd, tip, waited_note, no_tip_verdict, interim_green)
 
+    def held_over(self) -> bool:
+        """Whether a read of this round waited a quota hold out (``Budget.waited``): its pages
+        are then older than its end, and the round is read again rather than settled on."""
+        budget = self.b.session.budget
+        if budget is None or not budget.waited:
+            return False
+        warn("a quota hold was waited out inside this round's reads; reading the round again")
+        return True
+
     def read_runs(self, rnd: _Round) -> list[RunRow]:
         """Each listed non-advisory workflow's push runs on the branch, a page of ten, each ordered
         newest first. A full page with no GREEN row is read a hundred deep: one that judged nothing
@@ -1160,7 +1204,13 @@ class Wait:
                      f"({b.err_line()}); the base's health is UNKNOWN, which is NOT 'green'.")
             if len(rows) >= 10 and not page_green(rows):
                 deeper = b.runs_page(wid, self.ebranch, 100, rnd.pages)
-                if deeper is not None:
+                stale = _deeper_stale(rows, deeper) if deeper is not None else []
+                if stale:
+                    # The deeper read is a second moment, and it can be the staler one: a run the
+                    # first page holds is missing from it, or reads there at an earlier attempt or
+                    # unfinished. Keep the first page's verdicts and settle nothing on this round.
+                    rnd.inconsistent.extend(f"{wname}'s {why}" for why in stale)
+                elif deeper is not None:
                     rows = deeper
                 elif not page_judged(rows):
                     fail(3, f"could not read {repo}'s '{wname}' runs on {branch} past its newest ten,",

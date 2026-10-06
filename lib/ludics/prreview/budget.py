@@ -574,7 +574,7 @@ class Budget:
         """``lock_take <dir>``: a lock is a directory holding ``owner``. A holder that no longer runs
         is replaced, and so is a directory still ownerless a second after it was first seen: its
         claimant died between the mkdir and the write. A mkdir that failed with no directory there,
-        or a lock five reaps could not clear, is status 2."""
+        a lock five reaps could not clear, or an owner that could not be written, is status 2."""
         seen = False
         tries = 0
         while True:
@@ -604,7 +604,11 @@ class Budget:
             with open(os.path.join(directory, "owner"), "w", encoding="utf-8", newline="\n") as f:
                 f.write(f"{self.pid}\n{self.clock.now()}\n")
         except OSError:
-            pass
+            # An ownerless lock is reaped by the next claimant a second later, while this process
+            # still acts on it: not a lock at all. Give the directory back and say it cannot be
+            # taken (the shell's lock_take returned its printf's failure here).
+            shutil.rmtree(directory, ignore_errors=True)
+            return Lock(2)
         return Lock(0)
 
     def lock_reap(self, directory: str, judged: str) -> None:

@@ -17,11 +17,11 @@ on:
     paths:
       - ship-pr/scripts/pr-review-api-contract.sh
       - ship-pr/scripts/pr-review.sh # sourced by the contract, for its jq
-      # The gate's own words the contract asks of the Python (its branch encoder, its threads query,
-      # its summary-row patterns): a change to them is a change to the contract.
-      - lib/ludics/prreview/shtext.py
-      - lib/ludics/prreview/threads.py
-      - lib/ludics/prreview/state.py
+      # The gate is the Python package now: the contract asks it for its own words (its branch
+      # encoder, its threads query, its summary-row patterns), and every reader in it (base.py,
+      # gate.py, checkruns.py, feeds.py, ...) rests on the feed shapes the contract pins, so a
+      # change anywhere in it is a change the contract judges.
+      - lib/ludics/prreview/**
       - scripts/py
       - .github/workflows/api-contract.yml
 

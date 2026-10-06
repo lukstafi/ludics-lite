@@ -472,6 +472,61 @@ class WaitLoop(unittest.TestCase):
         self.assertEqual(rc, 4, out)
         self.assertIn(f"ci's run 9 at {B[:8]} reads at attempt 1, where an earlier round read attempt 2", out)
 
+    def test_a_deeper_page_staler_than_the_page_of_ten_keeps_the_ten(self) -> None:
+        """A full page of ten with no green row is read a hundred deep. When the deeper read is
+        the staler one (the tip's red run missing from it, an older green below), the page of ten
+        stands: its red is not traded for the green, and the round says it is a stale read."""
+        red: list[dict[str, object]] = [{"conclusion": "failure", "head_sha": C if i == 0 else A}
+                                        for i in range(10)]
+        older: list[dict[str, object]] = [{"conclusion": "failure", "head_sha": A} for _ in range(11)]
+        ten = runs(*red)
+        deeper = json.loads(runs(*older, {"conclusion": "success", "head_sha": B}))
+        for row in deeper["workflow_runs"]:
+            row["id"] += 1
+        answers = world(C, ten, **{
+            "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=100": json.dumps(deeper)})
+        rc, out, _, _ = base_run(answers, ["main"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"RED      ci — failure at {C[:8]}", out)
+        self.assertIn("ci's run 1000 on the page of ten is not on the deeper page", out)
+        # A deeper page holding every run of the ten reads as before: deeper.
+        fresh = json.loads(ten)
+        fresh["workflow_runs"] += deeper["workflow_runs"][10:]
+        answers["repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=100"] = json.dumps(fresh)
+        rc, out, _, _ = base_run(answers, ["main"])
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("deeper page", out)
+
+    def test_a_round_that_waited_a_quota_hold_out_is_read_again(self) -> None:
+        """A quota hold waited out between a round's reads makes its pages older than its end: a
+        red read before the hold, re-run green during it, is not the verdict. The round is read
+        again whole, as the checks gate reads its own."""
+        state = os.path.realpath(tempfile.mkdtemp(prefix="ludics-base-state."))
+        self.addCleanup(shutil.rmtree, state, True)
+        page = "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"
+        answers = world(C, "")
+        answers[page] = [runs({"conclusion": "failure", "head_sha": C, "id": 9, "run_attempt": 1}),
+                         runs({"conclusion": "success", "head_sha": C, "id": 9, "run_attempt": 2})]
+        gh = Endpoints(answers)
+        clock = FakeClock()
+        budget = Budget(state, _AsClock(clock))
+
+        def run(name: str, args: Sequence[str]) -> proc.Completed:
+            done = gh(name, args)
+            if page in args and gh.asked.count(page) == 1:
+                budget.waited = True  # the hold this read waited out
+            return done
+        session = GhSession(config(), run=run, sleep=lambda _s: None, budget=budget)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli.main_guard("pr-review.sh", lambda a: base.run(session, a, clock=clock, env=dict(KNOBS)),
+                                ["main", "--wait=900"])
+        self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+        self.assertEqual(out.getvalue(), f"o/r main: green (tip {C[:8]})\n  green    ci — success at {C[:8]}\n")
+        self.assertIn("a quota hold was waited out inside this round's reads; reading the round again",
+                      err.getvalue())
+        self.assertEqual(gh.asked.count(page), 2)
+
     def test_a_settle_on_absence_keeps_its_pages_and_only_the_newest(self) -> None:
         state = os.path.realpath(tempfile.mkdtemp(prefix="ludics-base-state."))
         self.addCleanup(shutil.rmtree, state, True)
