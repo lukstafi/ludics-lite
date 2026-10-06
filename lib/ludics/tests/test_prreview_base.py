@@ -378,6 +378,54 @@ class WaitLoop(unittest.TestCase):
         rc, out, _, _ = base_run(answers, ["main", "--wait=200"], knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
         self.assertNotIn("contradicts", out)
 
+    def test_a_tip_run_gone_from_the_page_alone_contradicts_it(self) -> None:
+        """ludics-lite#550, the tip-run half on its own: round two's page drops only the tip's run
+        in flight while its newest judged run stays the same, so only the lost run tells the stale
+        page apart. Settled on, round two would be an absence green trailing the tip."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+        fly = at(C, 9, "2026-10-05T10:30:00Z", status="in_progress", conclusion=None)
+        prev = at(B, 8, "2026-10-05T10:00:00Z")
+        answers = world(C, "", **{
+            f"repos/o/r/compare/{B}...{C}?per_page=20": json.dumps(
+                {"total_commits": 1, "behind_by": 0, "commits": [{"sha": C, "parents": [{"sha": B}]}]}),
+            f"repos/o/r/commits/{C}?per_page=100": json.dumps({"files": [{"filename": "src/x.ml"}]})})
+        answers["repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"] = [
+            runs(fly, prev), runs(prev), runs(at(C, 9, "2026-10-05T10:30:00Z"), prev)]
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock,
+                                 knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out, f"o/r main: green (tip {C[:8]})\n  green    ci — success at {C[:8]}\n")
+        self.assertEqual(len(clock.slept), 2, "three rounds")
+
+    def test_a_page_with_no_judged_run_where_one_was_contradicts_it(self) -> None:
+        """ludics-lite#550, the empty half: a second workflow's page comes back empty after a round
+        that judged on it. Settled on as that workflow's absence, it would be a green that never
+        names it; its run in flight is a red."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+
+        def lint(*items: dict[str, object]) -> str:
+            return runs(*[dict(i, workflow_id=2, name="lint") for i in items])
+        answers = world(C, runs(at(C, 20, "2026-10-05T11:00:00Z")), **{
+            "repos/o/r/actions/workflows?per_page=100": json.dumps(
+                {"workflows": [{"id": 1, "name": "ci"}, {"id": 2, "name": "lint"}]}),
+            "repos/o/r/actions/workflows/2": json.dumps({"path": ".github/workflows/lint.yml"}),
+            f"repos/o/r/contents/.github/workflows/lint.yml?ref={C}": DOCS_IGNORED.replace(
+                "name: ci", "name: lint")})
+        answers["repos/o/r/actions/workflows/2/runs?branch=main&event=push&per_page=10"] = [
+            lint(at(B, 9, "2026-10-05T10:30:00Z", status="queued", conclusion=None),
+                 at(A, 8, "2026-10-05T10:00:00Z")),
+            lint(),
+            lint(at(B, 9, "2026-10-05T10:30:00Z", conclusion="failure"), at(A, 8, "2026-10-05T10:00:00Z"))]
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock,
+                                 knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"RED      lint — failure at {B[:8]}", out)
+        self.assertEqual(len(clock.slept), 2, "three rounds")
+
     def test_a_settle_on_absence_keeps_its_pages_and_only_the_newest(self) -> None:
         state = os.path.realpath(tempfile.mkdtemp(prefix="ludics-base-state."))
         self.addCleanup(shutil.rmtree, state, True)
