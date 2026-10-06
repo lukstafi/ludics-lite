@@ -3857,58 +3857,66 @@ test_session_registration_locked_against_prune() {
   echo "PASS: session registration stays locked against pruning through unregistering"
 }
 
+# The session archive is allocated beside the session before anything changes, so a parent that
+# cannot hold it refuses the cleanup up front. Driven from outside: the session's parent is made
+# unwritable, which is what an unavailable archive location is. An account that can create
+# entries in a directory without write permission anyway (root, or Git Bash, where a directory's
+# mode bit does not keep anyone out) cannot express it, and the case states that boundary.
 test_archive_preflight_refusal() {
-  local fake_bin local_master real_mktemp
+  local local_master refusal rc=0
   setup_case archive-preflight-refusal merge main-off
   local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
-  fake_bin="$TEST_ROOT/archive-preflight-bin"
-  real_mktemp=$(command -v mktemp)
-  mkdir -p "$fake_bin"
-  printf '%s\n' \
-    '#!/usr/bin/env bash' \
-    'case "$*" in' \
-    '*.session.ship-pr-recovery.*) exit 1 ;;' \
-    'esac' \
-    'exec "$REAL_MKTEMP" "$@"' >"$fake_bin/mktemp"
-  chmod +x "$fake_bin/mktemp"
-
-  if PATH="$fake_bin:$PATH" REAL_MKTEMP="$real_mktemp" \
-    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
-    fail "unavailable session archive was discovered only after destructive cleanup"
+  chmod a-w "$CASE_ROOT"
+  if mkdir "$CASE_ROOT/.write-probe" 2>/dev/null; then
+    rmdir "$CASE_ROOT/.write-probe"
+    chmod u+w "$CASE_ROOT"
+    skip_boundary "an unwritable directory: this account creates entries in a directory without write permission (root, or a platform whose directories do not keep the mode bit)"
+    return 0
   fi
+  refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1) || rc=$?
+  chmod u+w "$CASE_ROOT"
+  [ "$rc" -ne 0 ] || fail "unavailable session archive was discovered only after destructive cleanup"
+  case "$refusal" in
+  *"could not allocate a session recovery archive beside $CASE_SESSION"*) ;;
+  *) fail "the refusal was not the archive preflight: $refusal" ;;
+  esac
   assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
     "archive preflight failure must precede the local master update"
   assert_topic_preserved
   echo "PASS: session archive availability is preflighted before mutation"
 }
 
+# A target created at the archive path between allocation and the rename must not have the session
+# nested inside it: the rename is rename(2), which refuses a nonempty target. A fake git creates
+# the target at the helper's last Git call before the rename -- its second ancestry proof, against
+# the updated local base -- which is the latest moment a writer can win from outside.
 test_precreated_archive_target_refusal() {
-  local attacked_target fake_bin real_perl
+  local attacked_target fake_bin real_git
   setup_case precreated-archive-target merge main-off
   fake_bin="$TEST_ROOT/precreated-archive-target-bin"
-  real_perl=$(command -v perl)
+  real_git=$(command -v git)
   mkdir -p "$fake_bin"
   printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'target=""' \
-    'for arg in "$@"; do target=$arg; done' \
-    'case "$target" in' \
-    '*.session.ship-pr-recovery.*/worktree)' \
-    '  if [ ! -e "$TARGET_MARKER" ]; then' \
-    '    mkdir -p "$target"' \
-    '    echo attacker >"$target/blocker"' \
-    '    printf "%s\n" "$target" >"$TARGET_MARKER"' \
-    '  fi' \
-    '  ;;' \
-    'esac' \
-    'exec "$REAL_PERL" "$@"' >"$fake_bin/perl"
-  chmod +x "$fake_bin/perl"
+    'if [ "$#" -eq 6 ] && [ "$1" = -C ] && [ "$2" = "$RACE_MAIN" ] && [ "$3" = merge-base ] &&' \
+    '  [ "$4" = --is-ancestor ] && [ "$5" = refs/heads/topic ] && [ "$6" = refs/heads/master ] &&' \
+    '  [ ! -e "$TARGET_MARKER" ]; then' \
+    '  for archive in "$RACE_ROOT"/.session.ship-pr-recovery.*; do' \
+    '    [ -d "$archive" ] || continue' \
+    '    mkdir -p "$archive/worktree"' \
+    '    echo attacker >"$archive/worktree/blocker"' \
+    '    printf "%s\n" "$archive/worktree" >"$TARGET_MARKER"' \
+    '  done' \
+    'fi' \
+    'exec "$REAL_GIT" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
 
-  if PATH="$fake_bin:$PATH" REAL_PERL="$real_perl" \
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" RACE_MAIN="$CASE_MAIN" RACE_ROOT="$CASE_ROOT" \
     TARGET_MARKER="$TEST_ROOT/precreated-archive-target.path" \
     "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>&1; then
     fail "session archive nested into a precreated target"
   fi
+  [ -f "$TEST_ROOT/precreated-archive-target.path" ] || fail "the fixture never precreated the archive target"
   attacked_target=$(cat "$TEST_ROOT/precreated-archive-target.path")
   [ -f "$attacked_target/blocker" ] || fail "precreated archive target was overwritten"
   [ -d "$CASE_SESSION" ] || fail "failed atomic archive moved the original session"
@@ -4529,6 +4537,39 @@ test_session_tmpdir_refusal() {
   echo "PASS: temporary roots inside the session are refused before mutation"
 }
 
+# An unusable TMPDIR refuses at the helper's first allocation in it, the worktree-list snapshot,
+# which comes before the base fetch and before any reservation: the shell helper's order, which the
+# port keeps by still allocating (and removing) that snapshot file.
+test_unwritable_tmpdir_refusal() {
+  local tmp tracking refusal rc=0
+  setup_case unwritable-tmpdir merge main-off
+  tmp="$CASE_ROOT/unwritable-tmp"
+  mkdir "$tmp"
+  tracking=$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)
+  [ "$tracking" != "$(git -C "$CASE_REMOTE" rev-parse refs/heads/master)" ] ||
+    fail "the fixture's tracking ref is already the remote tip, so an early fetch would go unseen"
+  chmod a-w "$tmp"
+  if mkdir "$tmp/.write-probe" 2>/dev/null; then
+    rmdir "$tmp/.write-probe"
+    chmod u+w "$tmp"
+    skip_boundary "an unwritable directory: this account creates entries in a directory without write permission (root, or a platform whose directories do not keep the mode bit)"
+    return 0
+  fi
+  refusal=$(TMPDIR="$tmp" "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1) || rc=$?
+  chmod u+w "$tmp"
+  assert_eq "$rc" 1 "an unwritable TMPDIR is an environment refusal"
+  case "$refusal" in
+  *"could not allocate the worktree list snapshot"*) ;;
+  *) fail "the refusal was not the first temporary allocation: $refusal" ;;
+  esac
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/remotes/origin/master)" "$tracking" \
+    "an unwritable TMPDIR must refuse before the base fetch"
+  assert_eq "$(git -C "$CASE_MAIN" for-each-ref refs/ship-pr)" "" \
+    "an unwritable TMPDIR must refuse before any reservation"
+  assert_topic_preserved
+  echo "PASS: an unwritable TMPDIR refuses at the first allocation, before the fetch"
+}
+
 test_config_lock_refusal() {
   setup_case config-lock merge main-off
   : >"$CASE_MAIN/.git/config.lock"
@@ -4749,6 +4790,227 @@ test_merge_options_cleanup() {
   echo "PASS: standard branch mergeOptions configuration is removed"
 }
 
+# --- cases pinned from the helper's fix history (ludics-lite#403) ------------------------------
+# The v2 rewrite ports this helper to Python behind its command line. Each case below pins, from
+# outside, a lesson a past round encoded in the helper's code that no case above asserted, so the
+# port cannot drop it quietly.
+
+# The option table (ludics-lite#332, after #302's `--force-integrated` listed bare over a valued
+# arm): one declaration drives the printed listing and the parser, and check-prompts reads the
+# PRINTED listing. So the text is pinned verbatim, every usage error is exit 2 with that text and
+# nothing on stdout, an option is matched in exactly its listed spelling, a valued option's value
+# may not be missing or empty, and the last occurrence wins. A usage error touches no repository.
+test_usage_and_option_errors() {
+  local expected local_master out rc
+  setup_case usage-and-option-errors merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  expected=$(cat <<'USAGE_TEXT'
+usage: post-merge-cleanup.sh <main-checkout> <session-worktree> <branch> [options]
+
+Options:
+  --base <branch>       Base branch to refresh and verify (default: master)
+  --force-integrated <reason>
+                        Why this squash/rebase merge is confirmed
+  --regenerable <name>  A top-level directory of the session worktree that cleanup may
+                        REMOVE rather than refuse over or archive, such as a build tree.
+                        Repeatable, no default; the name must be one untracked directory
+                        of the worktree root and is never followed through a symlink.
+
+The ordinary path requires the topic branch to be an ancestor of origin/<base>. Use
+--force-integrated only after independently confirming a squash or rebase merge; its
+non-empty reason is printed in the cleanup record.
+USAGE_TEXT
+)
+  # usage_error <description> <args...>: exit 2, the usage text on stderr, nothing on stdout.
+  usage_error() {
+    local what="$1" err="$CASE_ROOT/usage.err" stdout
+    shift
+    rc=0
+    stdout=$("$HELPER" "$@" 2>"$err") || rc=$?
+    assert_eq "$rc" 2 "$what must be a usage error"
+    assert_eq "$stdout" "" "$what must print nothing on stdout"
+    assert_eq "$(cat "$err")" "$expected" "$what must print the usage text"
+  }
+  usage_error "no arguments"
+  usage_error "one argument" "$CASE_MAIN"
+  usage_error "two arguments" "$CASE_MAIN" "$CASE_SESSION"
+  usage_error "an unknown option" "$CASE_MAIN" "$CASE_SESSION" topic --keep-branch
+  usage_error "an option in another spelling" "$CASE_MAIN" "$CASE_SESSION" topic --base=master
+  usage_error "a stray positional argument" "$CASE_MAIN" "$CASE_SESSION" topic extra
+  usage_error "--base without a value" "$CASE_MAIN" "$CASE_SESSION" topic --base
+  usage_error "an empty --base" "$CASE_MAIN" "$CASE_SESSION" topic --base ''
+  usage_error "--force-integrated without a value" "$CASE_MAIN" "$CASE_SESSION" topic --force-integrated
+  usage_error "an empty --force-integrated" "$CASE_MAIN" "$CASE_SESSION" topic --force-integrated ''
+  # A valued option takes the next word whatever it looks like (#302): here an option-shaped
+  # reason, after which the stray word is what refuses.
+  usage_error "a word after a consumed option-shaped value" \
+    "$CASE_MAIN" "$CASE_SESSION" topic --force-integrated --base stray
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "a usage error must not advance the base"
+  assert_topic_preserved
+
+  # The last occurrence of a valued option wins: a base that does not exist, then the real one.
+  out=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic --base no-such-base --base master)
+  assert_cleaned
+  case "$out" in
+  "post-merge-cleanup.sh: cleaned topic and unregistered "*) ;;
+  *) fail "the last --base did not win: $out" ;;
+  esac
+  echo "PASS: usage text, usage errors (exit 2, no repository touched), last occurrence wins"
+}
+
+# What a successful run reports, which the skill reads: one stdout line naming the session, its
+# archive and both recovery refs; the --force-integrated reason on stderr as the cleanup record
+# (the usage text promises it); and, for an already-absent remote topic, that no deletion was sent.
+test_success_reports_its_record() {
+  local err out
+  setup_case success-record squash main-off
+  err="$CASE_ROOT/success.err"
+  out=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic \
+    --force-integrated "confirmed squash merge" 2>"$err")
+  assert_cleaned
+  assert_eq "$out" "post-merge-cleanup.sh: cleaned topic and unregistered $CASE_SESSION; session archived at $CASE_ARCHIVE/worktree; recovery retained at refs/ship-pr/recovery/topic/$CASE_TOPIC_OID and refs/ship-pr/session-recovery/topic/$CASE_TOPIC_OID" \
+    "the success line must name the session, its archive and both recovery refs"
+  grep -Fx "post-merge-cleanup.sh: FORCE-INTEGRATED override: confirmed squash merge" "$err" >/dev/null ||
+    fail "the --force-integrated reason was not recorded on stderr: $(cat "$err")"
+
+  setup_case success-record-absent-remote merge main-off
+  git -C "$CASE_MAIN" push --no-verify origin :refs/heads/topic >/dev/null 2>&1
+  err="$CASE_ROOT/success.err"
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null 2>"$err"
+  assert_cleaned
+  grep -Fx "post-merge-cleanup.sh: origin/topic was already absent (no deletion sent)" "$err" >/dev/null ||
+    fail "an already-absent remote topic was not reported: $(cat "$err")"
+  ! grep -F "FORCE-INTEGRATED" "$err" >/dev/null || fail "an ordinary cleanup claimed an override"
+  echo "PASS: a successful cleanup reports its record"
+}
+
+# Review round 2 of #287: the finishing command a refusal prints names the validated push URL with
+# any http(s) userinfo removed, so no credential reaches the diagnostic, and the endpoint stays the
+# one the helper validated rather than the remote's name. The fixture's origin is an https URL
+# with a password; a fake git rewrites it to the case's bare repository through `insteadOf` for
+# every call but `remote get-url`, which expands `insteadOf` itself and would otherwise report
+# the local path. The pre-push hook refuses, which is the refusal that prints the command.
+test_finish_command_strips_url_credentials() {
+  local cred_url fake_bin finish hook log real_git
+  setup_case finish-url-credentials merge main-off
+  cred_url="https://ship-pr:s3cret@example.invalid/remote.git"
+  git -C "$CASE_MAIN" remote set-url origin "$cred_url"
+  real_git=$(command -v git)
+  fake_bin="$CASE_ROOT/bin"
+  log="$CASE_ROOT/cleanup.log"
+  mkdir -p "$fake_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case " $* " in' \
+    '*" remote get-url "*) exec "$REAL_GIT" "$@" ;;' \
+    'esac' \
+    'exec "$REAL_GIT" -c "url.$CRED_REMOTE.insteadOf=$CRED_URL" "$@"' >"$fake_bin/git"
+  chmod +x "$fake_bin/git"
+  hook="$CASE_MAIN/.git/hooks/pre-push"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$hook"
+  chmod +x "$hook"
+
+  if PATH="$fake_bin:$PATH" REAL_GIT="$real_git" CRED_REMOTE="$CASE_REMOTE" CRED_URL="$cred_url" \
+    "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >"$log" 2>&1; then
+    fail "a refused remote deletion was reported as a cleanup"
+  fi
+  grep "was refused while it was still at the validated tip $CASE_TOPIC_OID" "$log" >/dev/null ||
+    { cat "$log" >&2; fail "the refusal was not the refused leased deletion"; }
+  finish=$(sed -n 's/.*, finish with: //p' "$log")
+  assert_eq "$finish" "git -C $(printf '%q' "$CASE_MAIN") push --force-with-lease=refs/heads/topic:$CASE_TOPIC_OID https://example.invalid/remote.git :refs/heads/topic" \
+    "the finishing command must name the push URL without its userinfo"
+  ! grep -F "s3cret" "$log" >/dev/null || { cat "$log" >&2; fail "a credential reached the diagnostics"; }
+  echo "PASS: the finishing command strips http(s) userinfo from the validated push URL"
+}
+
+# Review rounds 2 and 7: the branch read and its deletion go through ONE push endpoint, so an
+# origin with several push URLs is refused as ambiguous before anything changes.
+test_multiple_push_endpoints_refusal() {
+  local local_master refusal second
+  setup_case multiple-push-endpoints merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  second="$CASE_ROOT/second.git"
+  git clone --bare "$CASE_REMOTE" "$second" >/dev/null 2>&1
+  git -C "$CASE_MAIN" remote set-url --add --push origin "$CASE_REMOTE"
+  git -C "$CASE_MAIN" remote set-url --add --push origin "$second"
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "an origin with two push endpoints was accepted"
+  fi
+  case "$refusal" in
+  *"origin has multiple push endpoints; refusing ambiguous branch deletion"*) ;;
+  *) fail "the ambiguous push endpoints were not named: $refusal" ;;
+  esac
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "the endpoint refusal must precede the base fast-forward"
+  assert_topic_preserved
+  echo "PASS: several push endpoints are refused as ambiguous"
+}
+
+# The identity checks the first rounds added, each refused before anything changes: the branch
+# name's syntax, the base branch itself, a branch that does not exist, a session attached to
+# another branch or detached off the tip, and the two checkout arguments' shapes (round 3's
+# worktree root, round 1's canonical paths, the primary-checkout and same-repository rules).
+test_identity_refusals() {
+  local local_master refusal
+  setup_case identity-refusals merge main-off
+  local_master=$(git -C "$CASE_MAIN" rev-parse refs/heads/master)
+  git -C "$CASE_MAIN" branch other refs/heads/topic
+  # refused <expected text> <args...>: the helper refuses with exit 1 and names the problem.
+  identity_refused() {
+    local expected="$1" rc=0
+    shift
+    refusal=$("$HELPER" "$@" 2>&1) || rc=$?
+    assert_eq "$rc" 1 "a refusal ($expected) must exit 1"
+    case "$refusal" in
+    *"$expected"*) ;;
+    *) fail "the refusal did not say '$expected': $refusal" ;;
+    esac
+  }
+  identity_refused "invalid branch name: bad..name" "$CASE_MAIN" "$CASE_SESSION" bad..name
+  identity_refused "refusing to clean up the base branch master" "$CASE_MAIN" "$CASE_SESSION" master
+  identity_refused "local branch does not exist: absent" "$CASE_MAIN" "$CASE_SESSION" absent
+  identity_refused "session worktree owns topic, not other" "$CASE_MAIN" "$CASE_SESSION" other
+  identity_refused "main checkout is not a git worktree: $CASE_ROOT" "$CASE_ROOT" "$CASE_SESSION" topic
+  identity_refused "session path is not a git worktree: $CASE_ROOT" "$CASE_MAIN" "$CASE_ROOT" topic
+  identity_refused "main-checkout is a linked worktree, not the primary checkout: $CASE_SESSION" \
+    "$CASE_SESSION" "$CASE_MAIN" topic
+  identity_refused "main checkout and session worktree must be different paths" "$CASE_MAIN" "$CASE_MAIN" topic
+  identity_refused "main checkout and session worktree belong to different repositories" \
+    "$CASE_MAIN" "$CASE_INTEGRATOR" topic
+  git -C "$CASE_SESSION" checkout --quiet --detach HEAD~1
+  identity_refused "detached session HEAD is not the tip of topic" "$CASE_MAIN" "$CASE_SESSION" topic
+  git -C "$CASE_SESSION" checkout --quiet topic
+  git -C "$CASE_MAIN" branch -D other >/dev/null
+  assert_eq "$(git -C "$CASE_MAIN" rev-parse refs/heads/master)" "$local_master" \
+    "an identity refusal must precede the base fast-forward"
+  assert_topic_preserved
+  echo "PASS: identity refusals precede every mutation"
+}
+
+# Round 11 retains the validated tip under refs/ship-pr/recovery/<branch>/<oid>. A retry after an
+# interrupted cleanup finds that ref already there and accepts it; a ref of that name pointing
+# anywhere else is refused, before the topic is touched.
+test_preexisting_recovery_ref() {
+  local refusal
+  setup_case preexisting-recovery-ref merge main-off
+  git -C "$CASE_MAIN" update-ref "refs/ship-pr/recovery/topic/$CASE_TOPIC_OID" "$CASE_TOPIC_OID"
+  "$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic >/dev/null
+  assert_cleaned
+
+  setup_case unexpected-recovery-ref merge main-off
+  git -C "$CASE_MAIN" update-ref "refs/ship-pr/recovery/topic/$CASE_TOPIC_OID" refs/heads/master
+  if refusal=$("$HELPER" "$CASE_MAIN" "$CASE_SESSION" topic 2>&1); then
+    fail "a recovery ref pointing at another object was accepted"
+  fi
+  case "$refusal" in
+  *"recovery ref points at an unexpected object: refs/ship-pr/recovery/topic/$CASE_TOPIC_OID"*) ;;
+  *) fail "the unexpected recovery ref was not named: $refusal" ;;
+  esac
+  assert_topic_preserved
+  echo "PASS: an existing recovery ref is reused at the validated tip and refused elsewhere"
+}
+
 # --- runner self-cases (ludics-lite#9) -------------------------------------------------------
 # The runner's own behaviors used to be verified by hand from patched scratch copies, repeated by
 # nothing in CI. These point the runner at itself: a scratch COPY of this script and the helper,
@@ -4768,9 +5030,21 @@ SELF_CASE_TIMEOUT=60
 
 # copy_runner <dir> <root-tag>: a scratch copy of the runner and the helper, its scratch root
 # template renamed so the copy's tree can be told from this run's and asserted gone afterwards.
+# <dir> is the copy's `ship-pr/scripts` (COPY_DIR below): the helper is the command line, and what
+# serves it may live elsewhere in the checkout -- since the v2 rewrite (ludics-lite#403) the helper
+# is a forwarder to `scripts/py` and the package under `lib/` -- so the copy sits in a mirror of the
+# checkout's layout, with copies of both beside it. Copies, not links: a rewrite of a copy must
+# never reach this checkout's files, and Git Bash makes a directory link only with privileges.
+COPY_DIR=copy/ship-pr/scripts
 copy_runner() {
-  local dir="$1" tag="$2"
+  local dir="$1" tag="$2" mirror checkout
   mkdir -p "$dir"
+  mirror=$(CDPATH= cd "$dir/../.." && pwd -P) || fail "could not resolve the copy's checkout mirror"
+  checkout=$(CDPATH= cd "$SCRIPT_DIR/../.." && pwd -P) || fail "could not resolve this checkout"
+  rm -rf "$mirror/scripts" "$mirror/lib"
+  mkdir -p "$mirror/scripts"
+  cp "$checkout/scripts/py" "$mirror/scripts/py" || fail "could not copy scripts/py into the mirror"
+  cp -R "$checkout/lib" "$mirror/lib" || fail "could not copy lib/ into the mirror"
   sed "s|/tmp/post-merge-cleanup-test\.XXXXXX|/tmp/post-merge-cleanup-test.$tag.XXXXXX|" "$RUNNER" \
     >"$dir/test-post-merge-cleanup.sh"
   grep -q "post-merge-cleanup-test\.$tag\.XXXXXX" "$dir/test-post-merge-cleanup.sh" ||
@@ -4803,12 +5077,17 @@ assert_copy_root_gone() {
 # group before running never looks. Unguarded, the same rewrite with plain comment padding once
 # resumed at a harmless spot and reprinted a case's PASS line, so the landing is aimed, not left
 # to where the shift happens to fall.
+#
+# rewrite_in_place <file> [<anchor line>]: the resume point is the byte after the last line that
+# is exactly <anchor line>, `done` by default. The helper's copy is aimed at its guard's own
+# `exit "$?"`, which every guarded file carries: what the helper's body holds -- a whole cleanup in
+# shell, or a forwarder of a few lines -- is not this case's business, only that bash read it whole.
 rewrite_in_place() {
-  local file="$1" first_line resume_at pad i=0 rewritten
+  local file="$1" anchor="${2:-done}" first_line resume_at pad i=0 rewritten
   first_line=$(head -n 1 "$file")
-  resume_at=$(grep -b '^done$' "$file" | tail -n 1 | cut -d: -f1) || resume_at=""
-  [ -n "$resume_at" ] || fail "no wait loop to aim the rewrite at in $file"
-  resume_at=$((resume_at + 5))
+  resume_at=$(grep -bxF -- "$anchor" "$file" | tail -n 1 | cut -d: -f1) || resume_at=""
+  [ -n "$resume_at" ] || fail "no '$anchor' line to aim the rewrite at in $file"
+  resume_at=$((resume_at + ${#anchor} + 1))
   pad=$((resume_at - ${#first_line} - 1))
   [ "$pad" -ge 0 ] || fail "the resume point precedes the shebang in $file"
   rewritten=$(
@@ -4865,7 +5144,7 @@ run_copy_rewritten() {
     tries=$((tries + 1))
   done
   rewrite_in_place "$copy/test-post-merge-cleanup.sh"
-  [ "$helper_too" -eq 0 ] || rewrite_in_place "$copy/post-merge-cleanup.sh"
+  [ "$helper_too" -eq 0 ] || rewrite_in_place "$copy/post-merge-cleanup.sh" 'exit "$?"'
   touch "$go"
   if wait "$pid"; then rc=0; else rc=$?; fi
   echo "$rc"
@@ -4880,7 +5159,7 @@ test_runner_survives_midrun_rewrite() {
   # summary; the negative control — the same rewrite of a runner copy with the group stripped —
   # must not, which is what makes this a regression test rather than a tautology. A command
   # appended past the guarded copy's closing brace must never run either.
-  local tag="rw$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc
+  local tag="rw$$" copy="$TEST_ROOT/$COPY_DIR" out="$TEST_ROOT/copy.out" rc
   copy_runner "$copy" "$tag-guarded"
   echo 'echo SHOULD_NOT_RUN' >>"$copy/test-post-merge-cleanup.sh"
   rc=$(run_copy_rewritten "$copy" "$out" 1)
@@ -4913,7 +5192,7 @@ test_runner_kills_a_case_past_its_deadline() {
   # KILL for what is left. The descendant writes its own pid before it execs, and the case reads
   # that pid with pid_alive, the way the runner reads its groups, not with pgrep: Git for Windows
   # ships no pgrep, where the check passed while checking nothing (ludics-lite#337).
-  local tag="dl$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" rc marker patched
+  local tag="dl$$" copy="$TEST_ROOT/$COPY_DIR" out="$TEST_ROOT/copy.out" rc marker patched
   local pidfile="$copy/stall.pid" stall_pid tries=0
   marker="sh -c 'trap \"\" TERM; echo \$\$ >\"$pidfile\"; exec sleep 3571'"
   copy_runner "$copy" "$tag"
@@ -4948,7 +5227,7 @@ test_runner_names_a_setup_case_failure() {
   # have captured its destination before that scope exists. Force setup_case to fail after the
   # local is declared; the copy must promptly report the selected function's name and ordinary
   # exit status, not wait on a status file named after setup_case's scratch slug.
-  local tag="setup$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched rc
+  local tag="setup$$" copy="$TEST_ROOT/$COPY_DIR" out="$TEST_ROOT/copy.out" patched rc
   copy_runner "$copy" "$tag"
   patched=$(awk '{
     print
@@ -4977,7 +5256,7 @@ test_runner_reaps_a_statusless_case() {
   # Candidate (2) of ludics-lite#9: a case shell may exit without running its status trap. Remove
   # the trap from a copy; the scheduler must notice the gone or zombie child, reap it, and report
   # the missing status instead of polling forever or accepting the child's zero exit.
-  local tag="statusless$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched rc
+  local tag="statusless$$" copy="$TEST_ROOT/$COPY_DIR" out="$TEST_ROOT/copy.out" patched rc
   copy_runner "$copy" "$tag"
   patched=$(awk '{
     if ($0 ~ /^  trap .*CASE_STATUS_FILE.* EXIT$/) {
@@ -5016,7 +5295,7 @@ test_runner_cleans_up_after_a_closed_pipe() {
   # no writer dies of the signal, and each sees EPIPE and exits with its own status, which is how
   # a -v path through BSD awk (exit 2) passed a local run and went red in CI (ludics-lite#338). A
   # signal ignored when a shell starts stays ignored in it, so the only closed-pipe exit there is 1.
-  local tag="pipe$$" copy="$TEST_ROOT/copy" err="$TEST_ROOT/copy.err" out="$TEST_ROOT/copy.out" patched
+  local tag="pipe$$" copy="$TEST_ROOT/$COPY_DIR" err="$TEST_ROOT/copy.err" out="$TEST_ROOT/copy.out" patched
   local copy_rc head_rc pipeline_statuses sigpipe
   copy_runner "$copy" "$tag"
   patched=$(awk -v target="$SELF_CASE() {" '{
@@ -5061,7 +5340,7 @@ test_runner_term_midrun_exits_130() {
   # Candidate (4) of ludics-lite#9: wait until the copied helper is running inside its brace group
   # (a fixed delay raced on fast CI), then TERM the runner. Its scheduler trap must leave the case
   # registered for EXIT cleanup, which terminates and reaps the group before removing the root.
-  local tag="term$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out"
+  local tag="term$$" copy="$TEST_ROOT/$COPY_DIR" out="$TEST_ROOT/copy.out"
   local started go pid rc tries=0
   copy_runner "$copy" "$tag"
   started="$copy.started"
@@ -5139,7 +5418,7 @@ test_runner_help_ignores_inherited_pids() {
 test_runner_counts_a_stated_boundary() {
   # ludics-lite#338: a case that states a platform boundary still passes, but its SKIP line is
   # printed under its name and the summary counts and names it, so the boundary is on the record.
-  local tag="bd$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" patched rc
+  local tag="bd$$" copy="$TEST_ROOT/$COPY_DIR" out="$TEST_ROOT/copy.out" patched rc
   copy_runner "$copy" "$tag"
   patched=$(sed "s|^$SELF_CASE() {\$|$SELF_CASE() { skip_boundary 'runner self-case boundary';|" "$copy/test-post-merge-cleanup.sh")
   printf '%s\n' "$patched" >"$copy/test-post-merge-cleanup.sh"
@@ -5188,7 +5467,7 @@ test_runner_counts_a_stated_boundary() {
 # isolation from a copy: the same case under the HOME leg must then go red on the race it no
 # longer ran, which is what makes the passing legs a test of the isolation and not of the case.
 test_runner_isolates_ambient_git_config() {
-  local tag="gc$$" copy="$TEST_ROOT/copy" out="$TEST_ROOT/copy.out" home="$TEST_ROOT/home"
+  local tag="gc$$" copy="$TEST_ROOT/$COPY_DIR" out="$TEST_ROOT/copy.out" home="$TEST_ROOT/home"
   local hooks="$TEST_ROOT/ambient-hooks" planted="$TEST_ROOT/ambient.gitconfig" leg leg_env patched rc
   local race=test_remote_master_lease
   mkdir -p "$home" "$hooks"
@@ -5367,6 +5646,7 @@ TESTS=(
   test_option_like_branch_name
   test_relative_tmpdir
   test_session_tmpdir_refusal
+  test_unwritable_tmpdir_refusal
   test_config_lock_refusal
   test_symbolic_repository_config_refusal
   test_symbolic_worktree_config_preflight
@@ -5378,6 +5658,12 @@ TESTS=(
   test_dotted_branch_config
   test_custom_branch_config
   test_merge_options_cleanup
+  test_usage_and_option_errors
+  test_success_reports_its_record
+  test_finish_command_strips_url_credentials
+  test_multiple_push_endpoints_refusal
+  test_identity_refusals
+  test_preexisting_recovery_ref
   test_runner_names_a_setup_case_failure
   test_runner_reaps_a_statusless_case
   test_runner_cleans_up_after_a_closed_pipe

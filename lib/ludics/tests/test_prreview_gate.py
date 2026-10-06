@@ -1,0 +1,349 @@
+"""Units of the ``checks``/``merge`` port: the advisory list as grep reads it, the shell readings,
+the workflow-YAML readers, the glob, the drift's hunk reader, the closing-keyword filter, and the
+gate's fold and wait loop driven through an in-process gh (``GhSession(run=...)``) and an injected
+clock.
+
+The fixture suites (test-pr-review-checks-absent.sh, -merge.sh, -base-drift.sh) are the
+conformance suite; these pin the rules inside the port that a regression would bend first.
+"""
+
+import contextlib
+import io
+import os
+import subprocess
+import unittest
+from unittest import mock
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+
+from ludics import proc
+from ludics.prreview import clock, closekw, shtext, workflow_yaml
+from ludics.prreview.core import Config, GhSession, Json
+from ludics.prreview.drift import compare_file_set, compare_hunks
+from ludics.prreview.checkruns import conclusion_class, newest_first_lines
+from ludics.prreview.clock import FuncClock
+from ludics.prreview.gate import Gate, advisory_parse, load_gate_config
+
+
+def grep_refuses_in(locale: str, pattern: str) -> bool:
+    """Does this box's grep refuse ``pattern`` under ``locale``? (The oracle the shell asked.)"""
+    env = {**os.environ, "LC_ALL": locale}
+    done = subprocess.run(["grep", "-Eq", "--", pattern], input=b"", env=env, capture_output=True, check=False)
+    return done.returncode == 2
+
+
+class Advisory(unittest.TestCase):
+    """The advisory list is grep's to read, as it was the shell's: these pin patterns a translation
+    to ``re`` read differently from grep (parity review of the port)."""
+
+    def advisory(self, pattern: str, name: str) -> bool:
+        gate = make_gate(FakeGh(), FakeClock(), SHIP_PR_ADVISORY_CHECKS=pattern)
+        return gate.is_advisory(name)
+
+    def test_the_default_list(self) -> None:
+        gate = make_gate(FakeGh(), FakeClock())
+        self.assertEqual(
+            [gate.is_advisory(n) for n in ("claude", "Claude Code", "github pages docs", "claude-nightly", "build")],
+            [True, True, True, False, False],
+        )
+
+    def test_an_escape_both_greps_read_is_read(self) -> None:
+        pattern = r"^(claude|Claude Code)$|\bdocs\b"
+        self.assertTrue(self.advisory(pattern, "github pages docs"))
+        self.assertFalse(self.advisory(pattern, "build"))
+
+    def test_a_newline_separates_patterns(self) -> None:
+        pattern = "^claude$\n^github pages docs$"
+        self.assertTrue(self.advisory(pattern, "github pages docs"))
+        self.assertTrue(self.advisory(pattern, "claude"))
+        self.assertFalse(self.advisory(pattern, "build"))
+
+    def test_an_option_shaped_pattern_is_a_pattern(self) -> None:
+        self.assertFalse(self.advisory("--help", "build"))
+        self.assertTrue(self.advisory("--help", "x--helpy"))
+
+    def test_a_pattern_grep_refuses_matches_nothing(self) -> None:
+        self.assertFalse(self.advisory("^(claude", "claude"))
+
+    def test_the_callers_locale_is_greps(self) -> None:
+        locale = "en_US.UTF-8"
+        if not grep_refuses_in(locale, "[+-.]"):
+            self.skipTest(f"this box's grep reads [+-.] in {locale}")
+        with mock.patch.dict(os.environ, {"LC_ALL": locale}):
+            self.assertFalse(self.advisory("^(claude|github pages docs)$|^[+-.]$", "github pages docs"))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(advisory_parse("^github pages docs$\n^[+-.]$", "f"))
+        with mock.patch.dict(os.environ, {"LC_ALL": "C"}):
+            self.assertTrue(self.advisory("^(claude|github pages docs)$|^[+-.]$", "github pages docs"))
+            self.assertEqual(advisory_parse("^github pages docs$\n^[+-.]$", "f"), "^github pages docs$|^[+-.]$")
+
+    def test_a_line_grep_refuses_refuses_the_file(self) -> None:
+        for body in ("^claude$\n^(macos", "[a", "[z-a]", "^claude$\n^(macos)\\1$"):
+            with self.subTest(body=body), contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(advisory_parse(body, "f"))
+
+
+class ShellReadings(unittest.TestCase):
+    def test_tab_fields_collapses_a_run_of_tabs(self) -> None:
+        self.assertEqual(shtext.tab_fields("a\tb\tc", 3), ["a", "b", "c"])
+        self.assertEqual(shtext.tab_fields("a\t\tc\td", 3), ["a", "c", "d"])
+        self.assertEqual(shtext.tab_fields("a\tb\tc\td", 2), ["a", "b\tc\td"])
+        self.assertEqual(shtext.tab_fields("\ta", 2), ["a", ""])
+        self.assertEqual(shtext.tab_fields("", 2), ["", ""])
+
+    def test_the_parameter_expansions(self) -> None:
+        self.assertEqual(shtext.head_line("a\nb"), "a")
+        self.assertEqual(shtext.after_line("a\nb\nc"), "b\nc")
+        self.assertEqual(shtext.after_line("alone"), "alone")
+        self.assertEqual(shtext.count_nonempty("a\n\nb\n"), 2)
+
+    def test_encode_ref(self) -> None:
+        self.assertEqual(shtext.encode_ref("wip x"), "wip%20x")
+        self.assertEqual(shtext.encode_ref("feat/a#1&b"), "feat/a%231%26b")
+        self.assertEqual(shtext.encode_ref("é"), "%C3%A9")
+
+    def test_clocks(self) -> None:
+        def now() -> float:
+            return 1767225600.0 + 90  # 2026-01-01T00:01:30Z
+
+        self.assertEqual(clock.age_of("2026-01-01T00:00:00Z", now()), 90)
+        self.assertIsNone(clock.age_of("2026-01-01T00:05:00Z", now()), "a future stamp is no age")
+        self.assertIsNone(clock.age_of("yesterday", now()))
+        self.assertEqual(clock.freshest_age("2026-01-01T00:05:00Z", "2026-01-01T00:00:30Z", now=now()), 60)
+        self.assertEqual((clock.fmt_age(59), clock.fmt_age(61), clock.fmt_age(None)), ("59s", "1m", "an unknown time"))
+
+    def test_jq_compact(self) -> None:
+        self.assertEqual(shtext.jq_compact(["dir/a\tb.txt", "x\x01", "é"]), '["dir/a\\tb.txt","x\\u0001","é"]')
+
+
+DOCS = """name: ci
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - '**.md'   # a comment
+jobs:
+  build:
+\truns-on: ubuntu-latest
+"""
+
+
+class WorkflowYaml(unittest.TestCase):
+    def test_the_block_sequence_is_read_and_a_tab_below_it_is_never_seen(self) -> None:
+        # An item's trailing comment is NOT stripped (the awk read the item off the key, not the
+        # comment-stripped rest), so it is not unquoted either -- and the glob then refuses it.
+        self.assertEqual(
+            workflow_yaml.workflow_filter(DOCS, "pull_request", "paths-ignore"), ["docs/**", "'**.md'   # a comment"]
+        )
+        self.assertIsNone(workflow_yaml.glob_ere("'**.md'   # a comment"))
+
+    def test_a_tab_before_the_answer_refuses(self) -> None:
+        text = "on:\n\tpull_request:\n"
+        self.assertIsNone(workflow_yaml.workflow_filter(text, "pull_request", "paths-ignore"))
+        self.assertIsNone(workflow_yaml.workflow_keys(text, ""))
+
+    def test_the_flow_form_and_its_refusals(self) -> None:
+        flow = 'on:\n  pull_request:\n    paths-ignore: ["docs/**", "**.md"]\n'
+        self.assertEqual(workflow_yaml.workflow_filter(flow, "pull_request", "paths-ignore"), ["docs/**", "**.md"])
+        self.assertIsNone(workflow_yaml.workflow_filter('on:\n  pull_request:\n    paths-ignore: []\n', "pull_request", "paths-ignore"))
+        self.assertIsNone(workflow_yaml.workflow_filter("on:\n  pull_request:\n    paths-ignore: *docs\n", "pull_request", "paths-ignore"))
+        self.assertIsNone(workflow_yaml.workflow_filter("on:\n  pull_request:\n    paths: [a]\n", "pull_request", "paths-ignore"))
+
+    def test_the_events_in_every_form(self) -> None:
+        self.assertEqual(workflow_yaml.workflow_keys(DOCS, ""), ["pull_request"])
+        self.assertEqual(workflow_yaml.workflow_keys("on: push\n", ""), ["push"])
+        self.assertEqual(workflow_yaml.workflow_keys("on: [push, pull_request]\n", ""), ["push", "pull_request"])
+        self.assertEqual(workflow_yaml.workflow_keys(DOCS, "pull_request"), ["paths-ignore"])
+        self.assertEqual(workflow_yaml.workflow_keys("on: push\n", "push"), [], "declared with no keys is an answer")
+        self.assertIsNone(workflow_yaml.workflow_keys(DOCS, "push"), "a mapping that never reached the event")
+        self.assertIsNone(workflow_yaml.workflow_keys("name: x\n", ""), "no trigger at all is a misread file")
+
+    def test_the_glob(self) -> None:
+        self.assertEqual(workflow_yaml.glob_ere("docs/**"), "^docs/.*$")
+        self.assertEqual(workflow_yaml.glob_ere("*.md"), "^[^/]*\\.md$")
+        self.assertIsNone(workflow_yaml.glob_ere("!docs/**"))
+        self.assertIsNone(workflow_yaml.glob_ere("docs/?.md"))
+        self.assertTrue(workflow_yaml.paths_ignore_covers(["docs/**", "**.md"], ["docs/a.txt", "x/README.md"]))
+        self.assertFalse(workflow_yaml.paths_ignore_covers(["docs/**"], ["docs/a.txt", "src/a.ml"]))
+        self.assertFalse(workflow_yaml.paths_ignore_covers(["docs/**", "[ab]"], ["docs/a.txt"]),
+                         "one untranslatable pattern fails the whole filter")
+        self.assertFalse(workflow_yaml.paths_ignore_covers(["*.md"], ["docs/a.md"]), "* stays in one segment")
+
+
+class Drift(unittest.TestCase):
+    def test_hunks_are_read_against_their_headers(self) -> None:
+        doc: Json = {"files": [
+            {"filename": "a", "patch": "@@ -5 +5,2 @@\n-x\n+y\n+z", "additions": 2, "deletions": 1},
+            {"filename": "b", "patch": "@@ -10,3 +10,4 @@\n context", "additions": 0, "deletions": 0},
+            {"filename": "c", "patch": "@@ -1,1 +1,1 @@\n-a\n+b", "additions": 3, "deletions": 1},
+            {"filename": "d", "patch": "@@ -400,0 +401,2 @@\n+a\n+b", "additions": 2, "deletions": 0},
+        ]}
+        self.assertEqual(compare_hunks(doc), {"a": [(5, 5)], "b": None, "c": None, "d": [(400, 401)]})
+
+    def test_the_file_set(self) -> None:
+        doc: Json = {"files": [{"filename": "new", "previous_filename": "old"}, {"filename": "x"}]}
+        self.assertEqual(compare_file_set(doc), (2, ["new", "old", "x"]))
+        self.assertIsNone(compare_file_set({"files": [{}]}))
+        self.assertIsNone(compare_file_set({"files": [{"filename": "a", "previous_filename": ""}]}))
+        self.assertIsNone(compare_file_set({}))
+
+
+class ClosingKeywords(unittest.TestCase):
+    def found(self, text: str, plain: bool = False) -> list[tuple[str, int, str]]:
+        return [(f.cls, f.count, f.refs) for f in closekw.scan(text, "example/repo", plain)]
+
+    def test_a_sentence_binding_two_and_the_prescribed_shape(self) -> None:
+        self.assertEqual(self.found("The scanner lands. Closes #401 and #402"), [("sentence", 2, "#401 #402")])
+        self.assertEqual(self.found("Closes #404\nCloses #405"), [])
+
+    def test_quotes_fences_and_indentation(self) -> None:
+        body = "> Closes #205\n\n```\nFixes #206\n```\n\n    Closes #207 and #208\n\nCloses #403\n"
+        self.assertEqual(self.found(body), [("quoted", 1, "#205"), ("quoted", 1, "#206")])
+        self.assertEqual(self.found("    Resolves #194 and #205", plain=True), [("quoted", 2, "#194 #205")])
+        self.assertEqual(self.found("````markdown\n```\nCloses #410\n```\n````\nCloses #411\n"),
+                         [("quoted", 1, "#410")])
+
+    def test_urls_dedupe_and_boundaries(self) -> None:
+        self.assertEqual(self.found("Closes #606; see https://example.com/docs/#607 and www.example.com/page#608."), [])
+        self.assertEqual(self.found("Closes #628 (example/repo#628)."), [])
+        self.assertEqual(self.found("Closes Other/Tracker#638 and other/tracker#638"), [])
+        self.assertEqual(self.found("Closes #675 after changing #123abc."), [])
+        self.assertEqual(self.found("Issues #720 and #721 are now fixed."), [])
+        self.assertEqual(self.found("Ceci fix\u00e9s #665 et #666."), [])
+        self.assertEqual(self.found("Closes #650 and #651 in release 3.5 of the tool"), [("sentence", 2, "#650 #651")])
+
+    def test_control_bytes_are_shown_not_run(self) -> None:
+        [finding] = closekw.scan("Closes #709 and #710\x1b[2K\rFORGED", "example/repo", False)
+        self.assertEqual(finding.sentence, "Closes #709 and #710?[2K?FORGED")
+
+    def test_a_tsv_message_is_restored(self) -> None:
+        self.assertEqual(closekw.tsv_unescape("C:\\\\new\\ttab\\nline"), "C:\\new\ttab\nline")
+
+
+class Fold(unittest.TestCase):
+    def test_conclusion_classes(self) -> None:
+        self.assertEqual(
+            [conclusion_class(c) for c in ("failure", "skipped", "pending", "", "cancelled", "action_required")],
+            ["red", "green", "pending", "pending", "nogo", "nogo"],
+        )
+
+    def test_newest_first_breaks_a_same_second_tie_on_the_id(self) -> None:
+        rows = "2026-01-01T00:00:00Z\t5\ta\n2026-01-01T00:00:01Z\t3\tb\n2026-01-01T00:00:00Z\t12\tc\n-\t99\td"
+        self.assertEqual([r.split("\t")[2] for r in newest_first_lines(rows, 1, 2).split("\n")], ["b", "c", "a", "d"])
+
+    def test_the_advisory_file(self) -> None:
+        self.assertEqual(advisory_parse("# c\n\n  # i\n^claude$\r\n^macos$\n", "f"), "^claude$|^macos$")
+
+
+# --- the gate, in process ---------------------------------------------------------------------------
+
+
+@dataclass
+class Route:
+    needles: tuple[str, ...]
+    answers: list[proc.Completed]
+    served: int = 0
+
+    def next(self) -> proc.Completed:
+        a = self.answers[min(self.served, len(self.answers) - 1)]
+        self.served += 1
+        return a
+
+
+@dataclass
+class FakeGh:
+    routes: list[Route] = field(default_factory=lambda: list[Route]())
+    calls: list[list[str]] = field(default_factory=lambda: list[list[str]]())
+
+    def on(self, *needles: str, out: str | list[str] = "", rc: int = 0, err: str = "") -> None:
+        outs = out if isinstance(out, list) else [out]
+        self.routes.append(Route(needles, [proc.Completed(rc, o + "\n" if o else "", err) for o in outs]))
+
+    def __call__(self, name: str, args: Sequence[str]) -> proc.Completed:
+        self.calls.append(list(args))
+        joined = " ".join(args)
+        for route in self.routes:
+            if all(n in joined for n in route.needles):
+                return route.next()
+        raise AssertionError(f"no route for gh {joined}")
+
+
+@dataclass
+class FakeClock:
+    t: float = 1767225600.0
+    sleeps: list[float] = field(default_factory=lambda: list[float]())
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.t += seconds
+
+
+def make_gate(gh: FakeGh, clock: FakeClock, **env: str) -> Gate:
+    config = Config(repo="o/r", reviewer="r", round_threshold=None, round_gap=0, api_attempts=1, api_backoff=0)
+    session = GhSession(config, run=gh, sleep=lambda _s: None)
+    gate_config = load_gate_config({"SHIP_PR_CHECKS_INTERVAL": "60", **env})
+    return Gate(session, "o/r", gate_config, FuncClock(time=clock.now, sleep=clock.sleep))
+
+
+class GateLoop(unittest.TestCase):
+    def setUp(self) -> None:
+        # The gate prints its report; keep it out of the test runner's output.
+        self.out = io.StringIO()
+        stack = contextlib.ExitStack()
+        stack.enter_context(contextlib.redirect_stdout(self.out))
+        stack.enter_context(contextlib.redirect_stderr(self.out))
+        self.addCleanup(stack.close)
+
+    def test_a_wait_holds_a_running_check_and_ends_on_its_verdict(self) -> None:
+        gh = FakeGh()
+        gh.on("pulls/7", ".updated_at", out="h1\t2026-01-01T00:00:00Z\tb1\ttopic")
+        gh.on("pulls/7", out="h1\tb1\ttopic")
+        gh.on("check-runs", out=["ci\tpending\tu\t1", "ci\tsuccess\tu\t1"])
+        gh.on("actions/runs?head_sha=h1", out="2026-01-01T00:00:00Z\t100\t1\tpush\tci\tcompleted\tsuccess\t1")
+        clock = FakeClock()
+        gate = make_gate(gh, clock)
+        rc = gate.check("7", 600)
+        self.assertEqual((rc, gate.verdict, gate.check_sha, gate.gate_base), (0, "green", "h1", "b1"))
+        self.assertEqual(clock.sleeps, [60], "one interval between the two reads")
+
+    def test_a_superseded_head_is_five_and_an_unread_reread_is_three(self) -> None:
+        for second, want in (("h2\tb1\ttopic", 5), ("", 3)):
+            gh = FakeGh()
+            gh.on("pulls/7", ".updated_at", out="h1\t2026-01-01T00:00:00Z\tb1\ttopic")
+            gh.on("pulls/7", out=second, rc=0 if second else 1, err="" if second else "gh: HTTP 503")
+            gh.on("check-runs", out="ci\tsuccess\tu\t1")
+            gh.on("actions/runs?head_sha=h1", out="2026-01-01T00:00:00Z\t100\t1\tpush\tci\tcompleted\tsuccess\t1")
+            with self.subTest(second=second):
+                self.assertEqual(make_gate(gh, FakeClock()).check("7", 600), want)
+
+    def test_a_checkless_head_inside_the_grace_holds_and_past_it_is_absent(self) -> None:
+        for commit, want, verdict in (("2026-01-01T00:00:00Z", 0, "absent"), ("2025-12-31T23:59:00Z", 4, "unjudged")):
+            gh = FakeGh()
+            gh.on("pulls/7", ".updated_at", out="h1\t2025-01-01T00:00:00Z\t-\ttopic")
+            gh.on("pulls/7", out="h1\t-\ttopic")
+            gh.on("check-runs", out="")
+            gh.on("actions/runs?head_sha=h1", out="")
+            gh.on("commits/h1", out=commit)
+            clock = FakeClock(t=1767225600.0 + 3600) if verdict == "absent" else FakeClock()
+            with self.subTest(verdict=verdict):
+                gate = make_gate(gh, clock)
+                self.assertEqual((gate.check("7", 0), gate.verdict), (want, verdict))
+
+    def test_the_waiver_records_the_first_read_only(self) -> None:
+        gh = FakeGh()
+        gh.on("pulls/7", ".updated_at", out="h1\t2026-01-01T00:00:00Z\tb1\ttopic")
+        gh.on("pulls/7", out="h1\tb1\ttopic")
+        gh.on("check-runs", out=["ubuntu\tfailure\tu\t1\nmacos\tpending\tm\t1",
+                                 "ubuntu\tfailure\tu\t1\nmacos\tfailure\tm\t1"])
+        gh.on("actions/runs?head_sha=h1", out="2026-01-01T00:00:00Z\t100\t1\tpush\tci\tin_progress\tpending\t1")
+        gh.on("actions/runs/100/jobs", out="")
+        gate = make_gate(gh, FakeClock())
+        self.assertEqual(gate.check("7", 600, waive=True), 1)
+        self.assertEqual((gate.verdict, gate.waived), ("red", {"check:1/ubuntu"}))
+
+
+if __name__ == "__main__":
+    unittest.main()

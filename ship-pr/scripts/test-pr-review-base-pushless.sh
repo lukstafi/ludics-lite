@@ -357,6 +357,23 @@ test_a_file_the_reader_refuses_is_read_as_a_push_workflow() {
   assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "no named source is consulted"
 }
 
+# The reader refuses a tab only on a line it READS: it stops at the end of the `on:` block, so a
+# tab further down (a `<<-EOF` heredoc in a job's script) leaves the triggers read, and the retired
+# workflow stays retired. Refusing the whole file for it would read the workflow as a push one and
+# hand out its stale push green (the #401 shape) — a port that refused a tab anywhere did exactly
+# that.
+test_a_tab_past_the_triggers_does_not_unread_the_file() {
+  pushless_fixture
+  TIP_PULLS='[]'
+  WORKFLOW_YAML="$PUSHLESS_YAML"$'    steps:\n      - run: |\n          cat <<-EOF\n\t\tindented\n\t\tEOF\n'
+  run_base
+  assert_eq "$BASE_RC" 4 "a retired workflow with a tab under jobs: is still retired"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: NO VERDICT (tip ${SHA_C:0:8}) — ci no longer run(s) on push" \
+    "the headline is the retired one"
+  assert_not_contains "$BASE_OUTPUT" "could not be parsed for its triggers" "the file was parsed"
+  assert_not_contains "$BASE_OUTPUT" ": green" "the old push green is not the tip's"
+}
+
 # A read of the file that fails without establishing anything is UNKNOWN, not a guess in either
 # direction: transport that outlived its retries, and just as much the API REFUSING the read — a
 # token that may read Actions but not the repository's contents would otherwise pass for a file
@@ -848,6 +865,83 @@ test_interim_takes_a_record_at_the_tip() {
   assert_eq "$BASE_RC" 4 "without --interim a push tip in flight is pending"
 }
 
+# --- lessons of the fix rounds, pinned before the port (ludics-lite#403) ------------------------
+# The fail-closed branches the review rounds of #401 and #308 wrote, which no case read until the
+# v2 rewrite went looking.
+
+# A verdict source that cannot be read is UNKNOWN for a retired workflow (f3e46a9: refused reads
+# are unknown), never "no source": the source it failed to read may be the tip's red.
+test_an_unreadable_source_for_a_retired_workflow_is_unknown() {
+  pushless_fixture
+  retune API_ATTEMPTS=1
+  FAIL_ENDPOINT="repos/$REPO/commits/$SHA_C"
+  run_base
+  assert_eq "$BASE_RC" 3 "an unread source is unknown ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "could not read a verdict source for $REPO $BRANCH's tip ${SHA_C:0:8}" \
+    "naming the tip it could not judge"
+  assert_not_contains "$BASE_OUTPUT" "$REPO $BRANCH: green" "never green"
+}
+
+# A records file is read as lines: a blank line is skipped, and a last row with no newline after
+# it is still a row -- dropping it could drop the tip's failed record.
+test_a_records_file_is_read_whole() {
+  local file="$TEST_ROOT/records-raw"
+  pushless_fixture
+  printf '\n%s\t%s\t%s\t%s\n\n%s\t%s\t%s\t%s' \
+    "$SHA_C" pass w-integration-1 2026-09-26T09:00:00+00:00 \
+    "$SHA_C" fail w-integration-2 2026-09-26T10:00:00Z >"$file"
+  run_base --integration-records "$file"
+  assert_eq "$BASE_RC" 1 "the unterminated last row is read, and it is the newest ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "integration record w-integration-2 ran the tip ${SHA_C:0:8} and concluded fail (2026-09-26T10:00:00Z)" \
+    "naming it"
+}
+
+# Every read the interim needs that fails leaves the tip PENDING with a note naming the read --
+# never UNKNOWN (the pending it falls back to is true) and never the interim green.
+test_interim_reads_that_fail_hold_it_with_a_note() {
+  # The hundred-deep read of the tip's workflow (#533).
+  burst_fixture "$BURST_RUNS"
+  retune API_ATTEMPTS=1
+  FAIL_ENDPOINT="repos/$REPO/actions/workflows/1/runs?*per_page=100"
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "an unread deeper page holds the interim ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: its push runs could not be read past the first page (" \
+    "naming the read"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "/pulls" "and no source is asked behind it"
+  # The source itself.
+  burst_fixture "$BURST_RUNS"
+  retune API_ATTEMPTS=1
+  FAIL_ENDPOINT="repos/$REPO/commits/$SHA_C"
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "an unread source holds the interim ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: a verdict source could not be read (" "naming it"
+  # The tip's own run, read again after the source.
+  burst_fixture "$BURST_RUNS"
+  retune API_ATTEMPTS=1
+  FAIL_ENDPOINT="repos/$REPO/actions/runs/7301"
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "an unread re-read of the tip's run holds the interim ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: the tip's run of ci could not be read again after the source (" \
+    "naming it"
+  # Whether a workflow with no push run on the branch runs on push at all (round 1's newcomer).
+  burst_fixture "$BURST_RUNS"
+  retune API_ATTEMPTS=1
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"nightly"}]')
+  FAIL_ENDPOINT="repos/$REPO/actions/workflows/2"
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "an unread newcomer file holds the interim ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: whether nightly, which has no push run on $BRANCH, runs on push could not be read (" \
+    "naming the newcomer"
+  # And the tip's age, which the newcomer's window is measured on, when no row at the tip dates it.
+  burst_fixture '[{"status":"in_progress","conclusion":null,"head_sha":"cccccccccccccccccccccccccccccccccccccccc","id":7301,"created_at":"-"},
+                  {"conclusion":"cancelled","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","id":7300,"created_at":"-"}]'
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"nightly"}]')
+  run_base --interim
+  assert_eq "$BASE_RC" 4 "an undated tip holds the interim over a newcomer ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "(no interim verdict for ci: nightly may run on push and has no run on $BRANCH, and the tip's age could not be read)" \
+    "saying the age could not be read"
+}
+
 tests=(
   test_a_clean_merge_of_a_green_head_is_green_by_the_named_source
   test_a_tip_no_source_covers_is_no_verdict_never_the_old_green
@@ -863,6 +957,7 @@ tests=(
   test_a_malformed_records_file_is_refused
   test_a_workflow_that_still_runs_on_push_reads_as_before
   test_a_file_the_reader_refuses_is_read_as_a_push_workflow
+  test_a_tab_past_the_triggers_does_not_unread_the_file
   test_a_file_read_that_fails_is_unknown
   test_a_file_confirmed_absent_at_the_tip_reads_as_before
   test_a_push_workflow_green_at_the_tip_does_not_speak_for_a_retired_one
@@ -883,6 +978,9 @@ tests=(
   test_interim_rerounds_at_most_twice
   test_interim_ages_the_tip_on_the_rounds_snapshot
   test_interim_takes_a_record_at_the_tip
+  test_an_unreadable_source_for_a_retired_workflow_is_unknown
+  test_a_records_file_is_read_whole
+  test_interim_reads_that_fail_hold_it_with_a_note
 )
 
 run_tests "${tests[@]}" -- "$@"

@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# scripts/py: run Python >= 3.12 with this checkout's package on the path (ludics-lite#403).
+#
+#   scripts/py -m ludics.prreview body owner/name#7 notes.md
+#   scripts/py -m unittest discover -s lib -t lib -p 'test_*.py'
+#
+# Every Python entry point of the v2 rewrite goes through this file. The version check cannot live
+# in the Python itself: a module that uses `match` or `type X = ...` is a SyntaxError on 3.9, and
+# Python compiles the whole file before running any of it, so an in-file check never runs. And a
+# bare `python3` is not a version: a non-interactive ssh session on a Mac often has a PATH without
+# /opt/homebrew, and its `python3` is Xcode's 3.9.6.
+#
+# So this probes, in order, and runs the FIRST interpreter that reports sys.version_info >= (3, 12):
+#   /opt/homebrew/bin/python3, /usr/local/bin/python3, python3.13, python3.12, python3, python,
+#   $HOME/.local/bin/python3.12 (where `uv python install 3.12` puts one), and under Git Bash /
+#   MSYS / Cygwin the launcher: `py -3.12`, then `py -3`.
+# LUDICS_PY_CANDIDATES, when set, REPLACES that list: one command per line, no arguments (the
+# suite's hook, and a box whose interpreter lives elsewhere). When nothing qualifies it exits 2 --
+# the environment is wrong, the code every script here gives that -- naming each candidate and
+# what it found there, and runs nothing.
+#
+# How the interpreter is run, and why:
+#   -P           no cwd (or script directory) on sys.path: pr-review.sh runs from inside arbitrary
+#                project checkouts, and a `json.py` or `ludics/` there must not shadow anything;
+#   -X utf8      UTF-8 for every stream and open(), whatever the locale (a hostile pass runs the
+#                suites under a non-C locale, and Windows defaults to a code page);
+#   PYTHONCOERCECLOCALE=0
+#                the caller's LC_CTYPE stays the C library's: Python would otherwise coerce the C
+#                locale to C.UTF-8, in its own C library calls and in the environment of every
+#                program it runs, so a check of [[:space:]] (lib/ludics/prreview/space.py) and a
+#                child's own locale would differ from the shell's (-X utf8 already covers streams);
+#   PYTHONPATH   exactly this checkout's lib/ (the package `ludics`), replacing any inherited one,
+#                since the rewrite is standard-library only and nothing else belongs on the path;
+#   LUDICS_CALLER_PYTHONPATH
+#                the caller's own PYTHONPATH (`=<value>` when it was set, empty when not), which the
+#                entry point puts back before it runs anything (ludics.cli.restore_caller_environment),
+#                so a command it runs -- a batch under `fleet-worker.sh execution slot`, a hook, a
+#                fixture -- sees the caller's environment, not the `ludics` package.
+#
+# Shell: bash 3.2 (macOS), bash 5, and Git Bash. No arrays-with-`set -u` pitfalls, no `local -n`.
+
+# Physically before going up, so a path through a symlinked directory still lands in the checkout.
+lib_dir=$(CDPATH= cd -P "$(dirname "$0")" && cd -P .. && pwd -P)/lib
+
+windows=""
+case "$(uname -s 2>/dev/null)" in
+MINGW* | MSYS* | CYGWIN*) windows=1 ;;
+esac
+
+# The probe prints the version it ran under and exits 0 only on >= 3.12. It is written to parse on
+# any Python down to 2.x, so an old interpreter answers with its version instead of a SyntaxError.
+probe_code='import sys; sys.stdout.write("%d.%d.%d\n" % tuple(sys.version_info[:3])); sys.exit(0 if sys.version_info >= (3, 12) else 1)'
+
+tried=""
+note() { tried="$tried
+  $1"; }
+
+# try <command> [<arg>]: sets chosen_cmd/chosen_arg and returns 0 on a qualifying interpreter.
+chosen_cmd=""
+chosen_arg=""
+try() {
+  local cmd="$1" arg="${2:-}" where version rc label
+  label="$cmd${arg:+ $arg}"
+  case "$cmd" in
+  */*)
+    if [ ! -f "$cmd" ] || [ ! -x "$cmd" ]; then
+      note "$label: absent"
+      return 1
+    fi
+    where="$cmd"
+    ;;
+  *)
+    where=$(command -v "$cmd" 2>/dev/null) || {
+      note "$label: not on PATH"
+      return 1
+    }
+    ;;
+  esac
+  if [ -n "$arg" ]; then
+    version=$("$cmd" "$arg" -c "$probe_code" </dev/null 2>/dev/null)
+  else
+    version=$("$cmd" -c "$probe_code" </dev/null 2>/dev/null)
+  fi
+  rc=$?
+  version=$(printf '%s' "$version" | tr -d '\r' | head -n 1)
+  if [ "$rc" -eq 0 ] && [ -n "$version" ]; then
+    chosen_cmd="$cmd"
+    chosen_arg="$arg"
+    return 0
+  fi
+  if [ -n "$version" ]; then
+    note "$label ($where): Python $version, older than 3.12"
+  else
+    note "$label ($where): did not run as Python (exit $rc)"
+  fi
+  return 1
+}
+
+found=""
+if [ -n "${LUDICS_PY_CANDIDATES+set}" ]; then
+  # One per line; `read` keeps a path with spaces whole.
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    if try "$candidate"; then
+      found=1
+      break
+    fi
+  done <<EOF
+$LUDICS_PY_CANDIDATES
+EOF
+else
+  for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 python3.13 python3.12 python3 \
+    python "${HOME:-/nonexistent}/.local/bin/python3.12"; do
+    if try "$candidate"; then
+      found=1
+      break
+    fi
+  done
+  if [ -z "$found" ] && [ -n "$windows" ]; then
+    if try py -3.12 || try py -3; then found=1; fi
+  fi
+fi
+
+if [ -z "$found" ]; then
+  printf 'scripts/py: no Python >= 3.12 found, so nothing was run. Tried:%s\n' "$tried" >&2
+  printf 'Install Python 3.12 or newer (Homebrew python, the distro python3.12, or `uv python install 3.12`), or name one in LUDICS_PY_CANDIDATES.\n' >&2
+  exit 2
+fi
+
+# A native Windows interpreter reads PYTHONPATH as a Windows path list.
+if [ -n "$windows" ] && command -v cygpath >/dev/null 2>&1; then
+  lib_dir=$(cygpath -w "$lib_dir")
+fi
+if [ -n "${PYTHONPATH+set}" ]; then LUDICS_CALLER_PYTHONPATH="=$PYTHONPATH"; else LUDICS_CALLER_PYTHONPATH=""; fi
+PYTHONPATH="$lib_dir"
+PYTHONCOERCECLOCALE=0
+export PYTHONPATH PYTHONCOERCECLOCALE LUDICS_CALLER_PYTHONPATH
+
+if [ -n "$chosen_arg" ]; then
+  exec "$chosen_cmd" "$chosen_arg" -X utf8 -P "$@"
+fi
+exec "$chosen_cmd" -X utf8 -P "$@"

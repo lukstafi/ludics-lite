@@ -2,6 +2,15 @@
 
 This records cooperative ownership; it neither launches nor supervises processes.
 
+How it runs (ludics-lite#403). This module is SHIPPED: fleet-worker.sh's `execution` sends its
+source to the anchor, where a Python >= 3.12 runs it from stdin (`python - <argv>`), under the
+anchor's lease lock. So it is self-contained -- the standard library only, nothing imported from
+the `ludics` package, which the anchor's own checkout may hold at another version -- and its argv
+is the contract below. It is also what the registry suite loads in process with `runpy` (patching
+`os.replace` between records, so every published record is exactly one `os.replace`), and what the
+package's unit tests import; `main` runs when the module is run as a program, as stdin, or by
+`runpy.run_path`, and not on import.
+
 Argv: <state root> <action> <coordinator> <lease token> <json payload> <FLEET_BOXES>
       [<FLEET_BOX_CORRECTNESS_SLOTS> [<endpoint map> [<anchor> <lab host>]]]
 
@@ -89,18 +98,28 @@ measurements on a box (`execution slot`'s in-hold admission, ludics-lite#480, re
 import fcntl
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, NoReturn, cast
+
+type Record = dict[str, Any]
+"""One execution record, or a request inside one, as JSON decodes it: validated by
+`validate_record`/`validate_request` before anything reads a field."""
 
 
-def refuse(message):
+def refuse(message: str) -> NoReturn:
     raise ValueError(message)
 
 
-def nonempty(obj, keys):
+def as_object(value: Any) -> Record | None:
+    """The decoded JSON value as an object, or None when it is anything else."""
+    return cast(Record, value) if isinstance(value, dict) else None
+
+
+def nonempty(obj: Record, keys: list[str]) -> None:
     for key in keys:
         if not isinstance(obj.get(key), str) or not obj[key].strip():
             refuse(f"{key} must be a nonempty string")
@@ -112,33 +131,35 @@ STATES = {"reserved", "launching", "running", "uncertain", "suspended", "conclud
 SUSPENDABLE = STATES - {"suspended", "concluded"}   # what `suspended_from` may name
 
 
-def validate_request(data):
-    if not isinstance(data, dict) or set(data) - REQUEST_FIELDS - {"triage_reason", "standing", "integration"}:
+def validate_request(data: Any) -> None:
+    request = as_object(data)
+    if request is None or set(request) - REQUEST_FIELDS - {"triage_reason", "standing", "integration"}:
         refuse("unknown reservation fields or invalid request")
-    nonempty(data, REQUEST_FIELDS)
-    if "triage_reason" in data:
-        nonempty(data, ["triage_reason"])
-    if data["kind"] not in {"correctness", "measurement"}:
+    nonempty(request, list(REQUEST_FIELDS))
+    if "triage_reason" in request:
+        nonempty(request, ["triage_reason"])
+    if request["kind"] not in {"correctness", "measurement"}:
         refuse("kind must be correctness or measurement")
-    if "standing" in data:
+    if "standing" in request:
         # Loud and explicit rather than read off the `-iterate` id convention: a mistyped id
         # must not silently escape the cap, and `execution list` shows the exemption as a field.
-        if data["standing"] is not True:
+        if request["standing"] is not True:
             refuse("standing must be true when present")
-        if data["kind"] != "correctness":
+        if request["kind"] != "correctness":
             refuse("only a correctness reservation can be standing")
-    if data["transport"] not in {"subagent", "app", "cli", "coordinator"}:
+    if request["transport"] not in {"subagent", "app", "cli", "coordinator"}:
         refuse("invalid transport")
-    if "integration" in data:
+    if "integration" in request:
         # A claim the base gate acts on, so only the shape an integration run has may make it.
-        if data["integration"] is not True:
+        if request["integration"] is not True:
             refuse("integration must be true when present")
-        if data["kind"] != "correctness" or data["transport"] != "coordinator" or data.get("standing"):
+        if request["kind"] != "correctness" or request["transport"] != "coordinator" or request.get("standing"):
             refuse("only a coordinator's non-standing correctness reservation can be an integration run")
 
 
-def validate_record(record, path):
-    if not isinstance(record, dict):
+def validate_record(data: Any, path: Path) -> Record:
+    record = as_object(data)
+    if record is None:
         refuse(f"invalid execution record: {path}")
     nonempty(record, ["request_id", "coordinator", "lease_token", "state", "created_at", "updated_at"])
     if record["request_id"] != path.stem or record["state"] not in STATES:
@@ -149,8 +170,9 @@ def validate_record(record, path):
     history = record.get("history")
     if not isinstance(history, list) or not history:
         refuse(f"missing execution history: {path}")
-    for event in history:
-        if not isinstance(event, dict) or not isinstance(event.get("data"), dict):
+    for item in cast(list[Any], history):
+        event = as_object(item)
+        if event is None or as_object(event.get("data")) is None:
             refuse(f"invalid execution history: {path}")
         nonempty(event, ["at", "coordinator", "action"])
     for key in ("remote_checkout", "handle", "log", "observed_sha", "verdict", "halt_identity"):
@@ -173,9 +195,10 @@ def validate_record(record, path):
             refuse(f"invalid terminal verdict: {path}")
         if record["verdict"] != "not-launched":
             nonempty(record, ["observed_sha", "remote_checkout", "handle"])
+    return record
 
 
-def sync_directory(path):
+def sync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -183,7 +206,7 @@ def sync_directory(path):
         os.close(descriptor)
 
 
-def halt_generation(marker):
+def halt_generation(marker: str | None) -> str | None:
     if marker is None:
         return None
     first_line = marker.splitlines()[0] if marker.splitlines() else ""
@@ -192,9 +215,9 @@ def halt_generation(marker):
     return match.group(1) if match else first_line
 
 
-def correctness_slots(spec, canonical_hosts):
+def correctness_slots(spec: str, canonical_hosts: set[str]) -> dict[str, int]:
     """`<box>=<n>` pairs; a box the spec does not name has one slot."""
-    slots = {}
+    slots: dict[str, int] = {}
     for pair in spec.split():
         box, _, count = pair.partition("=")
         if not box or not count.isdigit() or int(count) < 1:
@@ -205,9 +228,9 @@ def correctness_slots(spec, canonical_hosts):
     return slots
 
 
-def endpoint_boxes(spec):
+def endpoint_boxes(spec: str) -> dict[str, str]:
     """The endpoint map as {casefolded alias: box}; each row is `<box> <alias>...`."""
-    boxes = {}
+    boxes: dict[str, str] = {}
     for row in spec.splitlines():
         words = row.split()
         for alias in words:
@@ -217,10 +240,10 @@ def endpoint_boxes(spec):
     return boxes
 
 
-def check_one_entry_per_box(roster, map_spec):
+def check_one_entry_per_box(roster: list[str], map_spec: str) -> None:
     """Refuse a roster naming two aliases of one physical box (see the header)."""
     boxes = endpoint_boxes(map_spec)
-    seen = {}
+    seen: dict[str, str] = {}
     for entry in roster:
         box = boxes.get(entry.casefold(), entry.casefold())
         other = seen.setdefault(box, entry)
@@ -229,10 +252,10 @@ def check_one_entry_per_box(roster, map_spec):
                    f"on one would not exclude a run on the other; keep one entry per physical box")
 
 
-LANE_LOCKS = []   # lane-lock descriptors held SHARED until this process exits (see the header)
+LANE_LOCKS: list[int] = []   # lane-lock descriptors held SHARED until this process exits (see the header)
 
 
-def check_lab_host(host, box, anchor, lab):
+def check_lab_host(host: str, box: str, anchor: str, lab: str) -> None:
     """Refuse unless this anchor is the machine whose lock directory holds the lab's lane locks."""
     if not anchor or not lab:
         refuse(f"{host} is lab box {box}, and the anchor's and lab host's names were not passed, so this "
@@ -249,7 +272,7 @@ def check_lab_host(host, box, anchor, lab):
                f"lab and holds its lane locks: a running lane could not be seen")
 
 
-def check_lane_lock(host, map_spec, anchor, lab):
+def check_lane_lock(host: str, map_spec: str, anchor: str, lab: str) -> None:
     """Refuse a measurement on a box whose lab LANE lock is held; hold it shared if free."""
     box = endpoint_boxes(map_spec).get(host.casefold())
     if box is None:
@@ -281,7 +304,8 @@ def check_lane_lock(host, map_spec, anchor, lab):
     LANE_LOCKS.append(descriptor)
 
 
-def check_capacity(data, records, canonical_hosts, slots_spec, window=False):
+def check_capacity(data: Record, records: dict[str, Record], canonical_hosts: set[str], slots_spec: str,
+                   window: bool = False) -> str | None:
     """Refuse when the requested host cannot take this assignment beside the outstanding ones.
 
     Returns the open measurement window a standing request is queued behind, if any."""
@@ -323,7 +347,7 @@ def check_capacity(data, records, canonical_hosts, slots_spec, window=False):
     return None
 
 
-def suspend(record, window, now, coordinator):
+def suspend(record: Record, window: str, now: str, coordinator: str) -> None:
     """Move a standing record into the window's suspension (see the header)."""
     record["suspended_from"] = record["state"]
     record["state"] = "suspended"
@@ -333,8 +357,8 @@ def suspend(record, window, now, coordinator):
         "request_id": record["request_id"], "evidence": f"suspended by measurement window {window}"}})
 
 
-def publish(directory, record):
-    """Write one record atomically and durably."""
+def publish(directory: Path, record: Record) -> None:
+    """Write one record atomically and durably: exactly one `os.replace` per record."""
     directory.mkdir(exist_ok=True)
     # Sync even on retry: an earlier failed sync may have left the new directory visible.
     sync_directory(directory.parent)
@@ -351,43 +375,44 @@ def publish(directory, record):
         if os.path.exists(temporary):
             os.unlink(temporary)
 
-
-def main():
-    root, action, coordinator, token, raw, boxes = sys.argv[1:7]
-    slots_spec = sys.argv[7] if len(sys.argv) > 7 else ""
-    map_spec = sys.argv[8] if len(sys.argv) > 8 else ""
-    anchor, lab = (sys.argv[9:11] + ["", ""])[:2]
+def main(argv: list[str]) -> None:
+    root, action, coordinator, token, raw, boxes = argv[1:7]
+    slots_spec = argv[7] if len(argv) > 7 else ""
+    map_spec = argv[8] if len(argv) > 8 else ""
+    anchor, lab = (argv[9:11] + ["", ""])[:2]
     directory = Path(root) / "executions"
     # A corrupt record blocks dispatch instead of silently making its box available.
-    records = {}
+    records: dict[str, Record] = {}
     if directory.exists():
         for path in sorted(directory.glob("*.json")):
-            record = json.loads(path.read_text())
-            validate_record(record, path)
-            records[path.stem] = record
+            records[path.stem] = validate_record(json.loads(path.read_text()), path)
     if action == "list":
-        options = json.loads(raw)
-        if (not isinstance(options, dict) or set(options) - {"active", "compact"}
+        options = as_object(json.loads(raw))
+        if (options is None or set(options) - {"active", "compact"}
                 or any(type(value) is not bool for value in options.values())):
             refuse("list options must be active/compact booleans")
+        flags = cast(dict[str, bool], options)
         # Validate the entire ledger above before filtering: a compact view must not hide
         # corrupt ownership evidence, including a malformed terminal record.
         selected = [record for record in records.values()
-                    if not options.get("active") or record["state"] != "concluded"]
-        if options.get("compact"):
+                    if not flags.get("active") or record["state"] != "concluded"]
+        if flags.get("compact"):
             selected = [{key: value for key, value in record.items()
                          if key not in {"history", "lease_token"}} for record in selected]
-        print(json.dumps(selected, indent=None if options.get("compact") else 2))
+        print(json.dumps(selected, indent=None if flags.get("compact") else 2))
         return
-    data = json.loads(raw)
-    window_box = None
+    decoded: Any = json.loads(raw)
+    window_box: str | None = None
     if action == "window":
-        if not isinstance(data, dict) or set(data) != {"box", "request"}:
+        payload = as_object(decoded)
+        if payload is None or set(payload) != {"box", "request"}:
             refuse("window payload must be {box, request}")
-        nonempty(data, ["box"])
-        window_box, data = data["box"], data["request"]
-    if not isinstance(data, dict):
+        nonempty(payload, ["box"])
+        window_box, decoded = cast(str, payload["box"]), payload["request"]
+    request_data = as_object(decoded)
+    if request_data is None:
         refuse("request must be a JSON object")
+    data: Record = request_data
     nonempty(data, ["request_id"])
     identity = data["request_id"]
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", identity):
@@ -401,10 +426,11 @@ def main():
     halt_identity = halt_generation(halt_path.read_text()) if halt_path.exists() else None
     if halt_identity is not None and not halt_identity.strip():
         refuse("invalid empty halt record")
-    record = records.get(identity)
-    events = []   # (action, data) pairs appended to the history, in order
-    before = []   # other records to publish BEFORE this one (a window's restorations)
-    after = []    # other records to publish AFTER this one (a window's suspensions)
+    record: Record | None = records.get(identity)
+    events: list[tuple[str, Record]] = []   # (action, data) pairs appended to the history, in order
+    before: list[Record] = []   # other records to publish BEFORE this one (a window's restorations)
+    after: list[Record] = []    # other records to publish AFTER this one (a window's suspensions)
+    canonical_hosts: set[str] = set()
     if action in {"reserve", "run", "dispatch", "window"}:
         roster = list(dict.fromkeys(boxes.split()))   # a repeated entry is the same entry
         canonical_hosts = set(roster)
@@ -437,7 +463,7 @@ def main():
                 refuse("a window opens for a measurement: kind must be measurement")
             if request["execution_host"] != window_box:
                 refuse(f"the window is for {window_box}, but the measurement names {request['execution_host']}")
-        queued = None      # the open window a standing request is admitted suspended by
+        queued: str | None = None      # the open window a standing request is admitted suspended by
         dispatch = action in {"run", "window"}
         if record:
             if record["request"] != request:
@@ -624,8 +650,18 @@ def main():
     print(json.dumps(record, indent=2))
 
 
-try:
-    main()
-except (ValueError, OSError, KeyError, TypeError) as exc:
-    print(f"EXECUTION REFUSED: {exc}", file=sys.stderr)
-    sys.exit(1)
+def run(argv: list[str]) -> int:
+    """`main` with the registry's refusal contract: one `EXECUTION REFUSED: <why>` line on stderr, exit 1."""
+    try:
+        main(argv)
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        print(f"EXECUTION REFUSED: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# A program (`python - <argv>` on the anchor, `python registry.py`) or `runpy.run_path`, never an
+# import: the in-process suite reads LANE_LOCKS from the namespace runpy returns.
+if __name__ in ("__main__", "<run_path>"):
+    if run(sys.argv) != 0:
+        sys.exit(1)

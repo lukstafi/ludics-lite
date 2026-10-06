@@ -22,10 +22,20 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/pr-review hostile.XXXXXX")
 # is inherited by every fixture path they build (ludics-lite#208).
 scratch=$(CDPATH= cd "$scratch" && pwd -P)
 trap 'rm -rf "$scratch"' EXIT
-mkdir "$scratch/scripts with spaces" "$scratch/tmp with spaces"
-cp -p "$script_dir/"*.sh "$scratch/scripts with spaces/"
+# The copy keeps the checkout's layout around the scripts, so pr-review.sh still finds the Python
+# half of a subcommand ported by ludics-lite#403 (../../scripts/py, which runs ../../lib) and runs
+# it from the spaced path too. A runner copied out alone (test-pr-review-hostile.py's synthetic
+# suites) has no checkout around it, and copies the scripts only.
+suites="$scratch/repo with spaces/ship-pr/scripts"
+mkdir -p "$suites" "$scratch/tmp with spaces"
+cp -p "$script_dir/"*.sh "$suites/"
+if [ -x "$script_dir/../../scripts/py" ] && [ -d "$script_dir/../../lib" ]; then
+  mkdir "$scratch/repo with spaces/scripts"
+  cp -p "$script_dir/../../scripts/py" "$scratch/repo with spaces/scripts/"
+  cp -pR "$script_dir/../../lib" "$scratch/repo with spaces/"
+fi
 result=0
-for suite in "$scratch/scripts with spaces"/test-pr-review-*.sh; do
+for suite in "$suites"/test-pr-review-*.sh; do
   name=$(basename "$suite")
   printf '\nHostile pass: %s (locale=%s)\n' "$name" "$hostile_locale"
   rc=0

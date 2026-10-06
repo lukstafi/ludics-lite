@@ -67,6 +67,14 @@ THREADS_FIXTURE_TOTAL=""
 BODY_FAILS=0
 # How many POSTs of a plain PR comment fail (with FAIL_MSG) before one succeeds.
 COMMENT_FAILS=0
+# The review-threads read: THREADS_FAIL_MSG fails every page with it (gh's stderr, behind `gh: `),
+# and THREADS_ANSWER, when set, is the whole GraphQL answer every page gets instead of THREADS'.
+THREADS_FAIL_MSG=""
+THREADS_ANSWER=""
+# The resolveReviewThread mutation fails with RESOLVE_FAIL_MSG when its query holds
+# RESOLVE_FAIL_NODE (empty: every thread's).
+RESOLVE_FAIL_MSG=""
+RESOLVE_FAIL_NODE=""
 
 reset_fixture() {
   : >"$REQUEST_LOG"
@@ -82,6 +90,10 @@ reset_fixture() {
   THREADS_FIXTURE_TOTAL=""
   BODY_FAILS=0
   COMMENT_FAILS=0
+  THREADS_FAIL_MSG=""
+  THREADS_ANSWER=""
+  RESOLVE_FAIL_MSG=""
+  RESOLVE_FAIL_NODE=""
 }
 
 # THREADS as review_thread rows (which serve `databaseId` null past 2^31, as GitHub does).
@@ -182,9 +194,26 @@ gh() {
     case "$query" in
     *resolveReviewThread*)
       printf '%s\n' "$query" >>"$BODIES/mutations"
+      if [ -n "$RESOLVE_FAIL_MSG" ]; then
+        case "$query" in *"$RESOLVE_FAIL_NODE"*)
+          echo "gh: $RESOLVE_FAIL_MSG" >&2
+          return 1
+          ;;
+        esac
+      fi
       gh_fixture_answer '{"data":{"resolveReviewThread":{"thread":{"isResolved":true}}}}'
       ;;
-    *) gh_fixture_answer "$(review_threads_answer "$(thread_rows)" "$@")" ;;
+    *)
+      if [ -n "$THREADS_FAIL_MSG" ]; then
+        echo "gh: $THREADS_FAIL_MSG" >&2
+        return 1
+      fi
+      if [ -n "$THREADS_ANSWER" ]; then
+        gh_fixture_answer "$THREADS_ANSWER"
+      else
+        gh_fixture_answer "$(review_threads_answer "$(thread_rows)" "$@")"
+      fi
+      ;;
     esac
     ;;
   *)
@@ -396,6 +425,8 @@ test_an_ambiguous_write_never_claims_nothing_was_posted() {
   assert_contains "$ERR" "retry with: 900+901 if the reply is not there" "with both answers named"
   assert_contains "$ERR" "retry with: 901 --anchor 900 if it is" \
     "the second keeping the thread that may already hold the answer as the anchor"
+  # Byte for byte the shell's tail: its ${after:-...} appended the raw remaining ids.
+  assert_eq "${ERR##*if it is}" "  901" "and the shell's raw remainder ends the message"
   # The control on the pair: the gateway refusal at the same id DOES say nothing was posted, so
   # the two classifications are reported differently rather than by one hedged string.
   reset_fixture
@@ -783,7 +814,7 @@ test_body_invocation_errors_send_nothing() {
 # ISSUES endpoint, since pulls/<n>/comments takes inline review comments, which need a commit and a
 # path. It carries the same marker as `reply`.
 comment_attempts() {
-  wc -l <"$BODIES/comment-methods" 2>/dev/null | tr -d ' ' || echo 0
+  wc -l 2>/dev/null <"$BODIES/comment-methods" | tr -d ' ' || echo 0
 }
 
 test_comment_posts_to_the_issues_endpoint() {
@@ -972,6 +1003,255 @@ test_the_bare_nudge_is_the_one_comment_that_passes() {
   done
 }
 
+# --- whitespace is the caller's locale's (ludics-lite#403) ------------------------------------
+# The shell read [[:space:]] through the C library under the caller's LC_CTYPE: under en_US.UTF-8 a
+# body of U+3000 or U+00A0 was empty, and '@codex review' followed by U+00A0 was the bare nudge;
+# under the C locale neither was. The port first read the C locale's six in every locale, so it
+# posted a body the shell refused and refused a nudge the shell posted. These cases ask THIS bash
+# what the class answers and hold the commands to it, so they pin one line on any C library.
+
+# The first UTF-8 locale whose [[:space:]] holds U+3000 here; empty when this box has none.
+space_locale() {
+  local loc
+  for loc in en_US.UTF-8 C.UTF-8 en_US.utf8 C.utf8; do
+    if shell_blank "$loc" $'\xe3\x80\x80'; then
+      printf '%s\n' "$loc"
+      return 0
+    fi
+  done
+}
+# <locale> <command...>: the command under that locale. LANG=C names the C locale through LANG
+# alone, with LC_ALL and LC_CTYPE empty: the one spelling Python would coerce to C.UTF-8 on its own
+# (PEP 538), which scripts/py turns off so the commands read the C locale the shell read.
+in_locale() {
+  local spec="$1"
+  shift
+  case "$spec" in
+  LANG=*) LC_ALL="" LC_CTYPE="" LANG="${spec#LANG=}" "$@" ;;
+  *) LC_ALL="$spec" "$@" ;;
+  esac
+}
+shell_blank() { # <locale> <body>: the shell's `[ -z "${body//[[:space:]]/}" ]`
+  in_locale "$1" "$BASH" -c 'b=$1; [ -z "${b//[[:space:]]/}" ]' _ "$2" 2>/dev/null
+}
+shell_trim() { # <locale> <body>: the shell's trim of trailing whitespace
+  in_locale "$1" "$BASH" -c 'b=$1; printf %s "${b%"${b##*[![:space:]]}"}"' _ "$2" 2>/dev/null
+}
+
+test_whitespace_is_the_locale_s() {
+  local utf8 loc body tail
+  utf8=$(space_locale)
+  # Not vacuous where it matters: macOS's en_US.UTF-8 holds U+3000, U+2003 and U+00A0.
+  if [ "$(uname -s)" = Darwin ]; then
+    assert_eq "$utf8" en_US.UTF-8 "this bash classes U+3000 as whitespace under en_US.UTF-8"
+  fi
+  for loc in ${utf8:+"$utf8"} C LANG=C; do
+    for body in $'\xe3\x80\x80' $'\xc2\xa0\xe2\x80\x83 '; do
+      reset_fixture
+      in_locale "$loc" run_cmd cmd_reply 900 "$body"
+      if shell_blank "$loc" "$body"; then
+        assert_eq "$RC" 2 "under $loc the shell read this reply body as empty ($ERR)"
+        assert_contains "$ERR" "the body is empty; there is nothing to post" "and says so"
+        assert_eq "$(writes_to 900)" 0 "and nothing is posted under $loc"
+      else
+        assert_eq "$RC" 0 "under $loc the shell posted this reply body ($ERR)"
+        assert_eq "$(writes_to 900)" 1 "once, under $loc"
+      fi
+      reset_fixture
+      in_locale "$loc" run_cmd cmd_comment "$body"
+      if shell_blank "$loc" "$body"; then
+        assert_eq "$RC" 2 "under $loc the shell read this comment body as empty ($ERR)"
+        assert_contains "$ERR" "the body is empty; there is nothing to post" "and says so"
+        assert_eq "$(comment_attempts)" 0 "and nothing is posted under $loc"
+      else
+        assert_eq "$RC" 0 "under $loc the shell posted this comment body ($ERR)"
+        assert_eq "$(comment_attempts)" 1 "once, under $loc"
+      fi
+    done
+    for tail in $'\xc2\xa0' $'\xe3\x80\x80' $'\xe2\x80\x83\n'; do
+      body="@codex review$tail"
+      reset_fixture
+      in_locale "$loc" run_cmd cmd_comment "$body"
+      if [ "$(shell_trim "$loc" "$body")" = "@codex review" ]; then
+        assert_eq "$RC" 0 "under $loc the shell trimmed this to the bare nudge and posted it ($ERR)"
+        assert_eq "$(comment_attempts)" 1 "once, under $loc"
+      else
+        assert_eq "$RC" 2 "under $loc the shell left the tail on, so a mention ($ERR)"
+        assert_contains "$ERR" "the body mentions '@codex'" "and refused it as one"
+        assert_eq "$(comment_attempts)" 0 "and nothing is posted under $loc"
+      fi
+    done
+  done
+}
+
+# --- what the fix rounds taught the writers, pinned before the port (ludics-lite#403) ----------
+# Each of these was a review round's finding, or a branch its fix added, that no case above
+# reached; the Python port has to keep every one of them.
+
+# What reaches a thread, byte for byte: the composed answer and then the marker, and each
+# duplicate's one-line pointer to the url its anchor's reply was given (ludics-lite#76). The urls
+# come back on stdout in the order the replies were posted.
+test_the_posted_bodies_are_exact() {
+  reset_fixture
+  run_cmd cmd_reply 900+901 $'Fixed in round 3.\n\n- `guard` now fires — "quoted", $dollars.'
+  assert_eq "$RC" 0 "the folded reply posts ($ERR)"
+  assert_eq "$(posted_to 900)" \
+    $'Fixed in round 3.\n\n- `guard` now fires — "quoted", $dollars.\n\n_🤖 Addressed by an automated coding agent_' \
+    "the anchor gets the body exactly as given, then the marker"
+  assert_eq "$(posted_to 901)" \
+    $'Duplicate of the thread answered at https://github.com/example/repo/pull/7#discussion_r900 — see there.\n\n_🤖 Addressed by an automated coding agent_' \
+    "the duplicate gets the pointer, then the marker"
+  assert_eq "$OUT" $'https://github.com/example/repo/pull/7#discussion_r900\nhttps://github.com/example/repo/pull/7#discussion_r901' \
+    "both urls, in the order the replies were posted"
+}
+
+# `--anchor` is spelled either way gh's own flags are, and a bare `--anchor` with nothing after it
+# is an invocation error rather than a reply with no anchor (round 3 of #86 added the flag).
+test_the_anchor_flag_takes_both_spellings() {
+  reset_fixture
+  run_cmd cmd_reply 901 --anchor=900
+  assert_eq "$RC" 0 "--anchor=<id> is the same flag ($ERR)"
+  assert_contains "$(posted_to 901)" "#discussion_r900" "and points the thread at the anchor"
+  assert_eq "$(writes_to 900)" 0 "without writing to the anchor"
+  reset_fixture
+  run_cmd cmd_reply 901 --anchor
+  assert_eq "$RC" 2 "--anchor with no id is an invocation error ($ERR)"
+  assert_contains "$ERR" "--anchor takes the comment id of the thread the answer is already in" \
+    "and says what it takes"
+  assert_eq "$(wc -l <"$REQUEST_LOG" | tr -d ' ')" 0 "with nothing posted"
+}
+
+# An anchored retry that itself fails part-way hands back a retry that still carries the anchor:
+# the answer is in 900 whichever invocation put the pointers up (round 3 of #86).
+test_a_failed_anchored_batch_keeps_its_anchor() {
+  reset_fixture
+  FAIL_ID=902
+  FAIL_MSG="503 No server is currently available to service your request"
+  run_cmd cmd_reply 901+902+903 --anchor 900
+  assert_eq "$RC" 3 "a gateway refusal mid-batch is transport ($ERR)"
+  assert_contains "$ERR" "The replies to 901 DID land" "what landed is named"
+  assert_contains "$ERR" "retry with: 902+903 --anchor 900" "and the retry keeps the anchor"
+  assert_eq "$(writes_to 903)" 0 "and the batch stopped at the failure"
+}
+
+# An ambiguous failure on the LAST id has nothing after it: the second answer of the question is
+# that nothing is outstanding, not a retry with an empty token (round 2 of #86).
+test_an_ambiguous_last_write_leaves_nothing_outstanding() {
+  reset_fixture
+  FAIL_ID=901
+  FAIL_MSG="Internal Server Error (HTTP 500)"
+  run_cmd cmd_reply 900+901 "Fixed in round 3 (abc1234)."
+  assert_eq "$RC" 3 "an ambiguous write is transport ($ERR)"
+  assert_contains "$ERR" "The replies to 900 DID land" "what landed is named"
+  assert_contains "$ERR" "Read comment 901's thread: retry with: 901 --anchor 900 if the reply is not there;" \
+    "the first answer keeps the anchor that holds the answer"
+  assert_contains "$ERR" "there is nothing else outstanding if it is" "and the second is that nothing is left"
+  # Byte for byte the shell's: its empty ${after:+...} left a double space before it.
+  assert_contains "$ERR" "if the reply is not there;  there is nothing else" "with the shell's spacing"
+}
+
+# The lookup's three ways to fail are three answers (9197c23): GraphQL rejecting the query says
+# nothing about the comment id (exit 2), an unanswered or malformed read is a retry and never a
+# missing thread (exit 3), and a thread FOUND whose mutation fails is exit 1 when the API refused
+# it and 3 when it never answered -- retried as a read, since resolving is idempotent.
+test_resolve_keeps_its_failures_apart() {
+  reset_fixture
+  THREADS_FAIL_MSG="HTTP 401: Bad credentials (https://api.github.com/graphql)"
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 2 "a rejected lookup is not about the comment ($ERR)"
+  assert_contains "$ERR" "GraphQL REJECTED the thread lookup for PR example/repo#7: gh: HTTP 401: Bad credentials" \
+    "it quotes the rejection"
+  assert_contains "$ERR" "says nothing about comment 900" "and says what it is not"
+  assert_eq "$(cat "$BODIES/mutations" 2>/dev/null)" "" "and nothing is mutated"
+  reset_fixture
+  retune API_ATTEMPTS=2
+  THREADS_FAIL_MSG="HTTP 503: Service Unavailable (https://api.github.com/graphql)"
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 3 "an unanswered lookup is transport ($ERR)"
+  assert_contains "$ERR" "the thread lookup on PR example/repo#7 did not complete: GraphQL did not answer the review-threads read after 2 attempts" \
+    "it says the read did not answer"
+  assert_contains "$ERR" "this is a RETRY, not a missing thread" "and that it is not a missing thread"
+  assert_eq "$(grep -c graphql "$REQUEST_LOG")" 2 "after every attempt"
+  reset_fixture
+  THREADS_ANSWER='{"data":{"repository":{"pullRequest":null}}}'
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 3 "a page with no connection in it is not an answer ($ERR)"
+  assert_contains "$ERR" "answered page 1 without a thread connection" "and says so"
+  reset_fixture
+  RESOLVE_FAIL_MSG="HTTP 403: Resource not accessible by integration"
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 1 "a rejected mutation is the API's answer ($ERR)"
+  assert_contains "$ERR" "resolveReviewThread was rejected for the thread at comment 900 on PR example/repo#7: gh: HTTP 403" \
+    "it names the thread and quotes the rejection"
+  reset_fixture
+  retune API_ATTEMPTS=2
+  RESOLVE_FAIL_MSG="HTTP 502: Bad gateway"
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 3 "an unanswered mutation is transport ($ERR)"
+  assert_contains "$ERR" "after 2 attempts" "after every attempt"
+  assert_contains "$ERR" "the thread was FOUND" "and it says the thread is there"
+  assert_eq "$(grep -c resolveReviewThread "$BODIES/mutations")" 2 "the mutation is retried"
+  # The READ policy on both calls, told apart from the write policy by the one class the two
+  # disagree on: a 500 is ambiguous for a write (one attempt, no retry) and transport for a read.
+  # Resolving is idempotent, so the mutation retries like the lookup does; a 502 above cannot show
+  # it, since both policies retry a gateway refusal.
+  reset_fixture
+  retune API_ATTEMPTS=2
+  THREADS_FAIL_MSG="HTTP 500: Internal Server Error (https://api.github.com/graphql)"
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 3 "a 500 on the lookup is transport ($ERR)"
+  assert_eq "$(grep -c graphql "$REQUEST_LOG")" 2 "and the lookup is retried like a read"
+  reset_fixture
+  retune API_ATTEMPTS=2
+  RESOLVE_FAIL_MSG="HTTP 500: Internal Server Error"
+  run_cmd cmd_resolve 900
+  assert_eq "$RC" 3 "a 500 on the mutation is transport, not a rejection ($ERR)"
+  assert_contains "$ERR" "after 2 attempts" "after every attempt"
+  assert_eq "$(grep -c resolveReviewThread "$BODIES/mutations")" 2 "the mutation is retried like a read"
+  # In a batch, the refusal names what was closed first, with the line break the shell's message
+  # has always carried.
+  reset_fixture
+  RESOLVE_FAIL_MSG="HTTP 403: Resource not accessible by integration"
+  RESOLVE_FAIL_NODE='"T901"'
+  run_cmd cmd_resolve 900+901
+  assert_eq "$RC" 1 "the second thread's rejection ($ERR)"
+  assert_eq "$OUT" "900 true" "the first was closed and said so"
+  assert_contains "$ERR" $'Already resolved in this invocation: 900 — resolving is\nidempotent, so the whole token is safe to repeat.' \
+    "and the refusal names it"
+}
+
+# A repeated id is one thread for resolve as for reply, so a token that names one thread twice
+# answers as a single resolve does, with no id in front of the verdict.
+test_a_repeated_id_resolves_once() {
+  reset_fixture
+  run_cmd cmd_resolve 900+900
+  assert_eq "$RC" 0 "a repeated id is not an error ($ERR)"
+  assert_eq "$OUT" true "one thread, answered as one"
+  assert_eq "$(grep -c resolveReviewThread "$BODIES/mutations")" 1 "with one mutation"
+}
+
+# resolve reads as deep as the open-thread gate does, and no deeper: both walk THREADS_PAGE_CAP
+# pages (review of #370, round 1 -- the lookup stopped at 20 pages while the gate read 50, so a
+# thread the gate named could never be cleared). A thread on the last page is found; one past it
+# is refused as unread, never answered as missing.
+test_resolve_reads_to_the_gate_s_page_cap() {
+  reset_fixture
+  retune THREADS_PAGE_CAP=3
+  THREADS="900:false 901:false 902:false 903:false"
+  THREADS_FIXTURE_PAGE=1
+  run_cmd cmd_resolve 902
+  assert_eq "$RC" 0 "a thread on the last page the cap allows is found ($ERR)"
+  assert_contains "$(cat "$BODIES/mutations")" '"T902"' "and closed"
+  reset_fixture
+  retune THREADS_PAGE_CAP=3
+  THREADS="900:false 901:false 902:false 903:false"
+  THREADS_FIXTURE_PAGE=1
+  run_cmd cmd_resolve 903
+  assert_eq "$RC" 3 "a thread past the cap is not judged missing ($ERR)"
+  assert_contains "$ERR" "still paging after 3 pages of 100" "the refusal names the cap"
+  assert_not_contains "$ERR" "no review thread starts" "and it is not a missing thread"
+}
+
 tests=(
   test_a_folded_entry_is_answered_by_one_invocation
   test_a_single_thread_reply_is_unchanged
@@ -1005,6 +1285,14 @@ tests=(
   test_a_mention_is_refused_before_anything_is_posted
   test_allow_mention_posts_a_meant_mention
   test_the_bare_nudge_is_the_one_comment_that_passes
+  test_the_posted_bodies_are_exact
+  test_the_anchor_flag_takes_both_spellings
+  test_a_failed_anchored_batch_keeps_its_anchor
+  test_an_ambiguous_last_write_leaves_nothing_outstanding
+  test_resolve_keeps_its_failures_apart
+  test_a_repeated_id_resolves_once
+  test_resolve_reads_to_the_gate_s_page_cap
+  test_whitespace_is_the_locale_s
 )
 
 run_tests "${tests[@]}" -- "$@"

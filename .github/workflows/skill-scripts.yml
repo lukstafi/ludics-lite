@@ -2,7 +2,9 @@ name: skill scripts
 
 # The prompts and the shell behind the skills, on the platforms the fleet runs: Ubuntu, macOS, and
 # Windows (PowerShell for the bounded driver; Git Bash is windows-git-bash.yml). Every push to
-# main and every pull request runs it. One job per concern, so a new one (a scheduled contract
+# main or v2 and every pull request runs it. v2 is the Python rewrite's integration branch
+# (ludics-lite#403): without its push runs, the fleet's base gate (`pr-review.sh base`) would
+# read NO VERDICT on v2 forever. One job per concern, so a new one (a scheduled contract
 # check, say) is one more entry below and no edit to the others.
 #
 # THE VERDICT GUARANTEE. `pr-review.sh merge` reads the head commit's check-runs and refuses a
@@ -43,7 +45,7 @@ name: skill scripts
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, v2]
 
 permissions:
   contents: read
@@ -115,6 +117,11 @@ jobs:
       - name: Exercise the hygiene checks against defective scratch trees
         if: ${{ !cancelled() }}
         run: scripts/test-check-prompts.sh || { echo '::error title=suite failed::test-check-prompts.sh'; exit 1; }
+      - name: Exercise the Python interpreter wrapper
+        # scripts/py, which every Python entry point of the v2 rewrite runs through (ludics-lite
+        # #403): seconds, and it is what the other Python steps stand on.
+        if: ${{ !cancelled() }}
+        run: scripts/test-py.sh || { echo '::error title=suite failed::test-py.sh'; exit 1; }
 
   lint:
     name: syntax, shellcheck, mode bits, parse guard
@@ -389,6 +396,27 @@ jobs:
       - name: Exercise the branch waiter's PR lookup
         run: wait-and-proceed/scripts/test-wait-for.sh
 
+  python:
+    name: python package, pyright and unit tests (ubuntu)
+    # The v2 rewrite's package, lib/ludics (ludics-lite#403): strict pyright at pythonVersion
+    # 3.12 with reportMatchNotExhaustive (pyrightconfig.json), so an unhandled variant of a sum
+    # type is red here, and the package's own unittest suites. Pyright runs only here and on the
+    # dev machine, never at run time, so the boxes carry no Node dependency; the version is
+    # pinned so a pyright release cannot turn a head red that was green.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Type-check the package (pyright, strict, pythonVersion 3.12)
+        run: npx --yes pyright@1.1.414
+      - name: The package's unit tests
+        run: scripts/py -m unittest discover -s lib -t lib -p 'test_*.py' -v
+
   # ---- every script suite on macOS, two jobs, two runner assignments -----------------------
   #
   # ludics-lite#55 collapsed four macOS jobs into one because four runner assignments per head
@@ -429,6 +457,11 @@ jobs:
       # ships a jq of its own, but not necessarily the fleet's patch release, so the suites below
       # run the pinned one, as every job that runs jq does (ludics-lite#508).
       - uses: ./.github/actions/setup-jq
+      # The subcommands ported to Python run through scripts/py, which needs a Python >= 3.12
+      # (ludics-lite#403); the image's own python3 is not promised to be one.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       # Every suite step below runs whether or not an earlier one failed, and a failure names
       # its suite in the run's annotations; the job's conclusion is red if any step's is.
       - name: ship-pr nudge
@@ -510,6 +543,10 @@ jobs:
         with:
           fetch-depth: 0 # the fleet launcher suite installs and preflights the real checkout
       - uses: ./.github/actions/setup-jq
+      # scripts/test-py.sh asserts this runner has a Python >= 3.12 for scripts/py to find.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Install tmux
         run: |
           set -e
@@ -558,6 +595,9 @@ jobs:
       - name: base negative-control helper
         if: ${{ !cancelled() }}
         run: scripts/test-run-against-base.sh || { echo '::error title=macOS suite failed::test-run-against-base.sh'; exit 1; }
+      - name: Python interpreter wrapper
+        if: ${{ !cancelled() }}
+        run: scripts/test-py.sh || { echo '::error title=macOS suite failed::test-py.sh'; exit 1; }
       - name: execution reservations
         if: ${{ !cancelled() }}
         run: python3 issue-wave/scripts/test-fleet-execution.py || { echo '::error title=macOS suite failed::test-fleet-execution.py'; exit 1; }

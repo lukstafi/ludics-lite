@@ -1,0 +1,422 @@
+"""ludics.prreview's readers: poll, rounds, status, and the jq semantics they read feeds with.
+
+The shell suites (test-pr-review-status.sh, -rounds.sh, -watch.sh) are the conformance suite;
+these pin the logic underneath them directly, with gh replaced by a table of answers. Since the
+integration (ludics-lite#403) the readers and ``watch`` share one implementation (feeds.py,
+state.py, poll.py, jqsem.py), so these pin what both read.
+"""
+
+import contextlib
+import io
+import json
+import time
+import unittest
+from collections.abc import Callable, Sequence
+
+from ludics import proc
+from ludics.prreview import jqsem as jq
+from ludics.prreview import poll, rounds, state, status, threads
+from ludics.prreview.clock import FuncClock
+from ludics.prreview.core import GhSession, Json, json_stream, load_config
+from ludics.prreview.feeds import HEAD_JQ, Ctx
+from ludics.prreview.shtext import tab_fields
+
+REV = "chatgpt-codex-connector"
+BOT = REV + "[bot]"
+HEAD = "a" * 40
+
+
+def iso(seconds_ago: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
+
+
+def tsv(fields: Sequence[str]) -> str:
+    """``@tsv`` over strings."""
+    return "\t".join(
+        f.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+        for f in fields
+    )
+
+
+class FakeGh:
+    """gh as a table: endpoint -> JSON (or a callable of the args), applying the few --jq filters
+    the readers send the way gh would."""
+
+    def __init__(self, answers: dict[str, Json | Callable[[Sequence[str]], Json]]) -> None:
+        self.answers = answers
+        self.calls: list[str] = []
+        self.down: set[str] = set()
+
+    def __call__(self, name: str, args: Sequence[str]) -> proc.Completed:
+        assert name == "gh" and args[0] == "api"
+        endpoint = next(a for a in args[1:] if not a.startswith("-") and "/" in a or a == "graphql")
+        self.calls.append(endpoint)
+        if endpoint in self.down:
+            return proc.Completed(1, "", "gh: HTTP 503: No server is currently available\n")
+        answer = self.answers.get(endpoint)
+        if answer is None:
+            return proc.Completed(1, "", "gh: Not Found (HTTP 404)\n")
+        value = answer(args) if callable(answer) else answer
+        if "--jq" in args:
+            return proc.Completed(0, self._filter(args[args.index("--jq") + 1], value), "")
+        return proc.Completed(0, json.dumps(value) + "\n", "")
+
+    @staticmethod
+    def _filter(expr: str, value: Json) -> str:
+        if expr == HEAD_JQ:
+            fields = [jq.jstr(jq.alt(jq.path(value, *p), "-")) for p in (("head", "sha"),
+                      ("mergeable_state",), ("created_at",))]
+            return tsv(fields) + "\n"
+        if expr == ".commit.committer.date":
+            return jq.jstr(jq.path(value, "commit", "committer", "date")) + "\n"
+        if expr == ".data.repository.pullRequest.reviewThreads":
+            return json.dumps(jq.path(value, "data", "repository", "pullRequest", "reviewThreads")) + "\n"
+        raise AssertionError(f"unexpected --jq {expr}")
+
+
+def session(gh: FakeGh, **env: str) -> GhSession:
+    base = {"REPO": "o/r", "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0"}
+    base.update(env)
+    return GhSession(load_config(base), run=gh, sleep=lambda _s: None)
+
+
+def ctx(gh: FakeGh, nudge_after: int | None = None, **env: str) -> Ctx:
+    """The reads' context outside a watch, on the wall clock, STALL 2400."""
+    s = session(gh, **env)
+    return Ctx(s, "o/r", s.config.reviewer, FuncClock(), 2400, nudge_after=nudge_after)
+
+
+def feeds(
+    *,
+    reactions: Sequence[Json] | None = None,
+    comments: Sequence[Json] | None = None,
+    reviews: Sequence[Json] | None = None,
+    inline: Sequence[Json] | None = None,
+    review_comments: Sequence[Json] | None = None,
+    head: str = HEAD,
+    mstate: str = "clean",
+    created: str = "2026-09-01T00:00:00Z",
+    head_at: str = "2026-09-01T00:00:00Z",
+    threads: Sequence[Json] | None = None,
+) -> FakeGh:
+    answers: dict[str, Json | Callable[[Sequence[str]], Json]] = {
+        "repos/o/r/issues/7/reactions?per_page=100": list(reactions or []),
+        "repos/o/r/issues/7/comments?per_page=100": list(comments or []),
+        "repos/o/r/pulls/7/reviews?per_page=100": list(reviews or []),
+        "repos/o/r/pulls/7/comments?per_page=100": list(inline or []),
+        "repos/o/r/pulls/7": {"head": {"sha": head}, "mergeable_state": mstate, "created_at": created},
+        f"repos/o/r/commits/{head}": {"commit": {"committer": {"date": head_at}}},
+        "graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "totalCount": len(threads or []), "pageInfo": {"hasNextPage": False, "endCursor": "c"},
+            "nodes": list(threads or [])}}}}},
+    }
+    gh = FakeGh(answers)
+    for rid in range(1, 1000):
+        gh.answers[f"repos/o/r/pulls/7/reviews/{rid}/comments?per_page=100"] = list(review_comments or [])
+    return gh
+
+
+def reaction(content: str, at: str) -> Json:
+    return {"user": {"login": BOT}, "content": content, "created_at": at}
+
+
+def review(
+    rid: int, sha: str, at: str, body: str = "findings", st: str = "COMMENTED"
+) -> dict[str, Json]:
+    return {"id": rid, "user": {"login": BOT}, "state": st, "commit_id": sha,
+            "submitted_at": at, "body": body}
+
+
+def comment(cid: int, at: str, body: str, login: str = BOT) -> dict[str, Json]:
+    return {"id": cid, "user": {"login": login}, "created_at": at, "updated_at": at, "body": body}
+
+
+def run_state(gh: FakeGh, nudge_after: int | None = None) -> state.State:
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        return state.status_state(ctx(gh, nudge_after), "7")
+
+
+def gated(gh: FakeGh, st: state.State) -> state.State:
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        return state.approval_gate(ctx(gh), "7", st)
+
+
+# --- jq semantics ---------------------------------------------------------------------------------
+
+
+class JqSemantics(unittest.TestCase):
+    def test_a_stream_parses_as_jq_reads_it(self) -> None:
+        self.assertEqual(json_stream('[1] [{"a":"b"}]\n'), [[1], [{"a": "b"}]])
+        self.assertEqual(json_stream('["\\ud83d\\ude00"]'), [["\U0001f600"]])
+        # A lone high-surrogate escape is jq's parse error, a lone low one its U+FFFD.
+        self.assertIsNone(json_stream('[{"b":"\\ud83d"}]'))
+        self.assertIsNone(json_stream('[{"\\uD83D":1}]'))
+        self.assertIsNone(json_stream('[1] ["x\\ud83d\\u0041"]'))
+        self.assertEqual(json_stream('[{"b":"a\\udc80"}]'), [[{"b": "a\ufffd"}]])
+        self.assertEqual(json_stream('["\\\\ud83d"]'), [["\\ud83d"]])
+        self.assertIsNone(json_stream("[1"))
+
+    def test_order_is_jqs(self) -> None:
+        values: list[Json] = [{"a": 1}, [1], "a", 2, True, False, None]
+        self.assertEqual(jq.sort_by(values, lambda v: v), [None, False, True, 2, "a", [1], {"a": 1}])
+        self.assertNotEqual(jq.cmp(1, True), 0)
+        self.assertEqual(jq.cmp(1, 1.0), 0)
+        self.assertTrue(jq.gt("1", 5))
+
+    def test_max_by_keeps_the_last_of_equals_and_none_of_nothing(self) -> None:
+        items: list[dict[str, Json]] = [{"k": 1, "n": "first"}, {"k": 1, "n": "last"}, {"k": 0, "n": "x"}]
+        best = jq.max_by(items, lambda i: i["k"])
+        self.assertEqual(best, {"k": 1, "n": "last"})
+        nothing: list[Json] = []
+        self.assertIsNone(jq.max_by(nothing, lambda i: i))
+
+    def test_indexing_refuses_what_jq_refuses(self) -> None:
+        self.assertIsNone(jq.idx(None, "a"))
+        with self.assertRaises(jq.JqError):
+            jq.idx("s", "a")
+        with self.assertRaises(jq.JqError):
+            jq.startswith(5, "x")
+        with self.assertRaises(jq.JqError):
+            jq.test(7, jq.onig("[^[:space:]]"))
+        with self.assertRaises(jq.JqError):
+            poll.short(7)
+        self.assertEqual(poll.short("héllo wörld"), "héllo w")
+
+    def test_fromdateiso8601_is_strptimes(self) -> None:
+        self.assertEqual(jq.fromdateiso8601("2026-09-01T00:00:00Z"), 1788220800)
+        self.assertEqual(jq.fromdateiso8601("2026-9-1T0:0:0Z"), 1788220800)
+        for bad in ("2026-09-01T00:00:00.5Z", "2026-13-01T00:00:00Z", "2026-09-01 00:00:00Z", "x"):
+            with self.assertRaises(jq.JqError, msg=bad):
+                jq.fromdateiso8601(bad)
+        with self.assertRaises(jq.JqError):
+            jq.fromdateiso8601(5)
+
+    def test_tab_fields(self) -> None:
+        self.assertEqual(tab_fields("a\t\tb\tc d\t", 3), ["a", "b", "c d"])
+        self.assertEqual(tab_fields("", 3), ["", "", ""])
+        self.assertEqual(tab_fields("a\tb\nc\td", 2), ["a", "b"])
+
+    def test_space_is_unicode_white_space_not_pythons(self) -> None:
+        nonspace = jq.onig("[^[:space:]]")
+        self.assertTrue(jq.test("\x1c", nonspace))
+        self.assertFalse(jq.test("\xa0\u3000\u2028\t", nonspace))
+
+
+# --- poll -----------------------------------------------------------------------------------------
+
+
+class PollItems(unittest.TestCase):
+    def test_threads_at_one_anchor_fold_with_every_distinct_body(self) -> None:
+        a: Json = {"id": 900, "path": "x", "line": 3, "body": "one"}
+        b: Json = {"id": 901, "path": "x", "line": 3, "body": "two"}
+        c: Json = {"id": 902, "path": "x", "line": 3, "body": "one"}
+        d: Json = {"id": 903, "path": "y", "line": 3, "body": "one"}
+        folded = poll.fold_inline([a, d, b, c])
+        self.assertEqual([poll.thread_list(f) for f in folded], ["900+901+902", "903"])
+        self.assertEqual(poll.body_block(folded[0]), "[thread 900]\none\n[thread 901]\ntwo")
+        self.assertEqual(poll.dupe_note(folded[0]),
+                         " (3 threads at one location, 2 findings as written; one reply answers all)")
+        self.assertEqual(poll.dupe_note(folded[1]), "")
+
+    def test_the_anchor_line(self) -> None:
+        self.assertEqual(poll.item_line({"line": 5, "start_line": 3}), "3-5")
+        self.assertEqual(poll.item_line({"position": 12}), "@12")
+        self.assertEqual(poll.item_line({}), "?")
+        self.assertEqual(poll.item_side({"side": "LEFT", "start_side": "RIGHT"}),
+                         " side=LEFT start_side=RIGHT")
+        self.assertEqual(poll.item_was({"line": 7, "original_line": 3}), " was=3")
+        self.assertEqual(poll.item_was({"position": 9, "original_position": 5}), " was=@5")
+        self.assertEqual(poll.item_was({"position": 5, "original_position": 5}), "")
+
+    def test_short_and_stamps(self) -> None:
+        self.assertEqual(poll.short(None), "-")
+        self.assertEqual(poll.short(""), "-")
+        self.assertEqual(poll.short(HEAD), "aaaaaaa")
+        body = "**Reviewed commit:** `ccccccc`\nlater **Reviewed commit:** `ddddddd1`"
+        self.assertEqual(poll.item_stamp({"body": body}), "ddddddd")
+
+    def test_the_about_codex_block_folds_only_as_the_body_s_end(self) -> None:
+        block = poll.CODEX_ABOUT_OPEN + "\ninterior\n</details>\n  "
+        self.assertEqual(poll.fold_codex_about("findings\n" + block),
+                         "findings\n" + poll.CODEX_ABOUT_FOLDED)
+        self.assertEqual(poll.fold_codex_about("x" + block + "more"), "x" + block + "more")
+        self.assertEqual(poll.fold_codex_about(None), "")
+
+
+class PollRound(unittest.TestCase):
+    def run_poll(self, gh: FakeGh, mark: str = "") -> tuple[int, str, str]:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = poll.poll(ctx(gh), "7", mark)
+        return result.rc, result.text, err.getvalue()
+
+    def test_a_round(self) -> None:
+        gh = feeds(
+            inline=[{"id": 900, "path": "a.sh", "line": 3, "body": "a finding",
+                     "user": {"login": BOT}, "original_commit_id": HEAD}],
+            comments=[comment(700, "2026-09-01T00:00:00Z", "summary\n**Reviewed commit:** `aaaaaaa`"),
+                      comment(701, "2026-09-01T00:00:00Z", "<!-- codex-pull-request-review-summary -->")],
+            reviews=[review(800, HEAD, "2026-09-01T00:00:00Z")],
+        )
+        rc, out, _ = self.run_poll(gh)
+        self.assertEqual(rc, 0)
+        self.assertIn(f"--- inline id=900 a.sh:3 commit=aaaaaaa by {BOT}\na finding", out)
+        self.assertIn(f"--- summary id=700 commit=aaaaaaa by {BOT}", out)
+        self.assertNotIn("id=701", out)
+        self.assertIn(f"items: inline:900:aaaaaaa:{BOT}:- summary:700:aaaaaaa:{BOT}:- "
+                      f"review:800:aaaaaaa:{BOT}:COMMENTED", out)
+        self.assertTrue(out.endswith("watermark: 900,701,800\n"))
+
+    def test_a_shape_the_rendering_cannot_take_fails_after_what_was_printed(self) -> None:
+        gh = feeds(
+            inline=[{"id": 900, "body": "printed first", "user": {"login": BOT},
+                     "original_commit_id": HEAD}],
+            reviews=[{**review(800, HEAD, "2026-09-01T00:00:00Z"), "commit_id": 7}],
+        )
+        rc, out, _ = self.run_poll(gh)
+        self.assertEqual(rc, 4)
+        self.assertIn("printed first", out)
+        self.assertNotIn("watermark:", out)
+
+    def test_the_index_and_watermark_lines_are_what_the_shell_captured(self) -> None:
+        # The watermark was `jq -s` without -c, so an array maximum spans lines; each items field
+        # was a command substitution, which drops a NUL. Neither shape is GitHub's, but the lines
+        # are what watch reads.
+        gh = feeds(
+            comments=[{**comment(0, "x", "a"), "id": "8\u00000"}, {**comment(0, "x", "b"), "id": [1]}],
+        )
+        rc, out, _ = self.run_poll(gh)
+        self.assertEqual(rc, 0)
+        self.assertIn(f"items:  summary:80:-:{BOT}:-", out)
+        self.assertIn("--- summary id=8\u00000 ", out)
+        self.assertTrue(out.endswith("watermark: 0,[\n  1\n],0\n"), out)
+
+    def test_a_feed_that_did_not_answer_is_exit_3(self) -> None:
+        gh = feeds()
+        gh.down.add("repos/o/r/issues/7/comments?per_page=100")
+        rc, out, err = self.run_poll(gh)
+        self.assertEqual((rc, out), (3, ""))
+        self.assertIn("feed(s): summary after 1 attempts each", err)
+
+
+# --- rounds ---------------------------------------------------------------------------------------
+
+
+class Rounds(unittest.TestCase):
+    def count(self, reviews: Sequence[Json], comments: Sequence[Json] | None = None, gap: int = 900,
+              icap: int | None = None, rcap: int | None = None) -> str:
+        gh = feeds(reviews=reviews, comments=comments)
+        got = state.review_rounds(ctx(gh), "7", gap, icap, rcap)
+        return f"{got.token()}|{got.detail}"
+
+    def test_bursts_by_head_and_gap(self) -> None:
+        r = self.count([
+            review(1, "aaaa", "2026-09-01T10:00:00Z"),
+            review(2, "aaaa", "2026-09-01T10:00:03Z"),
+            review(3, "aaaa", "2026-09-01T10:40:00Z"),
+            review(4, "bbbb", "2026-09-01T11:00:00Z", st="CHANGES_REQUESTED"),
+            review(5, "cccc", "2026-09-01T12:00:00Z", st="APPROVED"),
+        ])
+        self.assertEqual(r, f"3|3 round(s) of {REV} findings over 2 head(s)")
+
+    def test_a_comment_quoting_a_truncated_sha_joins_its_burst(self) -> None:
+        r = self.count([review(1, "aaaa1111", "2026-09-01T10:00:00Z")],
+                       [comment(9, "2026-09-01T10:00:05Z", "**Reviewed commit:** `aaaa111`")])
+        self.assertTrue(r.startswith("1|"))
+
+    def test_caps_count_as_of_a_watermark(self) -> None:
+        reviews = [review(1, "aaaa", "2026-09-01T10:00:00Z"), review(2, "bbbb", "2026-09-01T11:00:00Z")]
+        self.assertTrue(self.count(reviews, rcap=1).startswith("1|"))
+        self.assertTrue(self.count(reviews).startswith("2|"))
+
+    def test_a_date_that_does_not_parse_is_unknown(self) -> None:
+        self.assertEqual(self.count([review(1, "aaaa", "yesterday")]),
+                         "unknown|the reviews feed did not parse")
+
+    def test_rounds_line(self) -> None:
+        self.assertEqual(rounds.rounds_line("2|d", 12), ("review rounds with findings: 2 of 12 (d)", 0))
+        self.assertEqual(rounds.rounds_line("2|d", None)[1], 0)
+        self.assertEqual(rounds.rounds_line("13|d", 12)[1], 1)
+        self.assertEqual(rounds.rounds_line("unknown|why", 12)[1], 3)
+        self.assertEqual(rounds.count_token("unknown|why"), "unknown")
+        self.assertEqual(rounds.count_token("4|x"), "4")
+
+
+# --- status ---------------------------------------------------------------------------------------
+
+
+class StatusState(unittest.TestCase):
+    def test_idle_on_a_review_of_the_head(self) -> None:
+        st = run_state(feeds(reviews=[review(5, HEAD, "2026-09-01T00:00:00Z")]))
+        self.assertEqual(st.tok, "idle", st.line())
+        self.assertEqual(st.merge, "clean")
+
+    def test_a_thumbs_up_is_an_approval_and_the_gate_reads_the_threads(self) -> None:
+        gh = feeds(reactions=[reaction("+1", iso(30))], head_at=iso(3600),
+                   threads=[{"isResolved": False, "path": "a b.sh",
+                             "comments": {"nodes": [{"fullDatabaseId": "4095735704",
+                                                     "author": {"login": "codex"}}]}}])
+        st = run_state(gh)
+        self.assertEqual(st.line(), f"approved|-|clean|👍 from {REV}")
+        self.assertEqual(gated(gh, st).line(),
+                         f"unresolved|-|clean|1|👍 from {REV}|4095735704 by codex on a\\ b.sh")
+
+    def test_a_live_eyes_is_reviewing_and_an_old_one_stalled(self) -> None:
+        self.assertEqual(run_state(feeds(reactions=[reaction("eyes", iso(60))])).tok, "reviewing")
+        self.assertEqual(run_state(feeds(reactions=[reaction("eyes", iso(9999))])).tok, "stalled")
+
+    def test_a_feed_that_did_not_answer_is_unknown(self) -> None:
+        gh = feeds()
+        gh.down.add("repos/o/r/issues/7/reactions?per_page=100")
+        self.assertTrue(run_state(gh).line().startswith("unknown|-|-|the reactions API did not answer (gh: HTTP 503"))
+
+    def test_a_shape_a_read_cannot_take_is_unknown(self) -> None:
+        st = run_state(feeds(comments=[{**comment(1, "2026-09-01T00:00:00Z", "x"), "body": 7}]))
+        # The head is read after the feeds, so no mergeability rides on this line yet.
+        self.assertEqual(st.line(), "unknown|-|-|the comments feed did not parse")
+
+    def test_a_pending_request_is_nudged(self) -> None:
+        st = run_state(feeds(comments=[comment(9, iso(30), "@codex review", login="me")]), 1)
+        self.assertEqual(st.tok, "nudged", st.line())
+        self.assertEqual(state.status_line(st, "o/r", "7").split(" — ")[0], "review EXPECTED but not started")
+
+    def test_the_initialization_failure_names_its_head(self) -> None:
+        body = ("Codex Review: Something went wrong. Try again later by commenting “@codex review”.\n\n"
+                f"```\nProvided git ref {HEAD} does not exist\n```")
+        st = run_state(feeds(comments=[comment(1, "2026-09-01T01:00:00Z", body)]))
+        self.assertEqual(st.tok, "failed", st.line())
+        self.assertEqual(st.detail.split("|")[:2], ["aaaaaaa", "git"])
+
+
+class StatusLine(unittest.TestCase):
+    def test_tokens(self) -> None:
+        def line(tok: state.Token, age: int | None, merge: str, detail: str, pr: str = "7") -> str:
+            return state.status_line(state.State(tok, age, merge, detail), "o/r", pr)
+
+        self.assertEqual(line("approved", None, "dirty", "x"),
+                         "approved (x); " + state.conflict_note("dirty", "o/r", "7"))
+        self.assertIn("the next move is yours", line("idle", 5, "clean", "d"))
+        self.assertNotIn("the next move is yours", line("idle", 5, "draft", "d"))
+        self.assertIn("gh pr ready <pr> --repo o/r", line("idle", 5, "draft", "d", ""))
+        self.assertIn("running 2m", line("reviewing", 125, "clean", "d"))
+
+    def test_the_status_line_entry_keeps_pipes_in_the_detail_and_names_a_stranger(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status.run_line(session(feeds()), ["unknown|-|-|gh: 502 | Bad Gateway", "7"])
+            status.run_line(session(feeds()), ["weird|-|-|", "7"])
+        first, second = out.getvalue().splitlines()
+        self.assertEqual(first, state.status_line(state.State("unknown", None, "-", "gh: 502 | Bad Gateway"), "o/r", "7"))
+        self.assertEqual(second, "unrecognised state 'weird' — treat as unknown and retry")
+
+    def test_threads_named_names_ten(self) -> None:
+        rows = [tsv([str(i), "u", "p"]) for i in range(12)]
+        n, shown = threads.threads_named(rows)
+        self.assertEqual(n, 12)
+        self.assertTrue(shown.endswith("9 by u on p, and 2 more"))
+
+
+if __name__ == "__main__":
+    unittest.main()

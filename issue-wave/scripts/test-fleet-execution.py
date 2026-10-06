@@ -5,9 +5,18 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 SCRIPT = Path(__file__).with_name('fleet-worker.sh')
+# The execution registry the anchor runs, wherever this checkout keeps it: the v2 package module
+# once fleet-execution.py is folded into lib/ludics (ludics-lite#403), else the standalone helper.
+# The in-process cases below load it with runpy and drive it by its positional argv, which the fold
+# keeps; neither path existing fails them loudly, never silently. It runs under THIS interpreter,
+# not a bare `python3`, since the package module needs Python >= 3.12.
+CHECKOUT = SCRIPT.resolve().parents[2]
+PACKAGED_REGISTRY = CHECKOUT / 'lib' / 'ludics' / 'fleetworker' / 'registry.py'
+REGISTRY = PACKAGED_REGISTRY if PACKAGED_REGISTRY.exists() else SCRIPT.with_name('fleet-execution.py')
 # A measurement on a lab box probes that box's lane lock (ludics-lite#445), and the real endpoint
 # map makes `rog` and `rog-nv-linux` lab boxes, so no case may reach the real lab's lock directory:
 # every subprocess below inherits this one.
@@ -413,8 +422,14 @@ def one_entry_per_box():
         # exact entries up to case, so the split roster is admitted as it was before #395.
         bare = root / 'bare'
         (bare / 'issue-wave' / 'scripts').mkdir(parents=True)
+        # The script and what it runs: the standalone registry while there is one, and the
+        # interpreter wrapper and package a ported subcommand forwards to (ludics-lite#403).
         for name in ['fleet-worker.sh', 'fleet-execution.py']:
-            shutil.copy(SCRIPT.with_name(name), bare / 'issue-wave' / 'scripts' / name)
+            if SCRIPT.with_name(name).exists():
+                shutil.copy(SCRIPT.with_name(name), bare / 'issue-wave' / 'scripts' / name)
+        (bare / 'scripts').mkdir()
+        shutil.copy(CHECKOUT / 'scripts' / 'py', bare / 'scripts' / 'py')
+        shutil.copytree(CHECKOUT / 'lib', bare / 'lib', ignore=shutil.ignore_patterns('__pycache__'))
         copied = bare / 'issue-wave' / 'scripts' / 'fleet-worker.sh'
         with tempfile.NamedTemporaryFile(mode='w', dir=root, suffix='.input') as stream:
             json.dump(request('bare-wsl', 'rog-nv-wsl'), stream)
@@ -422,7 +437,6 @@ def one_entry_per_box():
             out, err = run('execution', 'reserve', stream.name, script=copied, FLEET_BOXES=split)
             assert 'EXECUTION WARNING: no endpoint map' in err and 'wake-lab.sh is missing' in err, err
             # A wake-lab.sh that refuses its own map refuses the reservation instead.
-            (bare / 'scripts').mkdir()
             (bare / 'scripts' / 'wake-lab.sh').write_text('echo "wake-lab.sh: the endpoint map is inconsistent" >&2; exit 1\n')
             out, err = run('execution', 'reserve', stream.name, script=copied, expected=1,
                            FLEET_BOXES='mac-studio')
@@ -430,7 +444,7 @@ def one_entry_per_box():
         assert 'bare-wsl' in records()
         # The helper refuses a map naming one alias on two rows, rather than picking a box.
         with tempfile.TemporaryDirectory(prefix='fleet-map-') as state:
-            result = subprocess.run(['python3', str(SCRIPT.with_name('fleet-execution.py')), state, 'reserve',
+            result = subprocess.run([sys.executable, str(REGISTRY), state, 'reserve',
                                      'owner', 'token', json.dumps(request('bad-map', 'mac-studio')), 'mac-studio',
                                      '', 'rog rog-nv-linux\nnova rog-nv-linux'], text=True, capture_output=True)
             assert result.returncode == 1 and 'puts rog-nv-linux on both rog and nova' in result.stderr, result
@@ -600,7 +614,7 @@ def lab_host_identity():
         assert records()['lab-minix']['state'] == 'launching'
         # A caller that passes no identity is refused rather than read as the lab host.
         with tempfile.TemporaryDirectory(prefix='fleet-lab-bare-') as state:
-            result = subprocess.run(['python3', str(SCRIPT.with_name('fleet-execution.py')), state, 'reserve',
+            result = subprocess.run([sys.executable, str(REGISTRY), state, 'reserve',
                                      'owner', 'token', json.dumps(request('bare', 'rog-nv-linux')),
                                      'rog-nv-linux', '', 'rog rog-nv-linux'], text=True, capture_output=True)
             assert result.returncode == 1 and "the anchor's and lab host's names were not passed" in result.stderr, result
@@ -805,12 +819,12 @@ with tempfile.TemporaryDirectory(prefix='fleet-durable-') as temporary:
     with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload), roster]), \
             patch('os.fsync', side_effect=sync), patch('os.replace', side_effect=replace):
         with redirect_stdout(io.StringIO()):
-            runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
+            runpy.run_path(str(REGISTRY))
     assert events == ['directory', 'file', 'replace', 'directory'], events
     events.clear()
     with patch('sys.argv', ['helper', temporary, 'reserve', 'owner', 'token', json.dumps(payload), roster]), \
             patch('os.fsync', side_effect=sync), redirect_stdout(io.StringIO()):
-        runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
+        runpy.run_path(str(REGISTRY))
     assert events == ['directory', 'directory'], events
     print('PASS: parent and record directory synced around atomic publication')
 
@@ -837,7 +851,7 @@ with tempfile.TemporaryDirectory(prefix='fleet-lane-held-') as temporary:
                             'rog-nv-linux', '', 'rog rog-nv-linux rog-nv-wsl', 'mac-studio', 'mac-studio']), \
             patch.dict(os.environ, {'WAKE_LAB_LOCK_DIR': str(locks)}), \
             patch('os.replace', side_effect=replace), redirect_stdout(io.StringIO()):
-        helper = runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
+        helper = runpy.run_path(str(REGISTRY))
     for descriptor in helper['LANE_LOCKS']:
         os.close(descriptor)
     assert seen == ['held'], seen
@@ -863,7 +877,7 @@ with tempfile.TemporaryDirectory(prefix='fleet-window-order-') as temporary:
         try:
             with patch('sys.argv', ['helper', temporary, action, 'owner', 'token', json.dumps(data), 'mac']), \
                     patch('os.replace', side_effect=replace), redirect_stdout(io.StringIO()):
-                runpy.run_path(str(SCRIPT.with_name('fleet-execution.py')))
+                runpy.run_path(str(REGISTRY))
             assert crash_after is None, published
         except SystemExit as exit:
             assert crash_after is not None and exit.code == 1 and len(published) == crash_after, (exit, published)

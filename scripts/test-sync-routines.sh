@@ -119,7 +119,13 @@ fi
 # check-prompts.sh is what judges the real prompts.
 REPO="$TMP/repo"
 mkdir -p "$REPO/scripts"
-cp "$HERE/check-prompts.sh" "$REPO/scripts/check-prompts.sh"
+# check-prompts.sh forwards to Python (ludics-lite#403): scripts/py finds the interpreter and lib/
+# holds the checker, so a checkout that can run it carries all three.
+copy_checker() {
+  cp "$HERE/check-prompts.sh" "$HERE/py" "$1/scripts/"
+  ln -s "$HERE/../lib" "$1/lib"
+}
+copy_checker "$REPO"
 cp "$SYNC" "$REPO/scripts/sync-routines.sh"
 chmod +x "$REPO/scripts/sync-routines.sh"
 SR="$REPO/scripts/sync-routines.sh"
@@ -376,7 +382,7 @@ done
 LINKREPO="$TMP/linkrepo"
 rm -rf "$LINKREPO"
 mkdir -p "$LINKREPO/scripts"
-cp "$HERE/check-prompts.sh" "$LINKREPO/scripts/check-prompts.sh"
+copy_checker "$LINKREPO"
 cp "$SYNC" "$LINKREPO/scripts/sync-routines.sh"
 chmod +x "$LINKREPO/scripts/sync-routines.sh"
 ln -s "$TMP/outside-routines" "$LINKREPO/routines"
@@ -934,7 +940,7 @@ strip_check() {
 }
 BROKEN="$TMP/broken"
 mkdir -p "$BROKEN/scripts"
-cp "$HERE/check-prompts.sh" "$BROKEN/scripts/check-prompts.sh"
+copy_checker "$BROKEN"
 strip_marked_block kind-guard "$BROKEN/scripts/sync-routines.sh"
 strip_check kind-guard "$BROKEN/scripts/sync-routines.sh" \
   "a copy of the script without the file-kind guard was built"
@@ -959,7 +965,7 @@ contains "$out" "$R1: republished to" \
 # pruning pass.
 NOPRUNE="$TMP/noprune"
 mkdir -p "$NOPRUNE/scripts"
-cp "$HERE/check-prompts.sh" "$NOPRUNE/scripts/check-prompts.sh"
+copy_checker "$NOPRUNE"
 strip_marked_block prune-guard "$NOPRUNE/scripts/sync-routines.sh"
 strip_check prune-guard "$NOPRUNE/scripts/sync-routines.sh" \
   "a copy of the script that publishes without pruning was built"

@@ -164,9 +164,13 @@ trap cleanup EXIT
 
 # Copy the dispatcher beside a canned base helper: no live GitHub reads, and no
 # production bypass knob. The production helper's own suites pin its red diagnostics.
-mkdir -p "$TMP/dispatcher/issue-wave/scripts" "$TMP/dispatcher/ship-pr/scripts"
+mkdir -p "$TMP/dispatcher/issue-wave/scripts" "$TMP/dispatcher/ship-pr/scripts" "$TMP/dispatcher/scripts"
 cp "$FW" "$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
-cp "$HERE/fleet-execution.py" "$TMP/dispatcher/issue-wave/scripts/fleet-execution.py"
+# The standalone registry while there is one; the interpreter wrapper and the package the ported
+# subcommands forward to (ludics-lite#403) travel with the dispatcher either way.
+[ ! -f "$HERE/fleet-execution.py" ] || cp "$HERE/fleet-execution.py" "$TMP/dispatcher/issue-wave/scripts/fleet-execution.py"
+cp "$HERE/../../scripts/py" "$TMP/dispatcher/scripts/py"
+cp -R "$HERE/../../lib" "$TMP/dispatcher/lib"
 cp "$HERE/bg-run.sh" "$TMP/dispatcher/issue-wave/scripts/bg-run.sh"
 FW="$TMP/dispatcher/issue-wave/scripts/fleet-worker.sh"
 export BASE_CALL_LOG="$TMP/base-calls"
@@ -242,6 +246,9 @@ case " $* " in *" --interim "*) ;; *) exit 4 ;; esac
 # SHIM_BASE_CONCLUDE: an execution conclusion payload the read concludes while it "waits", as an
 # integration run finishing mid-gate would (ludics-lite#401, review round 6).
 [ -z "${SHIM_BASE_CONCLUDE:-}" ] || env FLEET_BOXES="testbox other" "$SHIM_FW" execution conclude "$SHIM_BASE_CONCLUDE" >/dev/null || exit 3
+# SHIM_BASE_HALT: a halt reason the read records while it "waits", as a coordinator halting the
+# fleet during a minutes-long base read would: the gate re-reads the lease and halt after it.
+[ -z "${SHIM_BASE_HALT:-}" ] || "$SHIM_FW" halt "$SHIM_BASE_HALT" >/dev/null || exit 3
 if [ -n "${SHIM_BASE_REQUIRE_PREFLIGHT:-}" ] && [ ! -e "$SHIM_BASE_REQUIRE_PREFLIGHT" ]; then
   echo 'base read occurred before preflight'; exit 3
 fi
@@ -540,7 +547,7 @@ codex_loop=$(readme_block 'for s in ship-pr wait-and-proceed after-merge' | grep
 # Tracked paths close the class rather than one name (post-merge-cleanup.sh, which has to judge a
 # real checkout rather than a declaration, exempts `.claude/` by name instead). `.git` is never
 # tracked, so unlike under `find` it no longer has to be declared.
-non_skill_dirs=".github routines scripts"
+non_skill_dirs=".github lib routines scripts"
 top_dirs() { # <checkout>: the top-level directories the repository declares, one per line
   git -C "$1" ls-files -z | while IFS= read -r -d '' path; do
     case $path in */*) printf '%s\n' "${path%%/*}" ;; esac
@@ -864,6 +871,19 @@ expect "release on an unwritable anchor fails at once, not after the lock wait" 
 chmod 755 "$ISSUE_WAVE_STATE"
 expect "release drops it" 0 "RELEASED coordinator lease" -- "$FW" release
 expect "coordinator after release: nobody" 3 "nobody holds" -- "$FW" coordinator
+# The lease lock is take_lock's: a lock whose recorded holder is dead (a coordinator killed mid
+# mutation, a rebooted anchor) is reclaimed, not a wedge for every later claim.
+mkdir "$ISSUE_WAVE_STATE/COORDINATOR.lock" && echo 999999 > "$ISSUE_WAVE_STATE/COORDINATOR.lock/pid"
+expect "a lease lock left by a dead holder is reclaimed by the next claim" 0 "CLAIMED coordinator lease on testbox" -- env FLEET_LOCK_WAIT=1 "$FW" claim
+[ -d "$ISSUE_WAVE_STATE/COORDINATOR.lock" ] && ko "the reclaimed lease lock was left behind" || ok "...and released afterwards"
+"$FW" release >/dev/null
+expect "claim refuses an unknown option" 2 "claim: unknown option --tak" -- "$FW" claim --tak
+# Lease and halt live on the anchor: one that does not answer is unreachable (exit 4), never a
+# refusal or a verdict about the lease.
+for verb in claim release coordinator; do
+  label=$(printf '%s' "$verb" | tr 'a-z' 'A-Z')
+  expect "$verb against an anchor that does not answer is unreachable" 4 "^$label UNREACHABLE far-anchor$" -- env FLEET_ANCHOR=far-anchor "$FW" "$verb"
+done
 mkdir -p "$ISSUE_WAVE_STATE/COORDINATOR"
 expect "claim --take that cannot write the lease fails, not CLAIMED" 1 "CLAIM FAILED: could not write" -- "$FW" claim --take
 expect "a plain claim over an unwritable lease path fails too" 1 "CLAIM FAILED: could not write" -- "$FW" claim
@@ -1774,6 +1794,38 @@ expect "a coordinator adopting the lease inherits the halt" 1 "LAUNCH REFUSED te
   "${B[@]}" launch testbox h3 --target-repo example/project --kind claude --brief "$brief" --cwd "$proj"
 expect "...and reads it with halted" 1 "HALTED .*adopted mid-halt" -- "${B[@]}" halted
 "$FW" claim --take >/dev/null; "$FW" resume-launches >/dev/null
+expect "halt needs a reason" 2 "halt: give the reason" -- "$FW" halt
+expect "resume-launches with no halt says so, exit 0" 0 "^launches were not halted$" -- "$FW" resume-launches
+# A marker written before halts carried an identity (1b80779): its first line stays the halt's
+# generation -- the registry binds a triage reservation to it -- and a later halt appends an update.
+printf '2026-09-01T00:00:00Z legacy reason with no identity\n' > "$ISSUE_WAVE_STATE/HALT"
+expect "a halt over a legacy marker keeps it, appending the update" 0 "^HALTED: launches refused until resume-launches -- newer reason$" -- "$FW" halt "newer reason"
+[ "$(head -n 1 "$ISSUE_WAVE_STATE/HALT")" = "2026-09-01T00:00:00Z legacy reason with no identity" ] &&
+  grep -Eq '^update [0-9T:-]+Z newer reason$' "$ISSUE_WAVE_STATE/HALT" && ok "...first line kept, update appended" || ko "legacy marker rewritten: $(cat "$ISSUE_WAVE_STATE/HALT")"
+"$FW" resume-launches >/dev/null
+# A halt's identity outlives a re-halt (the generation the registry binds triage to).
+"$FW" halt "first reason" >/dev/null
+first_id=$(sed -n '1s/^[^ ]* id=\([^ ]*\) .*/\1/p' "$ISSUE_WAVE_STATE/HALT")
+"$FW" halt "second reason" >/dev/null
+[ -n "$first_id" ] && grep -q "^[^ ]* id=$first_id second reason$" "$ISSUE_WAVE_STATE/HALT" && ok "a re-halt keeps the halt's identity, with the new reason" || ko "re-halt identity: $(cat "$ISSUE_WAVE_STATE/HALT")"
+"$FW" resume-launches >/dev/null
+# The gate reads the lease and halt again AFTER the base read, which can take minutes: a halt
+# recorded meanwhile refuses the dispatch it would otherwise have green-lit.
+expect "a halt recorded during the gate's base read refuses the gate" 1 "GATE REFUSED native-worker: launches halted -- .*halted mid-read" -- \
+  env SHIM_BASE_HALT="halted mid-read" "$FW" gate --target-repo example/project
+"$FW" resume-launches >/dev/null
+expect "the gate's --allow-red-base needs a reason" 2 "requires a triage reason" -- "$FW" gate --target-repo example/project --force --allow-red-base " "
+expect "the gate refuses a base branch that reads as an option" 2 "base gate: invalid --base-branch" -- "$FW" gate --target-repo example/project --base-branch -x
+expect "the gate refuses a malformed repository" 2 "base gate: --target-repo <owner/repo> required" -- "$FW" gate --target-repo 'not a repo'
+for verb in halt resume-launches halted gate; do
+  case "$verb" in
+    halt) want="^HALT UNREACHABLE far-anchor$"; args=(halt "a reason") ;;
+    resume-launches) want="^RESUME-LAUNCHES UNREACHABLE far-anchor$"; args=(resume-launches) ;;
+    halted) want="^HALTED? UNREACHABLE far-anchor$"; args=(halted) ;;
+    gate) want="^GATE REFUSED native-worker: anchor far-anchor unreachable"; args=(gate --target-repo example/project) ;;
+  esac
+  expect "$verb against an anchor that does not answer is unreachable" 4 "$want" -- env FLEET_ANCHOR=far-anchor "$FW" "${args[@]}"
+done
 }
 
 section "execution run and conclude --from-run" && {
@@ -1860,6 +1912,30 @@ expect "a record launched clean at the reported revision concludes, and says so"
 grep -Fq "\"observed_sha\": \"$ran\"" <<<"$out" && grep -Fq '"verdict": "pass"' <<<"$out" && ok "...as a pass at the recorded revision" || ko "clean record: $out"
 fixture_done run-other
 expect "a run of a request outside the roster is refused" 1 "canonical FLEET_BOXES" -- "$FW" execution run "$(reqjson run-e)"
+# The command line's own refusals and the anchor's transport, each with its exit code.
+expect "a mutation needs a readable payload file" 2 "execution reserve: readable JSON file required" -- "${FWX[@]}" execution reserve "$TMP/no-such-payload.json"
+printf 'not json\n' > "$TMP/not-json.json"
+expect "a window payload that is not JSON is refused before the anchor is asked" 2 "execution window: $TMP/not-json.json is not a JSON reservation" -- "${FWX[@]}" execution window testbox "$TMP/not-json.json"
+# Several JSON values are jq's stream, one wrapped line each: the anchor is asked, and its registry
+# refuses the payload (exit 1), not the command line (2).
+printf '{"a":1}\n{"b":2}\n' > "$TMP/two-json.json"
+expect "a window payload of several JSON values is the registry's refusal, not a usage error" 1 "^EXECUTION REFUSED: Extra data: line 2 column 1" -- \
+  "${FWX[@]}" execution window testbox "$TMP/two-json.json"
+# A reader that went away: the verb dies of SIGPIPE as the shell did (141 under pipefail), with no
+# traceback. The writer starts after its reader has exited, so the first write is the broken one.
+env FLEET_BOXES="testbox other" sh -c 'sleep 1; exec "$0" execution list' "$FW" 2> "$TMP/epipe.err" | true
+rc=${PIPESTATUS[0]}
+[ "$rc" -eq 141 ] && [ ! -s "$TMP/epipe.err" ] && ok "a closed stdout ends the verb by SIGPIPE (141), silently" ||
+  ko "a closed stdout: rc=$rc (want 141) -- $(cat "$TMP/epipe.err")"
+expect "an unknown execution action is a usage error" 2 "execution: list, slot -- <command>" -- "${FWX[@]}" execution bogus
+expect "an anchor that does not answer leaves the outcome unknown (exit 4)" 4 "^EXECUTION UNREACHABLE far-anchor: outcome unknown; reconcile before retrying dispatch$" -- \
+  env FLEET_ANCHOR=far-anchor "${FWX[@]}" execution list
+expect "conclude --from-run with no --box cannot resolve the host over an unreachable anchor" 4 "EXECUTION UNREACHABLE far-anchor: cannot resolve the request's execution host" -- \
+  env FLEET_ANCHOR=far-anchor "${FWX[@]}" execution conclude --from-run "$run1" --request run-a --sha "$ran"
+"${FWX[@]}" execution run "$(reqjson run-far)" >/dev/null || ko "could not reserve run-far (setup)"
+expect "a run record on a box that does not answer concludes nothing (exit 4)" 4 "^FROM-RUN UNREACHABLE far-box: nothing concluded$" -- \
+  "${FWX[@]}" execution conclude --from-run "$run1" --request run-far --sha "$ran" --box far-box
+fixture_done run-far
 # The base gate offers the checker the registry's INTEGRATION RECORDS for its target (ludics-lite
 # #401): concluded records marked `"integration": true` for that repository, with a pass or fail at
 # an exact SHA. An unmarked run, another repository's, and a timeout are not sources.
@@ -1977,6 +2053,10 @@ expect "--from-bg-run needs an absolute directory" 2 "must be absolute" -- "${FW
 expect "--from-bg-run needs the request id" 2 "--request <id> required" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --sha "$sha"
 expect "--from-bg-run needs the revision that ran" 2 "--sha <full commit SHA> required" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live
 expect "--from-bg-run refuses a stray flag" 2 "conclude --from-bg-run <run-dir>" -- "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live --sha "$sha" --oops
+expect "a directory on a box that does not answer concludes nothing (exit 4)" 4 "^FROM-BG-RUN UNREACHABLE far-box: nothing concluded$" -- \
+  "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live --sha "$sha" --box far-box
+expect "...nor does one whose anchor does not answer" 4 "EXECUTION UNREACHABLE far-anchor: cannot resolve the request's execution host" -- \
+  env FLEET_ANCHOR=far-anchor "${FWB[@]}" execution conclude --from-bg-run "$ok_dir" --request bg-live --sha "$sha"
 "$FW" execution list | jq -e '[.[] | select(.request_id == "bg-live") | .state] == ["launching"]' >/dev/null && ok "every refusal left the assignment dispatched" || ko "a refusal changed bg-live"
 fixture_done bg-live
 }
@@ -2120,11 +2200,11 @@ echo local-fix >> "$repo/issue-wave/SKILL.md"
 expect "a divergent execution host is reported and the dispatch still stands" 0 "REFRESH FAILED other: 1 local change(s) in the served tree -- left as it is, never reset" -- "${FWR[@]}" execution run "$(rreq rf-c)"
 [ "$(git -C "$repo" rev-parse HEAD)" = "$cur" ] && grep -q local-fix "$repo/issue-wave/SKILL.md" && ok "...with the checkout left as it was" || ko "a divergent execution host was moved or reset"
 git -C "$repo" checkout -q -- issue-wave/SKILL.md; fixture_done rf-c
-# A dispatch whose record cannot be read says so, rather than skipping the refresh silently.
-mkdir -p "$TMP/nojq"; printf '#!/bin/sh\necho "jq: not here" >&2; exit 127\n' > "$TMP/nojq/jq"; chmod +x "$TMP/nojq/jq"
-expect "an unreadable dispatched record is a loud refresh failure, the dispatch standing" 0 "REFRESH FAILED: cannot read the execution host from the dispatched record (jq: not here)" -- \
-  env PATH="$TMP/nojq:$PATH" "${FWR[@]}" execution run "$(rreq rf-g)"
-fixture_done rf-g
+# A dispatch whose record cannot be read says so, rather than skipping the refresh silently. Not a
+# case here: the registry's own output is the record, so no command line makes it unreadable, and
+# the shell's version of this case broke the reader by putting a failing `jq` first on PATH, which
+# tests the implementation's tool rather than the command (ludics-lite#403). The rule is pinned
+# where the reader is: lib/ludics/tests/test_fleetworker_execution.py.
 # The reserve + dispatch pair refreshes at the dispatch, which is where the box is about to be used.
 "${FWR[@]}" execution reserve "$(rreq rf-d)" 2>&1 | grep -q REFRESH && ko "a bare reserve refreshed the box" || ok "a bare reserve does not refresh"
 jq -n '{request_id:"rf-d", evidence:"fixture dispatch"}' > "$TMP/refresh-rf-d-dispatch.json"
@@ -2328,6 +2408,26 @@ held "$TMP/slot-p1.log" "slot 1 of 1 held" &&
 kill -9 "$p1" 2>/dev/null; wait "$p1" 2>/dev/null
 expect "a host with no fleet name has no probe answer" 2 "this host has no fleet name" -- \
   env FLEET_LOCAL_BOX= FLEET_BOXES="testbox other" "$FW" execution slot --probe
+# THE PROBE WITHOUT PYTHON: any answer but the PROBE line sends a project runner on without a
+# slot, so the probe needs no Python >= 3.12 (scripts/py's probe finds none here).
+printf '#!/bin/sh\nexit 1\n' > "$TMP/no-python"; chmod +x "$TMP/no-python"
+expect "the probe answers on a box with no Python >= 3.12" 0 "^EXECUTION SLOT PROBE testbox 3 1$" -- \
+  env LUDICS_PY_CANDIDATES="$TMP/no-python" "${FWT[@]}" execution slot --probe
+expect "...and says the spec's own counts" 0 "^EXECUTION SLOT PROBE testbox 007 007$" -- \
+  env FLEET_BOX_CORRECTNESS_SLOTS="testbox=007" "${FWS[@]}" execution slot --probe
+expect "...and a non-probe still needs one (scripts/py's refusal, exit 2)" 2 "no Python >= 3.12 found" -- \
+  env LUDICS_PY_CANDIDATES="$TMP/no-python" "${FWS[@]}" execution slot --wait 0 -- echo no-python
+# The wrapper hands the batch its caller's environment: scripts/py's PYTHONPATH (the checkout's lib/)
+# must not reach the batch, set or unset.
+mkdir -p "$TMP/pp"
+expect "a slot's batch keeps the caller's PYTHONPATH" 0 "^pp=$TMP/pp$" -- \
+  env PYTHONPATH="$TMP/pp" "${FWS[@]}" execution slot --wait 0 -- sh -c 'echo "pp=${PYTHONPATH-unset}"'
+expect "...and the caller's lack of one" 0 "^pp=unset$" -- \
+  env -u PYTHONPATH "${FWS[@]}" execution slot --wait 0 -- sh -c 'echo "pp=${PYTHONPATH-unset}"'
+expect "...and so does a hold's" 0 "^pp=$TMP/pp$" -- \
+  env PYTHONPATH="$TMP/pp" "${FWS[@]}" execution hold -- sh -c 'echo "pp=${PYTHONPATH-unset}"'
+expect "...and its lack of one" 0 "^pp=unset$" -- \
+  env -u PYTHONPATH "${FWS[@]}" execution hold -- sh -c 'echo "pp=${PYTHONPATH-unset}"'
 # THE NESTED SLOT (ahrefs/ocannl#1004): a held slot exports its marker, and an `execution slot`
 # inside it runs under that slot instead of taking another -- a runner that takes its own slot
 # inside a worker's wrapper must not hold two, or deadlock a full box.
@@ -2495,6 +2595,8 @@ grep -Eq "slot [0-9]+ of [0-9]+ held|REFUSED" <<<"$out" && ko "the measurement's
   ok "...under the hold's one sleep guard, which names the measurement" || ko "the measurement's own batch took a second guard, or the hold's names no measurement: $(cat "$INHIBIT_LOG")"
 expect "...and the probe inside that hold reports it" 0 "^EXECUTION SLOT PROBE testbox 1 1 measurement hold-measure$" -- \
   "${FWS[@]}" execution hold --request hold-measure -- "$FW" execution slot --probe
+expect "...where a probe with no Python >= 3.12 to judge the marker still answers, naming none" 0 "^EXECUTION SLOT PROBE testbox 1 1$" -- \
+  "${FWS[@]}" execution hold --request hold-measure -- env LUDICS_PY_CANDIDATES="$TMP/no-python" "$FW" execution slot --probe
 expect "...as does a slot nested a level deeper, through a shell" 0 "^deeper$" -- \
   "${FWS[@]}" execution hold --request hold-measure -- sh -c '"$1" execution slot -- "$1" execution slot -- echo deeper' _ "$FW"
 "${FWS[@]}" execution hold --request hold-measure -- sleep 30 > "$TMP/hold-m0.log" 2>&1 &
@@ -2597,6 +2699,12 @@ expect "a malformed slots spec refuses before anything is locked" 1 "<box>=<posi
   env FLEET_BOXES="testbox other" FLEET_BOX_CORRECTNESS_SLOTS="testbox=x" "$FW" execution slot -- echo x
 expect "a host with no fleet name has no slot to take" 2 "no fleet name" -- \
   env -u FLEET_LOCAL_BOX FLEET_HOSTNAME_MAP="nomatch*=testbox" "$FW" execution slot -- echo x
+expect "a registry that does not answer takes no slot (exit 4)" 4 "^EXECUTION SLOT UNREACHABLE far-anchor: registry unread, no slot taken$" -- \
+  env FLEET_ANCHOR=far-anchor "${FWS[@]}" execution slot --wait 0 -- echo x
+grep -q "^x$" <<<"$out" && ko "the batch ran over an unread registry: $out" || ok "...and runs nothing"
+expect "execution hold --why needs its text" 2 "execution hold: expected text for --why" -- "${FWS[@]}" execution hold --why "" -- true
+expect "execution slot --cpu and --gpu together are refused whatever their order" 2 "--cpu and --gpu are exclusive" -- "${FWS[@]}" execution slot --gpu --cpu -- true
+expect "...while repeating one is not" 0 "slot 1 of 1" -- "${FWS[@]}" execution slot --wait 0 --cpu --cpu -- true
 }
 
 section "usage" && {

@@ -3,9 +3,10 @@
 Use `fleet-worker.sh execution` for every worker correctness or measurement run on a fleet box
 and every coordinator integration run, with either provider and any transport: a CLI worker
 running tests on its own agent host exactly as much as a native worker driving that host over
-ssh. Agent residence never grants execution ownership. Python 3 is required on the anchor, and
-on every box that runs batches (`execution slot`'s lock is a python3 flock); the per-box
-preflight checks it. State lives in `FLEET_ANCHOR_STATE/executions`, under the existing
+ssh. Agent residence never grants execution ownership. Python 3.12 or newer is required on the
+anchor, where the registry runs, and on every box that runs batches, where `execution slot` runs
+through `scripts/py` (ludics-lite#403); the per-box preflight checks for a python3 with fcntl, not
+yet for its version. State lives in `FLEET_ANCHOR_STATE/executions`, under the existing
 coordinator lease lock. Use the same fleet environment as `claim`.
 
 The vocabulary is SKILL.md's: a worker *requests*, the coordinator *reserves* (one record in
@@ -86,7 +87,8 @@ its command, and an `execution slot` that finds it runs its command under the en
 instead of taking a second one (ahrefs/ocannl#1004). That lets a project runner take the slot
 itself: OCANNL's `tools/test-run.sh` does, declaring `--cpu` when the backend it resolves is a
 CPU one. It first asks `execution slot --probe`, which prints `EXECUTION SLOT PROBE <box> <slots>
-<gpu tokens>` and takes no lock and reads no registry. Any answer other than that line (a host
+<gpu tokens>` and takes no lock and reads no registry. It needs no Python 3.12, so a box
+without one still answers, and the slot that follows refuses loudly. Any answer other than that line (a host
 with no fleet name, or a fleet-worker.sh too old to have the probe) makes the runner run
 without a slot, as it did before. A worker's wrapper around such a runner is harmless, because the runner runs inside
 it. Without this, two slots per batch would fill a box at half its count, and a full box would

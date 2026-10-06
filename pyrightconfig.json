@@ -1,0 +1,9 @@
+{
+  "include": ["lib"],
+  "exclude": ["**/__pycache__"],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "strict",
+  "reportMatchNotExhaustive": true,
+  "reportUnnecessaryTypeIgnoreComment": true,
+  "executionEnvironments": [{ "root": "lib" }]
+}
