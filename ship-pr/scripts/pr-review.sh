@@ -277,7 +277,8 @@
 #      90), WATCH_TIMEOUT=seconds to watch (900), SHIP_PR_REVIEW_POLL_CAP and
 #      SHIP_PR_BUILD_POLL_CAP=seconds the pause between unchanged polls doubles up to (300 for
 #      `watch`, 600 for a `--wait`), SHIP_PR_STATE_DIR=where the quota hold and the observer locks
-#      live (default ${XDG_STATE_HOME:-~/.local/state}/ship-pr; see prreview/budget.py),
+#      live (default ${XDG_STATE_HOME:-~/.local/state}/ship-pr; see prreview/budget.py), and
+#      the runs pages of a `base --wait` that settled on absence (base-pages/, the newest 20),
 #      SHIP_PR_API_ATTEMPTS=tries per gh call (4), SHIP_PR_API_BACKOFF=first pause in seconds (5,
 #      doubling to a 20s cap: ~35s of retrying before a call is declared dead),
 #      SHIP_PR_REVIEW_GRACE=seconds a due-but-unstarted review is waited for before `watch` returns

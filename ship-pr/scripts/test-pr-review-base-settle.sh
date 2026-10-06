@@ -424,6 +424,131 @@ test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict() {
   assert_eq "$(rounds_polled)" 2 "round one's settle was not taken, and round two's was"
 }
 
+# --- a round's page that contradicts an earlier round's (ludics-lite#550) ----------------------
+# GitHub's run listing can serve a stale page while a run changes status: on main, twice in an
+# hour, a `base --wait` round saw no row at the tip and a newest judged run weeks back, and settled
+# green on it while the tip's own run was in flight. Within one wait, a page whose newest judged
+# run is OLDER than one an earlier round judged, or that has lost a tip run an earlier round saw,
+# is an inconsistent read: the wait reads again and never settles on it. These rounds are
+# counted, and each case ENDS on the round after the stale one, under the wall-clock idiom.
+
+# The issue's fixture: round one shows the tip's run in flight, round two's page holds only an old
+# completed row, round three shows the tip's run finished.
+test_a_page_that_lost_the_tips_run_in_flight_is_not_settled_on() {
+  reset_fixture
+  retune ABSENT_GRACE=0
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
+    '[{status:"in_progress", conclusion:null, head_sha:$c, id:5501, created_at:"2026-10-05T10:30:00Z"},
+      {conclusion:"success", head_sha:$b, id:5500, created_at:"2026-10-05T10:00:00Z"}]')")
+  runs_from_round 2 1 "$(jq -cn --arg a "$SHA_A" \
+    '[{conclusion:"success", head_sha:$a, id:5400, created_at:"2026-09-24T09:00:00Z"}]')"
+  runs_from_round 3 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
+    '[{conclusion:"success", head_sha:$c, id:5501, created_at:"2026-10-05T10:30:00Z"},
+      {conclusion:"success", head_sha:$b, id:5500, created_at:"2026-10-05T10:00:00Z"}]')"
+  FILES_DEFAULT='[{"filename":"src/main.ml"}]'
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "the tip's own run answers on round three ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "$REPO $BRANCH: green (tip ${SHA_C:0:8})" "for the tip"
+  assert_contains "$BASE_OUTPUT" "green    ci — success at ${SHA_C:0:8}" "from its own run"
+  assert_not_contains "$BASE_OUTPUT" "success at ${SHA_A:0:8}" "never the weeks-old verdict of the stale page"
+  assert_not_contains "$BASE_OUTPUT" "no run for the tip appeared" "and no settle on absence"
+  assert_eq "$(rounds_polled)" 3 "the stale round was read again, not settled on"
+}
+
+# The judged commit going BACKWARDS alone: no tip run was ever seen, a run in flight at an older
+# commit holds round one, and round two's page has lost both it and the judged run under it.
+test_a_page_whose_judged_run_is_older_than_an_earlier_rounds_is_not_settled_on() {
+  reset_fixture
+  retune ABSENT_GRACE=0
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[{status:"in_progress", conclusion:null, head_sha:$b, id:5512, created_at:"2026-10-05T10:30:00Z"},
+      {conclusion:"success", head_sha:$a, id:5511, created_at:"2026-10-05T10:00:00Z"}]')")
+  runs_from_round 2 1 "$(jq -cn --arg z "$SHA_0" \
+    '[{conclusion:"success", head_sha:$z, id:5400, created_at:"2026-09-24T09:00:00Z"}]')"
+  runs_from_round 3 1 "$(jq -cn --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[{conclusion:"success", head_sha:$b, id:5512, created_at:"2026-10-05T10:30:00Z"},
+      {conclusion:"success", head_sha:$a, id:5511, created_at:"2026-10-05T10:00:00Z"}]')"
+  FILES_DEFAULT='[{"filename":"src/main.ml"}]'
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "round three settles on the absence it reads ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "green    ci — success at ${SHA_B:0:8}" "on the newest judged run there is"
+  assert_not_contains "$BASE_OUTPUT" "success at ${SHA_0:0:8}" "never on the stale page's older one"
+  assert_eq "$(rounds_polled)" 3 "the stale round was read again, not settled on"
+}
+
+# A wait whose stale page never goes away ends at its ceiling with no verdict, and the round's
+# report says why it would not settle. On the test clock, so the ceiling is reached after round
+# two however slow the box is: a sleep advances the clock instead of waiting.
+test_a_page_that_stays_inconsistent_runs_out_the_ceiling() (
+  export SHIP_PR_TEST_CLOCK="$TEST_ROOT/clock"
+  date +%s >"$SHIP_PR_TEST_CLOCK"
+  sleep() { printf '%s\n' "$(($(cat "$SHIP_PR_TEST_CLOCK") + $1))" >"$SHIP_PR_TEST_CLOCK"; }
+  reset_fixture
+  retune ABSENT_GRACE=0
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
+    '[{status:"in_progress", conclusion:null, head_sha:$c, id:5521, created_at:"2026-10-05T10:30:00Z"},
+      {conclusion:"success", head_sha:$b, id:5520, created_at:"2026-10-05T10:00:00Z"}]')")
+  runs_from_round 2 1 "$(jq -cn --arg a "$SHA_A" \
+    '[{conclusion:"success", head_sha:$a, id:5400, created_at:"2026-09-24T09:00:00Z"}]')"
+  run_base --wait=100
+  assert_eq "$BASE_RC" 4 "no verdict at the ceiling ($BASE_OUTPUT)"
+  assert_not_contains "$BASE_OUTPUT" "$BRANCH: green" "never green"
+  assert_contains "$BASE_OUTPUT" "--wait ceiling of 1 min reached" "the ceiling ended it"
+  assert_contains "$BASE_OUTPUT" "contradicts an earlier round's" "the report names the inconsistent read"
+)
+
+# The evidence: a round that settles on ABSENCE keeps the raw runs pages it read, under the state
+# directory, so the next stale page that slips past the checks above carries its own record.
+test_a_settle_on_absence_keeps_its_runs_pages() (
+  local kept
+  reset_fixture
+  retune ABSENT_GRACE=0
+  BUDGET_DIR="$TEST_ROOT/budget-state"
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg a "$SHA_A" '[{conclusion:"success", head_sha:$a, id:5531}]')")
+  FILES_DEFAULT='[{"filename":"src/main.ml"}]'
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "an absence past a zero grace settles ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "no run for the tip appeared" "on absence"
+  kept=$(sed -n 's/.*kept the runs pages it read in \(.*\) (ludics-lite#550).*/\1/p' <<<"$BASE_OUTPUT")
+  assert_contains "$kept" "$BUDGET_DIR/base-pages/" "the path is named, under the state directory"
+  [ -f "$kept" ] || bail "the kept pages should be a file: '$kept'"
+  assert_contains "$(cat "$kept")" "actions/workflows/1/runs?branch=$BRANCH&event=push&per_page=10" "naming the read"
+  assert_contains "$(cat "$kept")" '"id":5531' "holding the page as it was served"
+  assert_contains "$(cat "$kept")" "tip $SHA_C" "and the tip it settled for"
+  rm -rf "$BUDGET_DIR"
+  # A settle that is not on absence keeps nothing.
+  reset_fixture
+  BUDGET_DIR="$TEST_ROOT/budget-state"
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{conclusion:"success", head_sha:$c, id:5532}]')")
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "a covered tip is green ($BASE_OUTPUT)"
+  assert_not_contains "$BASE_OUTPUT" "kept the runs pages" "and keeps nothing"
+  [ ! -e "$BUDGET_DIR/base-pages" ] || bail "no pages directory for a covered tip"
+  rm -rf "$BUDGET_DIR"
+)
+
+# The other settle on absence: every run there is covers the tip, and a listed workflow has no push
+# run on the branch at all (dispatch-only, its first run past the creation window). An empty page
+# read stale would settle the same way, so its pages are kept too, naming that workflow.
+test_a_settle_over_a_workflow_with_no_runs_keeps_its_runs_pages() (
+  local kept
+  reset_fixture
+  BUDGET_DIR="$TEST_ROOT/budget-state"
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"nightly"}]')
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" \
+    '[{conclusion:"success", head_sha:$c, id:5541, created_at:"2026-09-10T00:00:00Z"}]')")
+  RUNS_2=$(jq -cn '{workflow_runs: []}')
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "a dispatch-only workflow does not park the wait ($BASE_OUTPUT)"
+  kept=$(sed -n 's/.*kept the runs pages it read in \(.*\) (ludics-lite#550).*/\1/p' <<<"$BASE_OUTPUT")
+  assert_contains "$kept" "$BUDGET_DIR/base-pages/" "the path is named, under the state directory"
+  [ -f "$kept" ] || bail "the kept pages should be a file: '$kept'"
+  assert_contains "$(cat "$kept")" "actions/workflows/2/runs?branch=$BRANCH&event=push&per_page=10" \
+    "naming the empty workflow's read"
+  assert_contains "$(cat "$kept")" "no push run on $BRANCH for nightly" "and why the round settled"
+  rm -rf "$BUDGET_DIR"
+)
+
 tests=(
   test_a_paths_ignored_tip_settles_without_waiting_out_the_grace
   test_a_tip_that_changed_a_source_file_is_not_recognized
@@ -446,6 +571,11 @@ tests=(
   test_a_run_in_flight_at_the_tip_keeps_the_refusal
   test_a_stopped_run_at_the_tip_is_no_verdict_not_an_absence
   test_the_settle_reconfirms_the_tip_before_it_accepts_an_older_verdict
+  test_a_page_that_lost_the_tips_run_in_flight_is_not_settled_on
+  test_a_page_whose_judged_run_is_older_than_an_earlier_rounds_is_not_settled_on
+  test_a_page_that_stays_inconsistent_runs_out_the_ceiling
+  test_a_settle_on_absence_keeps_its_runs_pages
+  test_a_settle_over_a_workflow_with_no_runs_keeps_its_runs_pages
 )
 
 run_tests "${tests[@]}" -- "$@"
