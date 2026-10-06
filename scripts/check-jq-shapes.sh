@@ -279,7 +279,7 @@ for f in "${files[@]}"; do
 done
 
 if [ "$rc" -ne 0 ]; then
-  echo "check-jq-shapes.sh: refused; see ship-pr/scripts/pr-review.sh's \`item_stamp\` for the safe shape" >&2
+  echo "check-jq-shapes.sh: refused; the safe shape is \`[capture(...)] | first\` (check-jq-shapes.sh --help; ship-pr/scripts/pr-review-api-contract.sh's \`dated\` is one)" >&2
   exit 1
 fi
 echo "check-jq-shapes.sh: every capture( is bracketed and read back (${#files[@]} file(s))"

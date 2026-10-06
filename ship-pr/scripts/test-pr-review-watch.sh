@@ -33,7 +33,7 @@ source "$SCRIPT_DIR/test-pr-review-lib.sh"
 {
 test_tmpdir TEST_ROOT watch-test
 
-# The clock is the script's own test clock (SHIP_PR_TEST_CLOCK, pr-review.sh's clock_now): a file
+# The clock is the script's own test clock (SHIP_PR_TEST_CLOCK, prreview/clock.py): a file
 # holding the epoch second, which every age the state reads and every deadline the watch keeps is
 # measured on, and which the watch's sleep ADVANCES instead of waiting. A window is then as long as
 # its arithmetic says and takes no wall time, and an age is exactly what a case dated it, however
@@ -234,7 +234,10 @@ gh() {
       echo "gh: pull request unavailable (HTTP 500)" >&2
       return 1
     fi
-    response=$(jq -cn --arg h "$HEAD_SHA" --arg m "$MERGEABLE_STATE" --arg c "$PR_CREATED_AT" \
+    # The head per round when a case schedules one (`schedule head <round> <sha>`), else HEAD_SHA.
+    local head="$HEAD_SHA"
+    [ ! -e "$FEEDS/head.0" ] || head=$(feed_answer head)
+    response=$(jq -cn --arg h "$head" --arg m "$MERGEABLE_STATE" --arg c "$PR_CREATED_AT" \
       '{base:{ref:"main",sha:"stale-base-sha"}, head:{sha:$h}, mergeable_state:$m, created_at:$c}')
     ;;
   "repos/$REPO/commits/$H1" | "repos/$REPO/commits/$H2")
@@ -273,9 +276,11 @@ run_watch() { # [watermark] [interval] [timeout]
   WATCH_ERR=$(cat "$TEST_ROOT/watch.err")
 }
 
+# The state and its rendering, as the watch reads them: the Python's own, through the two entry
+# points of ludics.prreview that the command line does not route to (test-pr-review-status.sh).
 run_status() {
-  STATE=$(status_state 7)
-  LINE=$(status_line "$STATE")
+  STATE=$(py_forward call status-state 7)
+  LINE=$(py_forward call status-line "$STATE")
 }
 
 # --- what ends the wait -------------------------------------------------------------------------
@@ -622,6 +627,56 @@ test_the_quiet_exit_names_the_head_and_what_scrolled_past() {
     "and the exit says so, with the item, so the two silences read differently"
 }
 
+# The polling budget (ludics-lite#543): a window whose state does not move backs off from the
+# interval toward the review cap, so a quiet 900s window at the 90s interval reads six times, not
+# eleven. The last pause is cut to the window's end, so the window's last read is at its end. A subshell case, like the
+# others that redefine sleep, so it is listed after the cases that make the snapshot directory in
+# the suite's own shell (one made in a subshell outlives it). The sleep is the suite's, to log each
+# pause, and it advances the test clock the window is kept on (the shell bridge hands it to the
+# Python; SECONDS is what a shell watch kept its window on).
+test_an_unmoving_window_backs_off_to_the_review_cap() (
+  sleep() {
+    printf '%s\n' "$1" >>"$TEST_ROOT/sleeps"
+    SECONDS=$((SECONDS + $1))
+    [ -z "${SHIP_PR_TEST_CLOCK:-}" ] ||
+      printf '%s\n' "$(($(cat "$SHIP_PR_TEST_CLOCK") + $1))" >"$SHIP_PR_TEST_CLOCK"
+  }
+  reset_fixture
+  : >"$TEST_ROOT/sleeps"
+  REVIEW_POLL_CAP=300
+  run_watch 0,0,0 90 900
+  assert_eq "$WATCH_RC" 1 "nothing at all is a quiet window"
+  local last
+  assert_eq "$(sed -n 1,4p "$TEST_ROOT/sleeps" | tr '\n' ' ')" "90 180 300 300 " \
+    "an unchanged state doubles the pause up to the review cap"
+  # The cut pause is what is left of the window: 30s, less any real second the case took.
+  last=$(sed -n 5p "$TEST_ROOT/sleeps")
+  assert_eq "$([ "${last:-0}" -ge 1 ] && [ "$last" -le 30 ] && echo cut)" cut \
+    "and the last is cut to the window's end (got '$last')"
+  assert_eq "$(poll_rounds)" 7 "six reads in the window, the last at its end, and the settle"
+)
+
+# A new head is movement even when the state's token stays put (ludics-lite#551): the pause keys on
+# the head and the state's detail, without its age, and goes back to the interval. A subshell case
+# for its sleep, like the one above.
+test_a_new_head_in_one_state_resets_the_pause() (
+  sleep() {
+    printf '%s\n' "$1" >>"$TEST_ROOT/sleeps"
+    SECONDS=$((SECONDS + $1))
+    [ -z "${SHIP_PR_TEST_CLOCK:-}" ] ||
+      printf '%s\n' "$(($(cat "$SHIP_PR_TEST_CLOCK") + $1))" >"$SHIP_PR_TEST_CLOCK"
+  }
+  reset_fixture
+  : >"$TEST_ROOT/sleeps"
+  REVIEW_POLL_CAP=300
+  schedule head 0 "$H2"
+  schedule head 3 "$H1"
+  run_watch 0,0,0 90 900
+  assert_eq "$WATCH_RC" 1 "nothing about either head is a quiet window ($WATCH_ERR)"
+  assert_eq "$(sed -n 1,4p "$TEST_ROOT/sleeps" | tr '\n' ' ')" "90 180 90 180 " \
+    "the pause doubles while the head stands, and the new head's round is read at the interval"
+)
+
 # --- one final poll before any verdict ------------------------------------------------------------
 
 # WATCH_INTERVAL above WATCH_TIMEOUT: the loop polls once and breaks. A round posted in the gap
@@ -697,10 +752,10 @@ test_a_final_poll_that_did_not_answer_withholds_the_verdict() {
 }
 
 # The withheld verdict quotes the final poll's error, which is the last gh call's: here the new
-# review's own comments read, after the three feeds answered. The poll runs in Python
-# (ludics-lite#403) and the line is printed by the shell, so the error has to come back through
-# GH_ERR_FILE as the shell's own gh_retry left it; a poll that did not hand it back made the line
-# say "did not answer ()".
+# review's own comments read, after the three feeds answered. While the poll ran in Python and the
+# line was printed by the shell (ludics-lite#403), the error had to come back through a file the
+# shell read, and a poll that did not hand it back made the line say "did not answer ()"; both are
+# Python now, and the line must still carry the error.
 test_a_withheld_verdict_quotes_the_final_poll_s_error() {
   reset_fixture
   retune GRACE=1
@@ -1661,8 +1716,8 @@ test_poll_a_feed_that_did_not_answer_is_unknown() {
 # Driven through the command line: a poll that answers takes the watermark it computed, never the
 # quoted one, and a poll that fails — here the comments feed, read after the inline one — leaves
 # the window blind on the caller's watermark. (The partway shape itself, bodies printed and then a
-# rendering failing, needs a jq program to break mid-round; that half is poll's, pinned by the
-# broken-jq cases above against the shell's own rendering.)
+# rendering failing, needs a jq program to break mid-round; that half was pinned by breaking the
+# shell's own rendering's programs, until poll was ported and the programs were gone.)
 test_a_failed_round_takes_no_watermark_from_a_quoted_line() {
   reset_fixture
   schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding
@@ -2000,6 +2055,8 @@ tests=(
   test_the_ending_line_claims_only_the_rounds_the_window_opened
   test_the_round_label_costs_no_request
   test_the_round_span_is_the_whole_watch
+  test_an_unmoving_window_backs_off_to_the_review_cap
+  test_a_new_head_in_one_state_resets_the_pause
   test_the_missing_environment_ends_the_wait_with_the_nudge
   test_the_connector_thread_reply_opens_no_round
   test_an_extension_holds_through_unknown_status

@@ -703,7 +703,11 @@ controlled through the tools in your coordinator's file, never through those com
   red for two hours). `merge --wait` refuses without a verdict (see ship-pr): brief workers to
   background it and let it hold, raising `SHIP_PR_CHECKS_WAIT` past the observed backlog rather
   than reaching for `--allow-no-verdict`, and whoever does merge unread owns re-checking the
-  master run it produces.
+  master run it produces. The worker's `watch` and `merge --wait` are a PR's only observers. The
+  coordinator reads their reports, plus one plain `checks` at most, and never arms its own. A
+  second observer is refused; one observer per issue was part of the recovery after the
+  2026-10-04 wave exhausted the quota (ship-pr's *polling budget*, which also holds every session
+  on a quota refusal).
 - **Re-check for a rival PR before each queued launch.** Per-box waves no longer race each
   other, but user-driven sessions, the CI-red triage routine (`ci-fix/*`), and a previous
   wave's stragglers still open PRs, and the pre-wave `gh pr list` goes stale within hours.

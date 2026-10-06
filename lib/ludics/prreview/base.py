@@ -52,7 +52,8 @@ from ludics.prreview.ere import Advisory
 from ludics.prreview.gate import GateConfig, Gate, load_gate_config
 from ludics.prreview.workflows import Reads
 from ludics.prreview.checkruns import conclusion_class, newest_first
-from ludics.prreview.clock import FuncClock, age_of
+from ludics.prreview.budget import pause
+from ludics.prreview.clock import Clock, FuncClock, age_of, clock_from_env
 from ludics.prreview.shtext import encode_ref, tab_fields
 from ludics.prreview.workflow_yaml import paths_ignore_covers, workflow_filter, workflow_keys
 from ludics.prreview.core import (
@@ -432,7 +433,7 @@ class Base:
         knobs: Knobs,
         repo: str,
         *,
-        clock: FuncClock | None = None,
+        clock: Clock | FuncClock | None = None,
         gate_config: GateConfig | None = None,
         gate: GateRunner | None = None,
         records: Sequence[Record] = (),
@@ -440,7 +441,7 @@ class Base:
         self.session = session
         self.knobs = knobs
         self.repo = repo
-        self.clock = clock if clock is not None else FuncClock()
+        self.clock: Clock | FuncClock = clock if clock is not None else clock_from_env(os.environ)
         self.gate_config = gate_config if gate_config is not None else load_gate_config(os.environ)
         self._gate: GateRunner = gate if gate is not None else self._gate_checks
         self.records = list(records)
@@ -874,7 +875,7 @@ def parse_args(args: Sequence[str], repo: str, knobs: Knobs) -> Args:
     return Args(repo, branch, int(wait_text), interim, records)
 
 
-def run(session: GhSession, args: list[str], *, clock: FuncClock | None = None,
+def run(session: GhSession, args: list[str], *, clock: Clock | FuncClock | None = None,
         gate: GateRunner | None = None, env: Mapping[str, str] | None = None) -> int:
     environ = os.environ if env is None else env
     knobs = load_knobs(environ)
@@ -892,7 +893,8 @@ def run(session: GhSession, args: list[str], *, clock: FuncClock | None = None,
              "tip has not moved — a tip that moves restamps the grace and no ceiling this close can then",
              "reach it. Size it from the two knobs instead:",
              f"--wait={grace + interval} or more (ludics-lite#175).")
-    repo = parsed.repo or repo_from_cwd() or ""
+    # A standing quota hold is exit 3 from the resolution itself (repo_from_cwd), never a guess.
+    repo = parsed.repo or repo_from_cwd(budget=session.budget) or ""
     if not repo:
         die("base: name the repo — `base owner/name [branch]`, --repo, or REPO=.",
             "cwd inference only works from a checkout, and not from a background shell.")
@@ -926,6 +928,14 @@ class Wait:
         b, repo = self.b, self.repo
         knobs = b.knobs
         grace, wait_for = knobs.absent_grace, self.args.wait_for
+        started = b.clock.now()
+        # A --wait is the branch's observer in the polling budget (ludics-lite#551): it waits a
+        # quota hold out within its ceiling from its first read (the default branch's, when none is
+        # named), and it is one per branch, refused before it reads the runs.
+        budget = b.session.budget
+        if wait_for > 0 and budget is not None:
+            budget.wait_from = started
+            budget.wait_until = started + wait_for
         if not self.branch:
             doc = b.gh_json(["api", f"repos/{repo}"])
             branch = "" if isinstance(doc, (GhFailed, GhUnanswered)) else jq_raw(get(doc, "default_branch"))
@@ -935,7 +945,11 @@ class Wait:
             self.branch = branch
         branch = self.branch
         self.ebranch = encode_ref(branch)
-        started = b.clock.now()
+        if wait_for > 0 and budget is not None:
+            budget.base_claim(repo, branch)
+        cap = budget.build_cap if budget is not None else knobs.checks_interval
+        last_sig = ""
+        last_pause: int | None = None
         beat = grace_from = started
         waited_note = ""
         no_tip_verdict = False
@@ -1036,8 +1050,19 @@ class Wait:
                      f" {rnd.uncovered} workflow(s)",
                      f"not yet judged at the tip, after {(now - started) // 60} min")
                 beat = now
+            # The budget's pause: the interval after a round that saw the branch move (its tip, its
+            # runs, what the round made of them), doubling toward the build cap while it sits still,
+            # and capped at what is left of the ceiling.
+            sig = "|".join((
+                tip, str(rnd.red), str(rnd.pend), str(rnd.inflight), str(rnd.uncovered),
+                str(rnd.red_at_tip), str(rnd.nogo_at_tip), str(rnd.norun), str(rnd.tip_unjudged),
+                " ".join(f"{r.run_id}:{r.status}:{r.conclusion}" for r in raw),
+            ))
+            sleep_for = pause(knobs.checks_interval, cap, last_pause, sig != last_sig)
+            last_sig = sig
+            last_pause = sleep_for
             remaining = started + wait_for - now
-            b.clock.sleep(min(knobs.checks_interval, remaining))
+            b.clock.sleep(min(sleep_for, remaining))
         return self.report(rnd, tip, waited_note, no_tip_verdict, interim_green)
 
     def read_runs(self, rnd: _Round) -> list[RunRow]:

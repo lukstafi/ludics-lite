@@ -429,7 +429,8 @@ class EndToEnd(unittest.TestCase):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("LUDICS_BRIDGE", "SHIP_PR_"))}
         env.update({"PATH": self.dir + os.pathsep + env.get("PATH", ""), "REPO": "o/r",
-                    "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0"})
+                    "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0",
+                    "SHIP_PR_STATE_DIR": os.path.join(self.dir, "state")})
         return subprocess.run([*entry, "base", *args], capture_output=True, text=True, env=env,
                               cwd=self.dir, check=False)
 

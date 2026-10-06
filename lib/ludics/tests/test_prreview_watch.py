@@ -263,7 +263,8 @@ class EndToEnd(unittest.TestCase):
         e = dict(os.environ)
         e.update({"PATH": f"{self.dir}{os.pathsep}{e.get('PATH', '')}", "TMPDIR": self.tmp,
                   "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0", "REPO": "",
-                  "SHIP_PR_TEST_CLOCK": self.clock})
+                  "SHIP_PR_TEST_CLOCK": self.clock,
+                  "SHIP_PR_STATE_DIR": os.path.join(self.tmp, "state")})
         e.update(env)
         return subprocess.run([*entry, *args], capture_output=True, text=True, env=e, cwd=self.dir,
                               check=False)
@@ -326,8 +327,11 @@ class EndToEnd(unittest.TestCase):
 
     def test_the_run_await_sleeps_on_the_test_clock_to_its_deadline(self) -> None:
         self.answer({"run view": {"stdout": "in_progress\tpending\n"}})
+        # A build cap at the interval keeps the pause fixed (the polling budget doubles it from the
+        # interval up to the cap; test-pr-review-budget.sh pins the backoff itself).
         done = self.run_cmd([PR_REVIEW], "retry", "run", "watch", "o/r#5", "-i", "100",
-                            SHIP_PR_CHECKS_WAIT="250", SHIP_PR_CHECKS_HEARTBEAT="200")
+                            SHIP_PR_CHECKS_WAIT="250", SHIP_PR_CHECKS_HEARTBEAT="200",
+                            SHIP_PR_BUILD_POLL_CAP="100")
         self.assertEqual(done.returncode, 4, done.stderr)
         self.assertIn("has NO VERDICT after 4 min (status: in_progress)", done.stderr)
         self.assertEqual(done.stderr.count("still waiting on run 5 in o/r: in_progress after 3 min"), 1)

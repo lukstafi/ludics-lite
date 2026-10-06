@@ -63,6 +63,12 @@ H12=$(sha40 2)  # the open PR #12's head
 WIDE=$(sha40 3)  # the wide commit, past one default page of files
 WIDE_REPO=example/wide
 BOT="${REVIEWER}[bot]"
+# The gate's review-threads query, which the contract asks of the Python and sends verbatim: the
+# fixture answers that query and no other.
+# LF line ends asked for, since a native Python on Windows prints CRLF.
+GATE_PY="$SCRIPT_DIR/../../scripts/py"
+GATE_THREADS_QUERY=$("$GATE_PY" -c 'import sys; sys.stdout.reconfigure(newline="\n")
+from ludics.prreview.threads import THREADS_QUERY; print(THREADS_QUERY)')
 
 # --- the fixture gh and sleep -------------------------------------------------------------------
 # The endpoint's file name: `/?&=` mapped to `,@+~`, which the alphabet below excludes from an
@@ -112,13 +118,13 @@ while [ $# -gt 0 ]; do
 done
 [ -z "${CONTRACT_FIXTURE_FAIL:-}" ] || refuse "the fixture refuses every read ($CONTRACT_FIXTURE_FAIL)"
 if [ "$endpoint" = graphql ]; then
-  # The library's THREADS_QUERY, verbatim but for the page size, on this repository: anything
+  # The gate's THREADS_QUERY, verbatim but for the page size, on this repository: anything
   # else is a query the world does not model.
   first=${query#*reviewThreads(first:}
   first=${first%%,*}
   case "$first" in '' | *[!0123456789]*) refuse "a GraphQL query without a reviewThreads page size (HTTP 400)" ;; esac
   [ "${query/"reviewThreads(first:$first,"/reviewThreads(first:100,}" = "$CONTRACT_FIXTURE_THREADS_QUERY" ] ||
-    refuse "a GraphQL query that is not the library's THREADS_QUERY (HTTP 400)"
+    refuse "a GraphQL query that is not the gate's THREADS_QUERY (HTTP 400)"
   [ "$owner/$name" = "$CONTRACT_FIXTURE_REPO" ] || refuse "a GraphQL read of another repository (HTTP 400): $owner/$name"
   endpoint="graphql?pr=$pr&first=$first&after=${after:--}"
 elif [ -n "$fields" ]; then
@@ -294,7 +300,7 @@ run_contract() { # [VAR=value...]: extra environment for this run
       PATH="$BIN:$PATH" TMPDIR="$tmp" REVIEWER="$REVIEWER" \
       CONTRACT_STALE_BASE_PR=7 CONTRACT_REVIEWED_PR=9 CONTRACT_THREADS_PR=9 \
       CONTRACT_WIDE_COMMIT="$WIDE_REPO@$WIDE" CONTRACT_WIDE_COMMIT_FILES=301 \
-      CONTRACT_FIXTURE_REPO="$REPO" CONTRACT_FIXTURE_THREADS_QUERY="$THREADS_QUERY" \
+      CONTRACT_FIXTURE_REPO="$REPO" CONTRACT_FIXTURE_THREADS_QUERY="$GATE_THREADS_QUERY" \
       CONTRACT_FIXTURE_WORLD="$WORLD" CONTRACT_FIXTURE_CALLS="$TEST_ROOT/calls" \
       CONTRACT_FIXTURE_ASKED="$TEST_ROOT/asked" CONTRACT_FIXTURE_SLEEPS="$TEST_ROOT/sleeps" "$@" \
       bash "$CONTRACT" "$REPO"
@@ -328,7 +334,7 @@ sourced() { # <script> [VAR=value...]
   SOURCED_OUT=$(
     unexport_functions
     exec env -u CONTRACT_FIXTURE_FAIL PATH="$BIN:$PATH" TMPDIR="$tmp" CONTRACT_TEST_SOURCE_ONLY=1 \
-      CONTRACT_FIXTURE_REPO="$REPO" CONTRACT_FIXTURE_THREADS_QUERY="$THREADS_QUERY" \
+      CONTRACT_FIXTURE_REPO="$REPO" CONTRACT_FIXTURE_THREADS_QUERY="$GATE_THREADS_QUERY" \
       CONTRACT_FIXTURE_WORLD="$WORLD" CONTRACT_FIXTURE_CALLS="$TEST_ROOT/calls" \
       CONTRACT_FIXTURE_ASKED="$TEST_ROOT/asked" CONTRACT_FIXTURE_SLEEPS="$TEST_ROOT/sleeps" "$@" \
       bash -c 'source "$1" '"$REPO"'; eval "$2"' _ "$CONTRACT" "$script" 2>"$TEST_ROOT/err"
@@ -432,24 +438,38 @@ test_api_sorts_a_failed_read_by_its_status() {
   assert_eq "$(cat "$TEST_ROOT/calls")" "" "the refused read should never reach gh"
 }
 
-# The EXIT trap calls pr-review.sh's cleanup (ludics-lite#195) and removes the scratch directory,
-# on every exit, and names an exit it did not choose. The control proves the assertion can fail:
-# with the library's cleanup emptied, what it would have removed is left behind.
+# The one piece of the gate's reading the contract restates in jq (SUMMARY_ROW_INSTANT_DEF: the
+# gate runs no jq), held to the gate's own state.instant: a fraction of any length, none, and a
+# whole-second stamp, each padded to the same nine digits by both.
+test_the_instant_def_answers_as_the_gate_s_instant() {
+  local samples want
+  samples='["2026-09-04T22:47:25.387018Z","2026-09-04T22:47:25Z","2026-09-04T22:47:25.1Z","2026-09-04T22:47:25.123456789Z","2026-09-04T22:47:25.1234567891Z"]'
+  want=$("$GATE_PY" -c 'import json, sys; sys.stdout.reconfigure(newline="\n")
+from ludics.prreview.state import instant
+print(json.dumps([instant(s) for s in json.loads(sys.argv[1])], separators=(",", ":")))' "$samples")
+  sourced 'jq -cn --argjson s "$SAMPLES" "$SUMMARY_ROW_INSTANT_DEF [\$s[] | instant]"' SAMPLES="$samples"
+  assert_eq "$SOURCED_RC" 0 "the jq spelling should run ($SOURCED_ERR)"
+  assert_eq "$(tr -d '\r' <<<"$SOURCED_OUT")" "$want" "the jq spelling of instant should answer as the gate's"
+  assert_contains "$want" '"2026-09-04T22:47:25.000000000"' "control: the samples include a padded whole second"
+}
+
+# The EXIT trap removes the scratch directory on every exit, and names an exit it did not choose.
+# The control proves the assertion can fail: with the trap's function emptied, the directory is
+# left behind. (pr-review.sh, which the contract sources, leaves nothing of its own to remove since
+# its shell half was retired; while it did, this trap called its cleanup by name, ludics-lite#195.)
 test_the_exit_trap_cleans_up_and_names_an_unchosen_exit() {
-  local plant=': >"$GH_ERR_FILE"; snapshot_dir_ensure; : >"$SNAP.x"'
-  sourced "$plant; exit 3"
+  sourced "exit 3"
   assert_eq "$SOURCED_RC" 3 "the planted exit should be the child's"
-  assert_nothing_left "an exit 3 with pr-review.sh's temporaries planted"
+  assert_nothing_left "an exit 3"
   assert_not_contains "$SOURCED_ERR" "stopped early" "an exit the contract chose should not be called an early stop"
-  sourced "$plant; exit 7"
+  sourced "exit 7"
   assert_eq "$SOURCED_RC" 7 "the planted exit should be the child's"
   assert_nothing_left "an exit 7"
   assert_contains "$SOURCED_ERR" "the contract stopped early with exit 7 after 0 beliefs (0 moved)" \
     "an exit the contract did not choose should be named"
-  sourced "pr_review_cleanup() { :; }; $plant; exit 3"
-  assert_contains "$(ls -A "$RUN_TMP")" "pr-review-err." \
-    "control: without pr-review.sh's cleanup the planted error file is left behind, so the assertion above can fail"
-  assert_not_contains "$(ls -A "$RUN_TMP")" "pr-review-api-contract." "control: the scratch directory is still the contract's own to remove"
+  sourced "on_exit() { :; }; exit 3"
+  assert_contains "$(ls -A "$RUN_TMP")" "pr-review-api-contract." \
+    "control: without the trap's removal the scratch directory is left behind, so the assertion above can fail"
 }
 
 # --- whole runs ----------------------------------------------------------------------------------
@@ -542,8 +562,8 @@ ok    every Code Review row of the sampled PRs' summaries is Completed or Failed
 ok    a findings review is submitted before its row flips to Completed: the app's last review naming the newest Completed row's commit is not after that row, on 1 sampled PRs (status_state's 'nothing since the 👀' rests on it, #453)
 ok    the gate's own THREADS_QUERY, sent verbatim, answers #9's reviewThreads as a connection: nodes[], a numeric totalCount and a boolean pageInfo.hasNextPage
 ok    every thread carries a non-empty node id (resolve's threadId) and isResolved as a boolean (closed only when literally true)
-ok    every thread's first comment carries fullDatabaseId as a decimal string (the BigInt THREAD_ID_JQ names a thread by, ahead of databaseId)
-ok    databaseId is not clamped past 2^31: on #9's 3 thread(s) whose first comment id is past it, databaseId is null or the very number fullDatabaseId spells (THREAD_ID_JQ's fallback)
+ok    every thread's first comment carries fullDatabaseId as a decimal string (the BigInt threads.thread_id names a thread by, ahead of databaseId)
+ok    databaseId is not clamped past 2^31: on #9's 3 thread(s) whose first comment id is past it, databaseId is null or the very number fullDatabaseId spells (threads.thread_id's fallback)
 ok    on a walk of #9 at 2 a page (2 pages), EVERY page states a numeric totalCount, nodes[] and a boolean hasNextPage, with a non-empty endCursor whenever there is a next page (threads_walk reads the last page's count)
 ok    ... and the pages add up: each states the verbatim read's totalCount (3), their rows reach it, and the last says hasNextPage false (threads_walk's whole-read test)
 skip  reviewThreads paged past 100 threads — no PR here has more than one page of 100 threads; the paging itself is pinned above on a smaller page of the same query
@@ -669,18 +689,42 @@ test_an_unanswered_api_exits_3_and_leaves_nothing_behind() {
   assert_nothing_left "an exit 4"
 }
 
+# The contract speaks in the gate's words by asking the gate's Python for them (the branch
+# encoder first), so a Python that does not answer is a usage-class stop, exit 2 -- never an
+# empty ref read as the base. Run from a copy of the two scripts whose checkout's scripts/py
+# fails, since the contract finds its runner beside itself as pr-review.sh's forward does.
+test_a_gate_python_that_does_not_answer_exits_2() {
+  local tree="$TEST_ROOT/no-py"
+  rm -rf "${tree:?}"
+  mkdir -p "$tree/ship-pr/scripts" "$tree/scripts"
+  cp "$SCRIPT_DIR/pr-review.sh" "$SCRIPT_DIR/pr-review-api-contract.sh" "$tree/ship-pr/scripts/"
+  printf '#!/bin/sh\necho "no gate here" >&2\nexit 1\n' >"$tree/scripts/py"
+  chmod +x "$tree/scripts/py"
+  world_healthy
+  local CONTRACT="$tree/ship-pr/scripts/pr-review-api-contract.sh"
+  run_contract
+  assert_eq "$CONTRACT_RC" 2 "a gate Python that does not answer should end the run 2 ($CONTRACT_ERR)"
+  assert_contains "$CONTRACT_ERR" "the gate's Python ($tree/scripts/py) did not answer; the contract cannot speak in its words" \
+    "the message should name the runner"
+  assert_eq "$(cat "$TEST_ROOT/calls")" "api repos/$REPO" "the run should stop after the repository read, before reading an unencoded ref"
+  assert_not_contains "$CONTRACT_OUT" "beliefs checked" "no verdict should be claimed"
+  assert_nothing_left "an exit 2"
+}
+
 tests=(
   test_sourcing_stops_before_the_first_read
   test_pages_joins_every_page_and_nulls_a_moved_wrapper
   test_pin_and_skip_count_and_report
   test_is_list_and_the_read_guards
   test_api_sorts_a_failed_read_by_its_status
+  test_the_instant_def_answers_as_the_gate_s_instant
   test_the_exit_trap_cleans_up_and_names_an_unchosen_exit
   test_a_healthy_world_pins_what_it_can_and_skips_the_rest
   test_a_squash_merged_anchor_skips_the_second_parent_claims
   test_a_doctored_response_moves_its_pin_and_only_it
   test_a_moved_wrapper_is_one_moved_and_its_rows_skip
   test_an_unanswered_api_exits_3_and_leaves_nothing_behind
+  test_a_gate_python_that_does_not_answer_exits_2
 )
 
 run_tests "${tests[@]}" -- "$@"

@@ -272,78 +272,14 @@ gh() {
   gh_fixture_answer "$response"
 }
 
-# The state line and its rendering, as `status` produces them. Once `status` is served by Python
-# (ludics-lite#403) that is the Python's own state and rendering, asked through the two entry points
-# of ludics.prreview that pr-review.sh's command line does not route to (`status-state <pr>
-# [<pending-request watermark>]`, `status-line <state line> [<pr number>]`), so every case here
-# judges what `status` runs; the arguments are what the shell functions read from their caller's
-# scope (watch_nudge_after, PR_NUM).
-#
-# The shell's status_state and status_line still serve `watch` until it is ported, and every case
-# here judges them too: the shell is asked first, over the same fixture state, and must answer the
-# line the Python does. Without that a regression in the state watch's verdicts are read from lands
-# green, since the watch suite reaches only a few of the states these cases build. The fixture's
-# own state (the request log, the read counters, the simulated push and posts) is put back between
-# the two, so the Python answers the reads the case set up, and what a case counts afterwards is the
-# Python's reads alone. The age is the one field the two may honestly disagree on: each reads the
-# clock for itself, a moment apart.
+# The state line and its rendering, as `status` produces them: the Python's own state and
+# rendering (ludics-lite#403), asked through the two entry points of ludics.prreview that
+# pr-review.sh's command line does not route to (`status-state <pr> [<pending-request watermark>]`,
+# `status-line <state line> [<pr number>]`), so every case here judges what `status` and `watch`
+# run. The arguments are what the reads take from their caller (watch_nudge_after, PR_NUM).
 run_status() {
-  if py_ported status; then
-    local saved="$TEST_ROOT/fixture-state" shell_state
-    fixture_state_save "$saved"
-    run_shell_status
-    shell_state=$STATE
-    fixture_state_restore "$saved"
-    STATE=$(py_forward call status-state 7 "${watch_nudge_after:-}")
-    LINE=$(py_forward call status-line "$STATE" "${PR_NUM:-}")
-    same_state_but_age "$shell_state" "$STATE" ||
-      bail "watch's state (the shell's status_state) and status's (the Python's) differ:" \
-        "shell '$shell_state', Python '$STATE'"
-    assert_eq "$(status_line "$STATE")" "$LINE" \
-      "watch's rendering (the shell's status_line) and status's differ on the same state"
-  else
-    run_shell_status
-  fi
-}
-
-# The fixture's files that a read changes, which run_status puts back between its two reads.
-FIXTURE_STATE_FILES=(requests pushed posted posted.keep fixture-calls nth.)
-fixture_state_save() { # <dir>
-  local name f
-  rm -rf "$1" && mkdir "$1" || bail "could not save the fixture state into $1"
-  for name in "${FIXTURE_STATE_FILES[@]}"; do
-    for f in "$TEST_ROOT/$name"*; do
-      [ ! -e "$f" ] || cp -R "$f" "$1/" || bail "could not save $f"
-    done
-  done
-}
-fixture_state_restore() { # <dir>
-  local name f
-  for name in "${FIXTURE_STATE_FILES[@]}"; do
-    rm -rf "$TEST_ROOT/$name"*
-  done
-  for f in "$1"/*; do
-    [ ! -e "$f" ] || cp -R "$f" "$TEST_ROOT/" || bail "could not restore $f"
-  done
-}
-
-# Two state lines that are the same but for an age read a moment later on the second.
-same_state_but_age() { # <first> <second>
-  local age_a age_b
-  [ "$(state_tok "$1")" = "$(state_tok "$2")" ] || return 1
-  [ "${1#*|*|}" = "${2#*|*|}" ] || return 1
-  age_a=$(state_age "$1") age_b=$(state_age "$2")
-  [ "$age_a" != "$age_b" ] || return 0
-  case "$age_a$age_b" in *[!0-9]*) return 1 ;; esac
-  [ $((age_b - age_a)) -ge 0 ] && [ $((age_b - age_a)) -le 2 ]
-}
-
-# The shell's own state, which `watch` reads until it is ported. run_status asks it beside the
-# Python's; the cases that break one of its jq programs by name (with_broken_jq) ask it alone: a
-# program no feed can reach on its own has no black-box form, and no Python counterpart to break.
-run_shell_status() {
-  STATE=$(status_state 7)
-  LINE=$(status_line "$STATE")
+  STATE=$(py_forward call status-state 7 "${watch_nudge_after:-}")
+  LINE=$(py_forward call status-line "$STATE" "${PR_NUM:-}")
 }
 
 # cmd_status in a subshell: its exit code is the assertion, and it must not end this reporter.
@@ -723,8 +659,8 @@ test_a_dead_watch_s_snapshot_directory_is_swept() {
   fi
   # And the watch left nothing of its own in the root once it returned: no loose snapshot file,
   # and no directory of its own either, so the live watch's two entries are all there is. Where a
-  # round is kept while the watch runs (a per-process directory in the shell, memory in the Python)
-  # is not visible from outside; what a watch that returned leaves behind is.
+  # round is kept while the watch runs (memory in the Python; a per-process directory in the
+  # retired shell) is not visible from outside; what a watch that returned leaves behind is.
   assert_eq "$(cd "$root" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | LC_ALL=C sort | tr '\n' ' ')" \
     "$(printf '%s\n' "pr-review-snap.$live.BBBBBB" "pr-review-snap.$live.feeds.pr" | LC_ALL=C sort | tr '\n' ' ')" \
     "a watch that returned leaves no snapshot file or directory of its own beside the live one's"
@@ -1207,7 +1143,7 @@ test_a_feed_that_did_not_answer_is_unknown_not_a_fact() {
 # A feed jq refuses to parse is a read that did not answer, whatever another JSON parser makes of
 # it. jq 1.8 refuses a lone high-surrogate escape ("Invalid \uXXXX\uXXXX surrogate pair escape");
 # Python's json reads one as a code point, which once gave a definite state, exit 0, where the
-# shell's api_list (and so `watch`) says UNKNOWN, exit 3.
+# shell's api_list (and so `watch`) said UNKNOWN, exit 3.
 test_a_feed_jq_cannot_parse_is_unknown_not_a_fact() {
   local feed
   for feed in comments reviews; do
@@ -1257,11 +1193,10 @@ test_empty_reviews_need_their_own_findings() {
 
 # --- a read that does not parse must not render as a fact (ludics-lite#89) ----------------------
 # Each site is reached from OUTSIDE: a feed answering a shape its read cannot take (an entry that is
-# not an object, a body that is not text), so the case judges whichever implementation serves
-# `status` (ludics-lite#403). Where no feed can reach a site on its own -- an earlier read of the
-# same feed takes every shape it would -- the site is a jq program of the SHELL's status_state,
-# which `watch` still reads: those cases break it by name with the preamble's `with_broken_jq`
-# shim (ludics-lite#179) and run it through run_shell_status.
+# not an object, a body that is not text), so the case judges what serves `status`. A site no feed
+# can reach on its own -- an earlier read of the same feed takes every shape it would -- is broken
+# by hand in the package's own tests instead (lib/ludics/tests/test_prreview_readers.py,
+# BrokenReads); this suite broke the shell's jq programs for those until the shell was retired.
 
 # assert_unknown_state <detail fragment> <site>: the state standing after a run refuses rather than
 # answers. Each case pairs it with a control run on the same fixture, so an `unknown` the fixture
@@ -1271,13 +1206,6 @@ assert_unknown_state() {
   assert_contains "$(state_detail "$STATE")" "$1" "$2: the detail should name the read that did not answer"
   assert_contains "$LINE" "this is NOT 'not approved', retry" \
     "$2: the rendered line should refuse, not report"
-}
-
-# assert_unknown_when_broken <marker> <detail fragment> <site>: break the one shell program the
-# marker names and require the shell's state to refuse.
-assert_unknown_when_broken() {
-  with_broken_jq "$1" run_shell_status
-  assert_unknown_state "$2" "$3"
 }
 
 # A reviewer's comment whose body is not text: the shape that reaches a comment read past the
@@ -1303,30 +1231,6 @@ test_a_broken_jq_program_is_unknown_not_a_value() {
   run_status
   assert_unknown_state "the comments feed did not parse" "the reviewer's last comment"
   COMMENTS_JSON='[]'
-  # The rest read the same feeds after a read that takes every shape they would: shell-only.
-  run_shell_status
-  assert_eq "$(state_tok "$STATE")" idle "control: the shell's own reading of this fixture"
-  assert_unknown_when_broken 'sort_by(.submitted_at) | last' \
-    "the reviews feed did not parse" "the reviews feed"
-  # These two used to default to "|" — no verdict comment, no initialization failure — which is
-  # a plausible fact about the PR and is the shape ludics-lite#89 was filed on.
-  assert_unknown_when_broken 'sort_by(.at) | last' \
-    "the verdict comments feed did not parse" "the no-findings verdict scan"
-  # `$refre` rather than the `capture($refre)` that surrounds it: the marker is a literal in
-  # THIS file, and scripts/check-jq-shapes.sh reads a bare `capture(` as jq source wherever it
-  # finds one. The variable appears in no other program, so it names the site just as exactly.
-  assert_unknown_when_broken '$refre' \
-    "the initialization-failure comments feed did not parse" "the initialization-failure scan"
-}
-
-test_a_broken_jq_program_is_unknown_on_the_failed_head_read() {
-  failed_fixture "$FAILED_HEAD"
-  run_shell_status
-  assert_eq "$(state_tok "$STATE")" failed "control: this fixture reaches the failed-head read"
-  # It used to default to "", which reads as "no review of this head" — the very question this
-  # arm is asking, answered by a read that did not happen.
-  assert_unknown_when_broken '(.commit_id // "") == $sha' \
-    "the reviews feed did not parse for the failed head" "the failed-head review read"
 }
 
 test_a_broken_jq_program_is_unknown_on_the_pending_request_read() {
@@ -1752,14 +1656,6 @@ test_a_completed_row_approval_passes_the_thread_gate() {
     "an open thread under the Completed row's approval is unresolved, as under a 👍"
 }
 
-test_a_broken_jq_program_is_unknown_on_the_completed_row_read() {
-  completed_fixture
-  run_shell_status
-  assert_eq "$(state_tok "$STATE")" approved "control: this fixture reaches the Completed-row read"
-  assert_unknown_when_broken 'max_by(.at | instant) | ([.row' \
-    "the summary comments feed did not parse" "the Completed-row read"
-}
-
 # --- a reviewer run the summary marks Failed (ludics-lite#453) ----------------------------------
 # lukstafi/ocannl-staging#633, 2026-09-04: the last findings review on 8c090d3 at 22:24:34Z, head
 # 1e14b13 committed at 22:46:29Z, and the summary's Code Review row "⚠️ Failed" on it at
@@ -2019,7 +1915,7 @@ test_watch_does_not_post_over_an_approval_that_landed_since_the_round() {
 test_watch_surfaces_a_re_request_that_did_not_post() {
   failed_run_fixture
   FAIL_POST=1
-  # Four attempts is gh_retry's write default: the request must be sent once whatever it is.
+  # Four attempts is GhSession.retry's write default: the request must be sent once whatever it is.
   retune API_ATTEMPTS=4
   run_watch 0,1,0 1 3
   assert_eq "$(grep -c -x "repos/$REPO/issues/7/comments" "$REQUEST_LOG" || true)" 1 \
@@ -2092,7 +1988,6 @@ tests=(
   test_a_feed_that_did_not_answer_is_unknown_not_a_fact
   test_a_feed_jq_cannot_parse_is_unknown_not_a_fact
   test_a_broken_jq_program_is_unknown_not_a_value
-  test_a_broken_jq_program_is_unknown_on_the_failed_head_read
   test_a_broken_jq_program_is_unknown_on_the_pending_request_read
   test_a_broken_jq_program_is_unknown_on_the_current_head_evidence
   test_a_running_row_the_stamp_pattern_misses_is_unknown
@@ -2118,7 +2013,6 @@ tests=(
   test_a_completed_row_needs_a_round_to_bound_it
   test_a_completed_row_outside_the_allowlist_is_not_a_verdict
   test_a_completed_row_approval_passes_the_thread_gate
-  test_a_broken_jq_program_is_unknown_on_the_completed_row_read
   test_a_failed_run_on_the_head_is_a_failed_state
   test_a_failed_run_needs_the_head_and_no_approval
   test_a_failed_run_needs_a_silent_reviewer

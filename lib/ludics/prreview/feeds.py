@@ -201,7 +201,23 @@ def review_comments(ctx: Ctx, pr: str, review_id: str) -> list[Json]:
     return out
 
 
-# The connector's fixed replies (ludics-lite#472): see CONNECTOR_FIXED_REPLIES in pr-review.sh.
+# The connector's FIXED replies (ludics-lite#472): an envelope whose comments are all such replies
+# is no review with findings either (substantive_reviews). A mention of '@codex' in a review thread
+# draws the connector's answer INTO that thread, and GitHub files a thread reply as an
+# empty-bodied COMMENTED review on the head, so the envelope test once passed it as findings: on PR #465 one quoted '@codex review' drew inline comment 4138519259, and
+# `watch` reported "opened round 5 of 12" over a round that never ran. Both the count and the
+# state read through here, so for both it is not a review of that head.
+#
+# Boundary, as a fail-closed allowlist: CONNECTOR_FIXED_REPLIES holds the verbatim bodies of the
+# replies seen, and a comment matches only when it IS a thread reply (a numeric `in_reply_to_id`,
+# which the review's own comments endpoint serves) and its body, trailing whitespace aside, EQUALS
+# one of them. A top-level comment carrying that text is a finding, not this reply (review of #488,
+# round 1). One body today, taken from comment 4138519259 and the same answer the connector gave six
+# times in threads of PR #82 (every connector thread reply on this repository and
+# ocannl-staging, read 2026-10-01). Not read: the comment's author (a review's comments are its
+# author's), any other wording, a body that quotes or extends one of these, and an envelope
+# mixing one with anything else, all of which stay findings. A new fixed reply counts as a round
+# until its body is added here, loudly; a finding swallowed by a looser match would not be seen.
 CONNECTOR_FIXED_REPLIES = (
     "To use Codex here, [create an environment for this repo]"
     "(https://chatgpt.com/codex/cloud/settings/environments).",

@@ -16,7 +16,13 @@ on:
   pull_request:
     paths:
       - ship-pr/scripts/pr-review-api-contract.sh
-      - ship-pr/scripts/pr-review.sh # sourced by the contract: a change to the library it derives from is a change to the contract
+      - ship-pr/scripts/pr-review.sh # sourced by the contract, for its jq
+      # The gate's own words the contract asks of the Python (its branch encoder, its threads query,
+      # its summary-row patterns): a change to them is a change to the contract.
+      - lib/ludics/prreview/shtext.py
+      - lib/ludics/prreview/threads.py
+      - lib/ludics/prreview/state.py
+      - scripts/py
       - .github/workflows/api-contract.yml
 
 # Two jobs, because a pull request that changes the script runs the PR's version of it: the job
@@ -45,6 +51,10 @@ jobs:
       - uses: actions/checkout@v4
       # The fleet's pinned jq, ahead of the image's own (ludics-lite#508); it prints which jq runs.
       - uses: ./.github/actions/setup-jq
+      # The contract asks the gate's Python for its own words (scripts/py needs a Python >= 3.12).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Assert the fixtures' beliefs against this repository's live API
         id: contract
         env:

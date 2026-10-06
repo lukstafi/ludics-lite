@@ -465,8 +465,9 @@ class ProductionPath(unittest.TestCase):
 
     def run_cmd(self, *args: str) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
-        env.update({"REPO": "", "SHIP_PR_API_ATTEMPTS": "2", "SHIP_PR_API_BACKOFF": "0"})
         cwd = os.path.realpath(tempfile.mkdtemp(prefix="ludics-writers-test."))
+        env.update({"REPO": "", "SHIP_PR_API_ATTEMPTS": "2", "SHIP_PR_API_BACKOFF": "0",
+                    "SHIP_PR_STATE_DIR": os.path.join(cwd, "state")})
         try:
             return subprocess.run([PR_REVIEW, *args], capture_output=True, text=True, env=env,
                                   cwd=cwd, check=False)

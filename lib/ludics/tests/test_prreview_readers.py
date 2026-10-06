@@ -12,6 +12,8 @@ import json
 import time
 import unittest
 from collections.abc import Callable, Sequence
+from typing import Any
+from unittest import mock
 
 from ludics import proc
 from ludics.prreview import jqsem as jq
@@ -335,6 +337,14 @@ class Rounds(unittest.TestCase):
         self.assertEqual(self.count([review(1, "aaaa", "yesterday")]),
                          "unknown|the reviews feed did not parse")
 
+    def test_an_unreadable_head_tally_is_a_question_mark_not_a_number(self) -> None:
+        # The tally reads nothing the count did not read first, so no feed breaks it alone; the
+        # shell suite broke the shell's program by name until the shell half was retired.
+        reviews = [review(1, "aaaa", "2026-09-01T10:00:00Z"), review(2, "bbbb", "2026-09-01T11:00:00Z")]
+        self.assertEqual(self.count(reviews), f"2|2 round(s) of {REV} findings over 2 head(s)")
+        with mock.patch.object(state, "unique", side_effect=jq.JqError("broken on purpose")):
+            self.assertEqual(self.count(reviews), f"2|2 round(s) of {REV} findings over ? head(s)")
+
     def test_rounds_line(self) -> None:
         self.assertEqual(rounds.rounds_line("2|d", 12), ("review rounds with findings: 2 of 12 (d)", 0))
         self.assertEqual(rounds.rounds_line("2|d", None)[1], 0)
@@ -388,6 +398,63 @@ class StatusState(unittest.TestCase):
         st = run_state(feeds(comments=[comment(1, "2026-09-01T01:00:00Z", body)]))
         self.assertEqual(st.tok, "failed", st.line())
         self.assertEqual(st.detail.split("|")[:2], ["aaaaaaa", "git"])
+
+
+class BrokenReads(unittest.TestCase):
+    """A read of status_state that no feed can break on its own -- an earlier read of the same feed
+    takes every shape it would -- still refuses rather than answers when it fails (ludics-lite#89):
+    each is broken here, one at a time, beside a control run of the same fixture. The shell suite
+    broke the shell's jq programs for these by name (test-pr-review-status.sh's with_broken_jq
+    cases) until the shell half of pr-review.sh was retired; these are the sites that serve now."""
+
+    def broken(self, gh: FakeGh, target: str, nth: int = 1) -> state.State:
+        """status_state with ``state.<target>`` raising JqError on its nth call."""
+        real = getattr(state, target)
+        calls = 0
+
+        def fail_once(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == nth:
+                raise jq.JqError("broken on purpose")
+            return real(*args, **kwargs)
+
+        with mock.patch.object(state, target, fail_once):
+            return run_state(gh)
+
+    def assert_unknown(self, st: state.State, detail: str) -> None:
+        self.assertEqual((st.tok, st.detail), ("unknown", detail), st.line())
+
+    def test_the_reviews_the_verdicts_and_the_summary_rows_refuse(self) -> None:
+        idle = feeds(reviews=[review(5, HEAD, "2026-09-01T00:00:00Z")])
+        self.assertEqual(run_state(idle).tok, "idle", "control: the fixture reads idle")
+        # sort_by's first call in status_state is the reviews read, its second the verdict scan.
+        self.assert_unknown(self.broken(idle, "sort_by", 1), "the reviews feed did not parse")
+        self.assert_unknown(self.broken(idle, "sort_by", 2), "the verdict comments feed did not parse")
+        self.assert_unknown(self.broken(idle, "_init_failure"),
+                            "the initialization-failure comments feed did not parse")
+        self.assert_unknown(self.broken(idle, "_done_row"), "the summary comments feed did not parse")
+
+    def test_the_failed_head_read_refuses(self) -> None:
+        body = ("Codex Review: Something went wrong. Try again later by commenting “@codex review”.\n\n"
+                f"```\nProvided git ref {HEAD} does not exist\n```")
+        failed = feeds(comments=[comment(1, "2026-09-01T01:00:00Z", body)])
+        self.assertEqual(run_state(failed).tok, "failed", "control: the fixture reaches the failed-head read")
+        self.assert_unknown(self.broken(failed, "_review_of_head_at"),
+                            "the reviews feed did not parse for the failed head")
+
+    def test_the_completed_row_read_refuses(self) -> None:
+        head = "fc6ff6a" + "0" * 33
+        row = ("<!-- codex-pull-request-review-summary -->\n| Review | Status | Commit | Review trigger |\n"
+               "| --- | --- | --- | --- |\n| 📝 **Code Review** | ✅ **Completed** <relative-time"
+               ' datetime="2026-09-27T01:10:51.510504Z">2026-09-27T01:10:51Z</relative-time> | `fc6ff6a` |'
+               " New commits |")
+        completed = feeds(head=head, head_at="2026-09-27T01:06:05Z",
+                          reviews=[review(5, "b67e463" + "0" * 33, "2026-09-27T01:03:11Z")],
+                          reactions=[reaction("eyes", "2026-09-27T01:06:53Z")],
+                          comments=[comment(1, "2026-09-27T01:10:51Z", row)])
+        self.assertEqual(run_state(completed).tok, "approved", "control: the fixture reaches the Completed row")
+        self.assert_unknown(self.broken(completed, "_done_row"), "the summary comments feed did not parse")
 
 
 class StatusLine(unittest.TestCase):

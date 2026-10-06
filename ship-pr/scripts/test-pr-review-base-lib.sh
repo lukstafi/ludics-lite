@@ -99,8 +99,8 @@ TIP=""
 WORKFLOWS_JSON=""
 JOBS_DEFAULT=""
 FAIL_ENDPOINT=""
-# The HTTP status a failed read reports: a 5xx is transport, which gh_retry retries, while a 4xx is
-# the API's answer — a 404 or a 403 on the workflow file is how base_push_trigger meets a missing
+# The HTTP status a failed read reports: a 5xx is transport, which GhSession.retry retries, while a 4xx is
+# the API's answer — a 404 or a 403 on the workflow file is how Base.push_trigger meets a missing
 # file and a token that may not read it (ludics-lite#401).
 FAIL_STATUS=""
 # The settle path's three reads (ludics-lite#156): the workflow FILE (its path, then its body at
@@ -355,8 +355,8 @@ gh() {
     # round, so the FIRST listed workflow's read is one per round and nothing else here is.
     # (A fixture whose first workflow is advisory would never be read, and would count no
     # rounds — no case lists one, and `is_advisory` is pr-review.sh's own test for it.)
-    # `|| return 1`: the fixture runs in gh_retry's command substitution, which does not inherit
-    # errexit, so a count that bails must be turned into a failed read by hand.
+    # `|| return 1`: the fixture function runs without errexit in the bridge's fresh bash, so a
+    # count that bails must be turned into a failed read by hand.
     if [ "$wid" = "$(first_wid)" ]; then
       round=$(fixture_call_count rounds) || return 1
     fi
@@ -850,21 +850,23 @@ test_a_suite_that_shadows_the_transport_is_refused() {
 }
 
 # The PR #419 shape: a fixture key pattern that also matches a name pr-review.sh defines. The old
-# reset unset WORKFLOW_YAML_FILTER in silence and a suite went red somewhere else; the reset now
-# refuses, naming it. The control: names a case creates under the same patterns are still cleared.
+# reset unset WORKFLOW_YAML_FILTER (a constant of the retired shell half) in silence and a suite
+# went red somewhere else; the reset now refuses, naming it. The shape here is the same over a
+# constant the script still sets, BUDGET_DIR. The control: names a case creates under the same
+# patterns are still cleared.
 test_reset_fixture_refuses_to_unset_a_name_it_did_not_create() {
   local rc v
   reset_fixture
-  [ -n "${WORKFLOW_YAML_FILTER:-}" ] || bail "pr-review.sh should define WORKFLOW_YAML_FILTER"
+  [ -n "${BUDGET_DIR+set}" ] || bail "pr-review.sh should define BUDGET_DIR"
   set +e
   (
-    FIXTURE_KEYS+=('WORKFLOW_YAML_[A-Za-z0-9_]*')
+    FIXTURE_KEYS+=('BUDGET_[A-Za-z0-9_]*')
     reset_fixture
   ) 2>"$TEST_ROOT/refusal"
   rc=$?
   set -e
   assert_eq "$rc" 2 "a key pattern over a library name is refused ($(cat "$TEST_ROOT/refusal"))"
-  assert_contains "$(cat "$TEST_ROOT/refusal")" "in scope before any case ran: WORKFLOW_YAML_FILTER —" \
+  assert_contains "$(cat "$TEST_ROOT/refusal")" "in scope before any case ran: BUDGET_DIR —" \
     "the refusal should name the library variable the pattern matched, alone"
   RUNS_7=x RUNS_7_FROM_2=x JOBS_7003=x RUN_7003=x WORKFLOW_PATH_7=x YAML_OF_nightly=x FILES_d=x
   reset_fixture
