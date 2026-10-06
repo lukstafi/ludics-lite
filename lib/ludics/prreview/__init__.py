@@ -2,5 +2,5 @@
 
 ``core`` is the shared prelude; each ported subcommand is a module named after it, exposing
 ``run(session, args) -> int``, and ``__main__`` dispatches to it. The shell script stays the
-entry point: its ``PY_PORTED`` set names the subcommands it forwards here.
+entry point: it validates the source-time knobs and forwards every subcommand here.
 """

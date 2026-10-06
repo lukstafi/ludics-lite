@@ -543,6 +543,33 @@ class PrTarget:
     num: str
 
 
+# A PR is addressed by a repository and a number, and the number alone names one PR in every
+# repository there is. So the repository is either SPELLED OUT in the invocation — an
+# owner/name#<n> argument, --repo, REPO= — or the call is refused. Resolution happens after the PR
+# argument is parsed, because that argument may carry the repo itself.
+#
+# Two other sources stood here and both are gone (ludics-lite#92). The cwd was trusted outright,
+# and cached: a bare `reply 7` typed from a shell sitting in another project's worktree posted into
+# whatever PR 7 is over there. The per-PR cache remembered a repo by NUMBER, across checkouts and
+# across sessions, so a `reply 7` meant for repo B resolved to the repo A that some earlier call
+# had named for 7.
+#
+# Both were verified against `repos/<repo>/pulls/<n>` before use, or could have been, and this is
+# the half worth writing down because verification is the fix that looks right: that read answers
+# "this repository has a seventh PR", not "this is the PR you meant". Every active repository has a
+# PR 7. So on exactly the invocations these guesses fail on — a worktree of another project, a
+# stale entry from yesterday's PR — the check passes and the write lands on a stranger's review
+# thread, now with a verification behind it. A claim that cannot fail, standing in for a
+# safeguard, is worse than no safeguard. Nor can any other read stand in: what both sources are
+# guesses about is INTENT, and the API has nothing to say about that.
+#
+# So there is no inference left, as ludics-lite#74 (PR #79) left none for `retry run watch` after a
+# background shell in a sibling worktree turned a wrong-target read into a failed-run verdict. The
+# cost is one `owner/name#<n>` per call, which is what the skill's instructions have always told
+# callers to write. What it buys is an invariant with no exception to remember: no command
+# addresses a repository that its invocation did not name. `repo_from_cwd` survives for `base`
+# alone, which resolves a repo and a BRANCH — a name the API can actually be asked about — rather
+# than a bare number every repository answers to.
 def resolve_repo(num: str, repo: str) -> None:
     """``resolve_repo``: a PR number with no repository named anywhere is refused (#92)."""
     if repo:

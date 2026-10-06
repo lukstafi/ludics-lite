@@ -98,15 +98,21 @@ INIT_FAILURE_ENV_RE = (
 _INIT_FAILURE = onig(f"(?:{INIT_FAILURE_GIT_RE})|(?:{INIT_FAILURE_ENV_RE})")
 _INIT_FAILURE_ENV = onig(INIT_FAILURE_ENV_RE)
 _INIT_FAILURE_REF = onig(r"Provided git ref[^0-9a-f]*(?<s>[0-9a-f]{7,40})")
-_SUMMARY_COMPLETED_ROW = onig(
-    r'^\|[^|]*Code Review[^|]*\| *\u2705 \*\*Completed\*\* <relative-time datetime="(?<at>[^"]+)">'
-    r"[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|"
+# The summary comment's Code Review row, in jq's regex dialect: compiled here (onig), and asked for
+# verbatim by pr-review-api-contract.sh, which pins the live rows against the gate's own patterns.
+# The emoji are literal characters, which both dialects read the same.
+SUMMARY_COMPLETED_ROW_RE = (
+    '^\\|[^|]*Code Review[^|]*\\| *\u2705 \\*\\*Completed\\*\\* <relative-time datetime="(?<at>[^"]+)">'
+    "[^<|]*</relative-time> *\\| *`(?<sha>[0-9a-f]{7,40})` *\\|"
 )
-_SUMMARY_FAILED_ROW = onig(
-    r'^\|[^|]*Code Review[^|]*\| *\u26a0\ufe0f \*\*Failed\*\* <relative-time datetime="(?<at>[^"]+)">'
-    r"[^<|]*</relative-time> *\| *`(?<sha>[0-9a-f]{7,40})` *\|"
+SUMMARY_FAILED_ROW_RE = (
+    '^\\|[^|]*Code Review[^|]*\\| *\u26a0\ufe0f \\*\\*Failed\\*\\* <relative-time datetime="(?<at>[^"]+)">'
+    "[^<|]*</relative-time> *\\| *`(?<sha>[0-9a-f]{7,40})` *\\|"
 )
-_SUMMARY_ROW_STAMP = onig(r'datetime="(?<at>[^"]+)"[^|]*\| *`(?<sha>[0-9a-f]{7,40})` *\|')
+SUMMARY_ROW_STAMP_RE = 'datetime="(?<at>[^"]+)"[^|]*\\| *`(?<sha>[0-9a-f]{7,40})` *\\|'
+_SUMMARY_COMPLETED_ROW = onig(SUMMARY_COMPLETED_ROW_RE)
+_SUMMARY_FAILED_ROW = onig(SUMMARY_FAILED_ROW_RE)
+_SUMMARY_ROW_STAMP = onig(SUMMARY_ROW_STAMP_RE)
 _CODE_REVIEW_ROW = onig(r"^\|[^|]*Code Review[^|]*\|")
 _RUNNING_ROW = onig(r"^\|[^|]*Code Review[^|]*\|[^|]*Running")
 _NO_FINDINGS = onig("[Dd]idn.t find any major issues")

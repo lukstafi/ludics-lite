@@ -191,7 +191,7 @@ set -euo pipefail
 {
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
 source "$SCRIPT_DIR/@LIBRARY@"
-newest() { echo "a suite helper that shadows the library"; }
+jq_lf() { echo "a suite helper that shadows the library"; }
 exit "$?"
 }
 EOF

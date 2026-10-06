@@ -906,7 +906,7 @@ checks leave nothing to wait for (green as well as absent), the gate reads
 - a run that completed `cancelled`/`stale`/`action_required` with nothing behind it is exit 4,
   stopped-not-judged like everywhere else, as is one reported `completed` with no conclusion
   recorded yet;
-- a head with no Actions run to back its checks holds too: `build_checks` accepts every provider's
+- a head with no Actions run to back its checks holds too: the gate reads every provider's
   check runs, so an early Codecov green is not evidence that Actions has created its rows;
 - a **checkless** head holds while it is inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from
   the fresher of the head's commit date and the PR's own `updated_at` — each validated on its own,
@@ -955,7 +955,7 @@ semantics the check lookup asks for: a re-triggered invocation supersedes its ow
 predecessor, while one file triggered on both `push` and `pull_request` produces two independent
 runs that are both judged — and a queued run is never folded away at all, since supersession is
 something that happens to a run that stopped. The advisory list is a deny-list of check, job and workflow names in all directions — a run
-whose red is explained entirely by advisory jobs is not a red build signal, since `build_checks`
+whose red is explained entirely by advisory jobs is not a red build signal, since the gate
 already dropped those checks on purpose. A run list that cannot be read is exit 3 even under a
 pending check: an unread run list cannot rule out a red that no check run will ever carry.
 

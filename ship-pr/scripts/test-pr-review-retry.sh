@@ -133,9 +133,6 @@ reset_fixture() {
   REPO=""
   AWAIT_WAIT=""
   : >"$CALL_LOG"
-  # A case's refusal of the script's own call stops every later call in this process, which is
-  # the point of it (ludics-lite#471), so the next case starts without one.
-  rm -f "$GH_REFUSED_FILE"
 }
 
 # `retry run watch` in a command substitution: its refusals call `exit`, and a subshell is what

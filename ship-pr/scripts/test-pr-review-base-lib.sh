@@ -850,21 +850,23 @@ test_a_suite_that_shadows_the_transport_is_refused() {
 }
 
 # The PR #419 shape: a fixture key pattern that also matches a name pr-review.sh defines. The old
-# reset unset WORKFLOW_YAML_FILTER in silence and a suite went red somewhere else; the reset now
-# refuses, naming it. The control: names a case creates under the same patterns are still cleared.
+# reset unset WORKFLOW_YAML_FILTER (a constant of the retired shell half) in silence and a suite
+# went red somewhere else; the reset now refuses, naming it. The shape here is the same over a
+# constant the script still sets, BUDGET_DIR. The control: names a case creates under the same
+# patterns are still cleared.
 test_reset_fixture_refuses_to_unset_a_name_it_did_not_create() {
   local rc v
   reset_fixture
-  [ -n "${WORKFLOW_YAML_FILTER:-}" ] || bail "pr-review.sh should define WORKFLOW_YAML_FILTER"
+  [ -n "${BUDGET_DIR+set}" ] || bail "pr-review.sh should define BUDGET_DIR"
   set +e
   (
-    FIXTURE_KEYS+=('WORKFLOW_YAML_[A-Za-z0-9_]*')
+    FIXTURE_KEYS+=('BUDGET_[A-Za-z0-9_]*')
     reset_fixture
   ) 2>"$TEST_ROOT/refusal"
   rc=$?
   set -e
   assert_eq "$rc" 2 "a key pattern over a library name is refused ($(cat "$TEST_ROOT/refusal"))"
-  assert_contains "$(cat "$TEST_ROOT/refusal")" "in scope before any case ran: WORKFLOW_YAML_FILTER —" \
+  assert_contains "$(cat "$TEST_ROOT/refusal")" "in scope before any case ran: BUDGET_DIR —" \
     "the refusal should name the library variable the pattern matched, alone"
   RUNS_7=x RUNS_7_FROM_2=x JOBS_7003=x RUN_7003=x WORKFLOW_PATH_7=x YAML_OF_nightly=x FILES_d=x
   reset_fixture

@@ -68,25 +68,34 @@ A script other than `pr-review.sh` gets a sibling package, `lib/ludics/<script>/
 `scripts/py -m ludics.<script>`; its shell file becomes the one-line forward (`exec "$(dirname
 "$0")/../../scripts/py" -m ludics.<script> "$@"`, with the right number of `..`).
 
-## Forwarding a pr-review.sh subcommand
+## pr-review.sh: the command line in front of the package
 
-`pr-review.sh` keeps every subcommand it has not ported. To port `<name>`:
+Every `pr-review.sh` subcommand is served here, and the shell half is retired: `pr-review.sh` is
+the usage text, the source-time knobs and their validation, and the forward (its implementation
+before the retirement is `git show c66d06b:ship-pr/scripts/pr-review.sh`). What it still defines,
+and why:
 
-1. Write `lib/ludics/prreview/<name>.py` with `run(session: GhSession, args: list[str]) -> int`,
-   using the core (`session.retry`, `pr_arg`, `fail`/`die`, `cli.emit`). Return the exit status,
-   or raise through `fail(rc, ...)`, which ends the command from any depth with
-   `pr-review.sh: <message>` on stderr.
-2. Add `case "<name>":` to `lib/ludics/prreview/__main__.py` (and the name to `PORTED` there).
-3. In `ship-pr/scripts/pr-review.sh`: add the name to `PY_PORTED`, and reduce `cmd_<name>` to
-   `cmd_<name>() { py_forward call <name> "$@"; }`. `main` then execs the Python for it; the stub
-   serves callers that source the script (every fixture suite, and any shell function that still
-   calls `cmd_<name>`).
-4. Every source-time constant the Python reads goes into `PY_FORWARD_VARS` as
-   `SHELLVAR=ENVNAME` (with `Config` reading `ENVNAME`), because a suite's `retune` and `main`'s
-   `--repo` change the shell variable, not the environment. A constant whose being SET is itself
-   meaningful (`SHIP_PR_ADVISORY_CHECKS`) needs a private environment name for the forward.
-5. Run the subcommand's suites unchanged, under `bash` and `/bin/bash`, and the hostile pass
-   (`ship-pr/scripts/run-pr-review-hostile.sh`, which needs `en_US.UTF-8`).
+- the knobs (`GRACE`, `CHECKS_INTERVAL`, `BUDGET_DIR`, ...), resolved from the environment and
+  validated once, so a bad value is refused before anything runs. `PY_FORWARD_VARS` hands each to
+  the Python as `SHELLVAR=ENVNAME` (with `Config` or `knobs.py` reading `ENVNAME`), because a
+  suite's `retune` and `main`'s `--repo` change the shell variable, not the environment. A
+  constant whose being SET is itself meaningful (`SHIP_PR_ADVISORY_CHECKS`) has a private
+  environment name for the forward;
+- `main`, which execs `scripts/py -m ludics.prreview <subcommand>`, and `py_usage`, the one
+  refusal it makes itself (bash's own `${1:?}` message for a reader with no PR);
+- `py_forward`, `py_bridge_state` and `py_native_path`: the forward, and the bridge below;
+- a `cmd_<name>` stub per subcommand (`py_forward call <name> "$@"`), for the fixture suites,
+  which source the script and call the function;
+- `fail`/`die`, for the refusals above, and `jq`/`jq_lf` with the line-ending probe
+  (ludics-lite#335), which nothing in the script runs any more: they are for the scripts that
+  source it and run jq themselves, the fixture suites and `pr-review-api-contract.sh`.
+
+A new subcommand is a module `lib/ludics/prreview/<name>.py` with `run(session: GhSession, args:
+list[str]) -> int` (the core: `session.retry`, `pr_arg`, `fail`/`die`, `cli.emit`; `fail(rc, ...)`
+ends the command from any depth with `pr-review.sh: <message>` on stderr), its `case` and its
+`PORTED` entry in `__main__.py`, its name in `main`'s case in `pr-review.sh` with a `cmd_<name>`
+stub, and any new knob in `PY_FORWARD_VARS`. Run its suites under `bash` and `/bin/bash`, and the
+hostile pass (`ship-pr/scripts/run-pr-review-hostile.sh`, which needs `en_US.UTF-8`).
 
 ### The shell bridge, and what it does not cover
 
@@ -100,8 +109,8 @@ for that reason) behaves the same. In production nothing is a function and `gh` 
 Not bridged: a suite's stub of the **clock** (`date`, SECONDS). The clock is an environment
 interface instead, `SHIP_PR_TEST_CLOCK` (`prreview/clock.py`, shared by every port): a file holding
 an epoch second that IS the clock -- every age and deadline is read from it -- and that a sleep
-advances instead of waiting. The shell's `clock_now` reads the same file, so a suite that exports it
-drives either implementation; test-pr-review-watch.sh runs every case on it.
+advances instead of waiting. A suite that exports it drives every subcommand's clock;
+test-pr-review-watch.sh runs every case on it.
 
 `sleep` IS bridged (with `gh` and `git`): a suite's `sleep` observes the wait -- the pauses it logs,
 what it lets happen meanwhile (test-pr-review-budget.sh's SLEEP_HOOK) -- which only a call carries.

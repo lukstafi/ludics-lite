@@ -33,7 +33,7 @@ source "$SCRIPT_DIR/test-pr-review-lib.sh"
 {
 test_tmpdir TEST_ROOT watch-test
 
-# The clock is the script's own test clock (SHIP_PR_TEST_CLOCK, pr-review.sh's clock_now): a file
+# The clock is the script's own test clock (SHIP_PR_TEST_CLOCK, prreview/clock.py): a file
 # holding the epoch second, which every age the state reads and every deadline the watch keeps is
 # measured on, and which the watch's sleep ADVANCES instead of waiting. A window is then as long as
 # its arithmetic says and takes no wall time, and an age is exactly what a case dated it, however
@@ -276,9 +276,11 @@ run_watch() { # [watermark] [interval] [timeout]
   WATCH_ERR=$(cat "$TEST_ROOT/watch.err")
 }
 
+# The state and its rendering, as the watch reads them: the Python's own, through the two entry
+# points of ludics.prreview that the command line does not route to (test-pr-review-status.sh).
 run_status() {
-  STATE=$(status_state 7)
-  LINE=$(status_line "$STATE")
+  STATE=$(py_forward call status-state 7)
+  LINE=$(py_forward call status-line "$STATE")
 }
 
 # --- what ends the wait -------------------------------------------------------------------------
@@ -750,10 +752,10 @@ test_a_final_poll_that_did_not_answer_withholds_the_verdict() {
 }
 
 # The withheld verdict quotes the final poll's error, which is the last gh call's: here the new
-# review's own comments read, after the three feeds answered. The poll runs in Python
-# (ludics-lite#403) and the line is printed by the shell, so the error has to come back through
-# GH_ERR_FILE as the shell's own gh_retry left it; a poll that did not hand it back made the line
-# say "did not answer ()".
+# review's own comments read, after the three feeds answered. While the poll ran in Python and the
+# line was printed by the shell (ludics-lite#403), the error had to come back through a file the
+# shell read, and a poll that did not hand it back made the line say "did not answer ()"; both are
+# Python now, and the line must still carry the error.
 test_a_withheld_verdict_quotes_the_final_poll_s_error() {
   reset_fixture
   retune GRACE=1
@@ -1714,8 +1716,8 @@ test_poll_a_feed_that_did_not_answer_is_unknown() {
 # Driven through the command line: a poll that answers takes the watermark it computed, never the
 # quoted one, and a poll that fails — here the comments feed, read after the inline one — leaves
 # the window blind on the caller's watermark. (The partway shape itself, bodies printed and then a
-# rendering failing, needs a jq program to break mid-round; that half is poll's, pinned by the
-# broken-jq cases above against the shell's own rendering.)
+# rendering failing, needs a jq program to break mid-round; that half was pinned by breaking the
+# shell's own rendering's programs, until poll was ported and the programs were gone.)
 test_a_failed_round_takes_no_watermark_from_a_quoted_line() {
   reset_fixture
   schedule inline 1 "[$(inline_comment 900 "$H2" "$H2" 'a finding

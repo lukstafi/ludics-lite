@@ -63,17 +63,36 @@
 
 set -euo pipefail
 
-# pr-review.sh itself, sourced without running: the contract encodes a branch name with the
-# library's own encode_ref, so the anchor read below exercises the encoder warn_base_drift uses,
-# rather than a restatement of it. Every function this file defines comes after this line and
-# shares no name with the library's (the trap test-pr-review-lib.sh guards the suites against).
+# pr-review.sh itself, sourced without running, for its `jq` (the line ending a native jq.exe
+# writes is decided there once, for every script that sources it). Every function this file defines
+# comes after this line and shares no name with the library's (the trap test-pr-review-lib.sh
+# guards the suites against).
 export SHIP_PR_TEST_SOURCE_ONLY=1
 # shellcheck source=pr-review.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/pr-review.sh"
+# The gate itself is Python (lib/ludics/prreview, ludics-lite#403), and what this contract sends
+# in its words is asked of it rather than restated: the branch encoder warn_base_drift's tip read
+# uses (shtext.encode_ref), and the review-threads query (threads.THREADS_QUERY). The checkout's
+# runner, physically resolved, as pr-review.sh's forward finds it.
+CONTRACT_PY="$(CDPATH= cd -P "$(dirname "${BASH_SOURCE[0]}")" && cd -P ../.. && pwd -P)/scripts/py"
+gate_py() { # <python statements, reading sys.argv[1:]> [arg...]
+  "$CONTRACT_PY" -c "import sys
+sys.stdout.reconfigure(newline='\\n')
+$1" "${@:2}" || {
+    echo "pr-review-api-contract.sh: the gate's Python ($CONTRACT_PY) did not answer; the contract cannot speak in its words" >&2
+    exit 2
+  }
+}
+encode_ref() { gate_py 'from ludics.prreview.shtext import encode_ref; print(encode_ref(sys.argv[1]))' "$1"; }
+# How status_state orders a summary row's datetime, spelled in jq for the reads below: the gate's
+# state.instant (fraction padded to nine digits, so the string order is the time order). It is the
+# one piece of the gate's reading this file restates, since the gate itself runs no jq;
+# test-pr-review-api-contract.sh holds the two spellings to the same answers.
+SUMMARY_ROW_INSTANT_DEF='def instant: sub("Z$"; "") | (if test("\\.") then . else . + "." end) + "000000000" | .[0:29];'
 
 REPO="${1:-${GITHUB_REPOSITORY:-lukstafi/ludics-lite}}"
 REVIEWER="${REVIEWER:-chatgpt-codex-connector}"
-BOT="${REVIEWER}[bot]" # how an app's login reads in every feed: matched by prefix in pr-review.sh
+BOT="${REVIEWER}[bot]" # how an app's login reads in every feed: matched by prefix in the gate
 STALE_BASE_PR="${CONTRACT_STALE_BASE_PR:-}"
 REVIEWED_PR="${CONTRACT_REVIEWED_PR:-}"
 THREADS_PR="${CONTRACT_THREADS_PR:-}"
@@ -91,7 +110,7 @@ if [ "$REPO" = lukstafi/ludics-lite ]; then
   fi
 fi
 
-# The vocabularies the projections classify. conclusion_class in pr-review.sh maps failure,
+# The vocabularies the projections classify. conclusion_class (prreview/checkruns.py) maps failure,
 # timed_out and startup_failure to red; success, skipped and neutral to green; null to pending;
 # and EVERYTHING ELSE to stopped-not-judged — so a conclusion string outside this list would be
 # absorbed silently, which is why membership is a belief and not a tautology.
@@ -189,13 +208,11 @@ SCRATCH=$(CDPATH= cd "$SCRATCH" && pwd -P)
 
 # Any exit this script did not choose — a jq that cannot iterate a wrapper that moved, say — is
 # named here, so the log says what stopped and the workflow's reporter (every exit but 0 and 3)
-# has something to point at. This trap REPLACED the one sourcing pr-review.sh installed — a trap
-# is not chained — so pr-review.sh's cleanup is CALLED here rather than restated (ludics-lite#195:
-# the restatement was a copy that drifted, and #191's snapshot directory leaked from the other
-# copy for a whole release).
+# has something to point at. Sourcing pr-review.sh installs no trap of its own for this one to
+# replace (it leaves nothing behind since its shell half was retired); when it did, this trap
+# called its cleanup by name rather than restating it (ludics-lite#195).
 on_exit() {
   local rc=$?
-  pr_review_cleanup
   rm -rf "$SCRATCH"
   case "$rc" in
   0 | 1 | 2 | 3 | 4 | 5) ;;
@@ -259,9 +276,11 @@ else
   BASE=$(jq -r '.default_branch // empty' <<<"$repo")
   [ -n "$BASE" ] || { echo "pr-review-api-contract.sh: the repository read carries no default branch; nothing below can be anchored (1 moved)" >&2; exit 1; }
 fi
-# The ref goes through the library's encoder, as warn_base_drift's tip read sends it: a legal
-# name such as release#1 would otherwise become a URL fragment.
-tip=$(api "repos/$REPO/commits/$(encode_ref "$BASE")")
+# The ref goes through the gate's encoder, as warn_base_drift's tip read sends it: a legal
+# name such as release#1 would otherwise become a URL fragment. Encoded once, by itself, so an
+# encoder that did not answer stops the contract (exit 2) instead of reading an empty ref.
+BASE_ENC=$(encode_ref "$BASE")
+tip=$(api "repos/$REPO/commits/$BASE_ENC")
 pin "commits/<encode_ref branch> answers the branch tip's sha and committer date (the drift anchor and the push clock)" \
   "(.sha | test(\"$HEX40\")) and (.commit.committer.date | test(\"$ISO\"))" "$tip"
 HEAD=$(jq -r '.sha // empty' <<<"$tip")
@@ -425,7 +444,7 @@ banchor=""
 bname=""
 for wf_id in $(jq -r '.[].id // empty' <<<"$wflist"); do
   is_num "$wf_id" || continue
-  bruns=$(api "repos/$REPO/actions/workflows/$wf_id/runs?branch=$(encode_ref "$BASE")&event=push&per_page=10" | pages workflow_runs)
+  bruns=$(api "repos/$REPO/actions/workflows/$wf_id/runs?branch=$BASE_ENC&event=push&per_page=10" | pages workflow_runs)
   # The wrapper is claimed for EVERY workflow this loop asks about, before the answer is used for
   # anything. A feed that dropped or renamed `workflow_runs` comes back null, and moving on to the
   # next workflow without recording that would walk the whole list and land on the "no push run"
@@ -937,6 +956,10 @@ fi
 section "the Codex summary row on recent merged PRs — status_state's Completed and Failed readings"
 SUMMARY_SAMPLE="${CONTRACT_SUMMARY_SAMPLE:-60}"
 is_num "$SUMMARY_SAMPLE" || { echo "pr-review-api-contract.sh: CONTRACT_SUMMARY_SAMPLE must be a number, got '$SUMMARY_SAMPLE'" >&2; exit 2; }
+# The row patterns are the gate's own (prreview/state.py, written in jq's dialect for this read).
+SUMMARY_COMPLETED_ROW_RE=$(gate_py 'from ludics.prreview.state import SUMMARY_COMPLETED_ROW_RE as r; print(r)')
+SUMMARY_FAILED_ROW_RE=$(gate_py 'from ludics.prreview.state import SUMMARY_FAILED_ROW_RE as r; print(r)')
+SUMMARY_ROW_STAMP_RE=$(gate_py 'from ludics.prreview.state import SUMMARY_ROW_STAMP_RE as r; print(r)')
 : >"$SCRATCH/summary_rows.jsonl"
 for n in $(jq -r --argjson k "$SUMMARY_SAMPLE" '[.[] | select(.merged_at != null) | .number | select(type == "number")] | .[:$k] | .[]' <<<"$closed"); do
   # Through files, not the argument vector: a long-reviewed PR's feed is over Linux's
@@ -994,7 +1017,7 @@ fi
 
 # --- reviewThreads (GraphQL) ------------------------------------------------------------------------
 # The one GraphQL read: the open-thread gate (unresolved_threads) and `resolve` (find_thread) both
-# page reviewThreads through threads_walk with the library's own THREADS_QUERY, sent here verbatim,
+# page reviewThreads through threads_walk with the gate's own THREADS_QUERY, sent here verbatim,
 # so a field the query asks for that GraphQL stopped serving is this script's exit 4 rather than a
 # restatement that kept passing. What the fixtures invent and nothing pinned (ludics-lite#389):
 #   - totalCount on EVERY page — threads_walk takes the read as whole only when the rows reach the
@@ -1018,6 +1041,7 @@ else
   threads_conn() { # stdin: a GraphQL answer -> its reviewThreads connection, or null
     jq -c 'try .data.repository.pullRequest.reviewThreads catch null'
   }
+  THREADS_QUERY=$(gate_py 'from ludics.prreview.threads import THREADS_QUERY; print(THREADS_QUERY)')
   tconn=$(api graphql -f query="$THREADS_QUERY" -F owner="${REPO%%/*}" -F name="${REPO##*/}" -F pr="$THREADS_PR" | threads_conn)
   pin "the gate's own THREADS_QUERY, sent verbatim, answers #$THREADS_PR's reviewThreads as a connection: nodes[], a numeric totalCount and a boolean pageInfo.hasNextPage" \
     '(.nodes | type == "array") and (.totalCount | type == "number") and (.pageInfo.hasNextPage | type == "boolean")' "$tconn"
@@ -1046,7 +1070,7 @@ else
     if [ "$ttotal" -lt 3 ]; then
       skip "totalCount on every page of reviewThreads" "#$THREADS_PR has $ttotal thread(s): too few to span two pages of two; an anchor with three or more shows it"
     else
-      # The verbatim query at a smaller page — the one edit, made on the library's text so every
+      # The verbatim query at a smaller page — the one edit, made on the gate's text so every
       # field stays the gate's. A query that no longer reads `reviewThreads(first:100,` is a change
       # this read must follow, and it stops rather than walking some other query.
       tsize=$(((ttotal + 2) / 3))

@@ -13,6 +13,8 @@
 #   assert_eq <got> <want> <msg>        the assertion trio
 #   assert_contains <hay> <needle> <msg>
 #   assert_not_contains <hay> <needle> <msg>
+#   state_tok / state_age /             the fields of a state line (`status-state`'s answer):
+#     state_merge / state_detail <line> token, age, mergeability, and the rest, pipes kept
 #   test_tmpdir <var> <label>           a throwaway directory in <var> (any name but the two the
 #                                       function itself uses, which it refuses), removed at exit —
 #                                       this file owns the EXIT trap (pr-review.sh installs one of
@@ -42,9 +44,10 @@
 #   fixture_call_total <name>           the new total on stdout, so `[ "$(fixture_call_count
 #   fixture_call_reset [<name>...]      body)" -ge 2 ]` is "from the second read on". The count
 #                                       lives in a FILE under $TEST_ROOT, never in a variable:
-#                                       gh_retry runs the fixture inside a command substitution,
-#                                       and a variable the fixture increments dies with that
-#                                       subshell — the merge suite hand-rolled three such files
+#                                       every call of the fixture runs in a shell of its own (a
+#                                       fresh bash through the forward's bridge, as the shell's
+#                                       `$(gh ...)` once did), and a variable the fixture
+#                                       increments dies with it — the merge suite hand-rolled three such files
 #                                       (ludics-lite#274) and the base fixture a fourth before
 #                                       these took their place. total is the current count
 #                                       WITHOUT counting — 0 for a counter never made — for a
@@ -55,15 +58,8 @@
 #   restore_tuning                      current case; run_tests restores them when it ends, and a
 #                                       case that wants them back sooner calls restore_tuning
 #   stub <fn>...                        declares the library functions this suite redefines on
-#                                       purpose (the merge suite's build_checks, run_signal and
-#                                       warn_base_drift)
-#   BREAK_JQ / jq()                     the shim that makes ONE named jq program fail, so a case
-#   with_broken_jq <marker> <cmd>...    can prove a read that did not parse refuses instead of
-#                                       rendering a plausible value (ludics-lite#89); three
-#                                       suites carried a byte-identical copy (#179). Its scope —
-#                                       the marked program and nothing else — is pinned by this
-#                                       file's own controls, so a suite needs only the baseline
-#                                       its broken runs are measured against
+#                                       purpose (no suite does today; the base suites' second
+#                                       library is the one that has been stubbed)
 #   jq_crlf_stub <dir> <mode>           a jq that ends its lines CRLF the way a native jq.exe
 #   SHIP_PR_TEST_JQ_EOL=crlf|           does, in <dir>; with the variable set the whole suite
 #     crlf-no-binary                    runs over one, which is how Ubuntu and macOS hold
@@ -71,9 +67,7 @@
 #   protect_library <file>              extends the guard over a second library sourced after
 #                                       this one (test-pr-review-base-lib.sh), whose functions
 #                                       the snapshot below could not see
-#   run_tests <case>... -- "$@"         the guard below, then each case with a PASS line — and,
-#                                       after each case, the refusal of a BREAK_JQ left standing,
-#                                       which would break a jq program for every case after it.
+#   run_tests <case>... -- "$@"         the guard below, then each case with a PASS line.
 #                                       A case that is not a defined function when run_tests is
 #                                       reached is refused before any case runs. Case names on
 #                                       the suite's command line, or SHIP_PR_TEST_CASES="<case>
@@ -81,12 +75,12 @@
 #                                       `SUBSET: n of m cases` line; a call without the `--`
 #                                       forward is refused
 #
-# The guard is why the file exists. pr-review.sh defines some sixty top-level functions, every
-# one in scope in every suite the moment it is sourced, and a suite helper that happens to share
-# a name silently replaces the library's: a reporter named `fail` turned every refusal of the
-# script under test into the reporter's exit 1 (ludics-lite#39, then #45 in three more suites),
-# and a collision on `newest` or `age_of` would produce wrong test RESULTS instead, with nothing
-# shouting. Shellcheck is silent about it at every severity. So the function table is snapshotted
+# The guard is why the file exists. Every function pr-review.sh and this file define is in scope in
+# every suite the moment it is sourced, and a suite helper that happens to share a name silently
+# replaces the library's: a reporter named `fail` turned every refusal of the script under test
+# into the reporter's exit 1 (ludics-lite#39, then #45 in three more suites), and a collision on a
+# helper whose output a case reads (`jq_lf`, or the clock helpers the shell half carried until it
+# was retired) would produce wrong test RESULTS instead, with nothing shouting. Shellcheck is silent about it at every severity. So the function table is snapshotted
 # here — name, line and defining file for everything pr-review.sh and this file define — and
 # `run_tests` reads it again before the first case: a protected function that is no longer the
 # one its file defined is REFUSED (exit 2, naming the function, its owner and where the suite
@@ -242,8 +236,8 @@ source "$HELPER"
 
 # What sourcing pr-review.sh installed on EXIT, read HERE because this file installs a trap of its
 # own a few lines down and a trap is REPLACED, not chained: after that line the script's own is
-# gone and unrecoverable. The guard under the snapshot holds this file's trap to it
-# (ludics-lite#195).
+# gone and unrecoverable. It installs none -- the forward leaves nothing behind for one to remove
+# -- and the guard under the snapshot refuses the suites the day it does (ludics-lite#195).
 LIB_HELPER_EXIT_TRAP=$(trap -p EXIT)
 
 # --- the reporter and the assertions ----------------------------------------------------------
@@ -265,18 +259,30 @@ assert_not_contains() {
   case "$1" in *"$2"*) bail "$3 (unexpected '$2' in: $1)" ;; *) ;; esac
 }
 
+# --- the state line's fields -------------------------------------------------------------------
+# `token|age|mergeability|detail`, as the Python's `status-state` entry point prints it (the state
+# the status and watch suites read): the detail is everything after the third `|`, pipes and all.
+state_tok() { printf '%s' "${1%%|*}"; }
+state_age() {
+  local rest="${1#*|}"
+  printf '%s' "${rest%%|*}"
+}
+state_merge() {
+  local rest="${1#*|}"
+  rest="${rest#*|}"
+  printf '%s' "${rest%%|*}"
+}
+state_detail() {
+  local rest="${1#*|}"
+  rest="${rest#*|}"
+  printf '%s' "${rest#*|}"
+}
+
 # --- temporary paths and the one EXIT trap ----------------------------------------------------
-# Sourcing pr-review.sh installed an EXIT trap, and this one REPLACES it — a trap is not chained.
-# So this trap does both jobs, and the suite registers its scratch space through test_tmpdir
-# instead of installing a trap of its own. Only paths mktemp created are ever removed.
+# This file owns the EXIT trap: the suite registers its scratch space through test_tmpdir instead
+# of installing a trap of its own. Only paths mktemp created are ever removed.
 TEST_CLEANUP=()
 test_cleanup() {
-  # pr-review.sh's cleanup, CALLED rather than restated: it removes GH_ERR_FILE and the snapshot
-  # directory a sourced watch made, and what it removes changes. The restatement this line
-  # replaced is how #191's snapshot directory leaked into the real TMPDIR from every suite run,
-  # green throughout, until the copy was updated by hand (ludics-lite#195). The guard under the
-  # function-table snapshot refuses the suites if this call goes away.
-  pr_review_cleanup
   local p
   # bash 3.2 under `set -u` rejects "${TEST_CLEANUP[@]}" while it is empty.
   [ "${#TEST_CLEANUP[@]}" -eq 0 ] || for p in "${TEST_CLEANUP[@]}"; do rm -rf "$p"; done
@@ -305,8 +311,8 @@ test_tmpdir() {
   # no owner, so a directory a killed suite left behind was uncollectable by construction — the
   # `pr-review-cwd-checkout.VLoj1M` that sat in this box's TMPDIR from 09-10 is one, and it is
   # what put test_tmpdir in ludics-lite#219 alongside pr-review.sh's own temporaries. With the pid
-  # in it, pr-review.sh's tmp_sweep_stale collects it on the same owner-gone test as everything
-  # else. The label stays in the name, after the pid, because it is what makes a leftover
+  # in it, `watch`'s tmp_sweep_stale (prreview/watch.py) collects it on the same owner-gone test as
+  # everything else. The label stays in the name, after the pid, because it is what makes a leftover
   # identifiable at a glance, and it may carry a space (`lib space`), which the quoting here and
   # the sweep's own quoting both survive.
   __test_tmpdir_path=$(mktemp -d "${TMPDIR:-/tmp}/pr-review-test.$$.$2.XXXXXX") || bail "mktemp -d failed for $2"
@@ -615,8 +621,9 @@ positional_comment() { # <id> <original commit> <body> <position> [original posi
 
 # --- counting a fixture's calls --------------------------------------------------------------
 # A fixture `gh` that must answer differently from the Nth call on needs a count that SURVIVES
-# it: gh_retry runs the fixture as `$(gh ...)`, so the fixture's whole life is one subshell, and
-# a `CALLS=$((CALLS + 1))` inside it is thrown away with the answer captured. A file is the only
+# it: every call runs the fixture in a shell of its own (the forward's bridge, a fresh bash per
+# call, as the shell's `$(gh ...)` once did), and a `CALLS=$((CALLS + 1))` inside it is thrown
+# away with the answer captured. A file is the only
 # thing a subshell can leave behind for the next one, which is why every suite that needed this
 # grew a `printf x >>"$FILE"` and a `wc -l` of its own (the merge suite three of them, the base
 # fixture's round counter a fourth). One helper, keyed by name, under the suite's $TEST_ROOT so
@@ -627,7 +634,7 @@ positional_comment() { # <id> <original commit> <body> <position> [original posi
 #
 # One line appended and the lines counted, rather than a number read, bumped and written back:
 # appends of one short line are atomic where a read-modify-write is not, and the fixture runs in
-# whatever order gh_retry and the shell fork it, so a rewritten total could lose a call.
+# whatever order the calls fork it, so a rewritten total could lose a call.
 #
 # EVERY filesystem step in all three helpers is `|| bail`: the mkdir, the append, each count, and
 # each removal. A count runs inside a command substitution, which does not inherit errexit, so a step
@@ -696,67 +703,6 @@ fixture_call_reset() {
   done
 }
 
-# --- breaking ONE jq program on purpose (ludics-lite#89, #179) --------------------------------
-# Every jq program pr-review.sh runs is a literal inside the tracked script, so the way to make
-# one of them — and only that one — fail is to shim `jq` itself: the shim refuses exactly the
-# invocation whose command line carries the marker (nonzero status, nothing on stdout, which is
-# what a rebinding error or a typo'd `$var` produces) and forwards every other call to
-# pr-review.sh's `jq_lf`, the call `jq` names there, so it never calls itself and keeps the line
-# ending that script decided for the jq on PATH (ludics-lite#335; `command jq` here would hand a
-# jq.exe's CRLF straight back to the script under test). Like a suite's fixture `gh` it shadows a
-# COMMAND rather than a library function — but it is defined HERE, above the snapshot, so it is a
-# protected name like any other: a suite that wants its own jq declares `stub jq` and says why.
-#
-# Three suites carried a byte-identical copy of this (rounds, status, watch), each with its own
-# "a marker no program carries" control to prove the shim breaks only what it is pointed at
-# (ludics-lite#179). That claim is about the shim and not about any one suite's fixture, so it is
-# pinned once, by this file's own controls below; a suite keeps only the baseline reading its
-# broken-program cases are measured against, which it gets from an ordinary run with no marker
-# set.
-#
-# The marker is matched against EVERY argument, not just the program text, because a program can
-# be assembled from `--arg`s and because a filter is an argument too. That reach is the one thing
-# to hold still when choosing a marker: `gh_fixture_answer` runs the suite's own `--jq` filter
-# through this same shim, so a marker that also matches the fixture's filter breaks the fixture's
-# ANSWER rather than the script's read of it, and the case then passes for the wrong reason. Pick
-# a fragment that appears in exactly one program, and pick it out of pr-review.sh.
-BREAK_JQ=""
-jq() {
-  local arg
-  if [ -n "$BREAK_JQ" ]; then
-    for arg in "$@"; do
-      case "$arg" in
-      *"$BREAK_JQ"*)
-        echo "jq: error: \$broken is not defined at <top-level>" >&2
-        return 3
-        ;;
-      esac
-    done
-  fi
-  jq_lf "$@"
-}
-
-# with_broken_jq <marker> <command> [arg...]: run <command> with the marker standing, and clear it
-# again whichever way the command goes. Set and cleared by hand — the three suites' idiom — the
-# clearing line is skipped by any command that fails under `set -e`, and a marker left standing is
-# not a failure but a WRONG RESULT: every later case in the suite runs with one of the script's
-# programs broken. The status is the command's own, so a caller can still read it; `|| rc=$?`
-# also means the command runs with `set -e` suspended, which is what the cases that drive a
-# failing round used to write as a `set +e` / `set -e` pair around the call.
-#
-# Going through the helper is not left to discipline: `run_tests` refuses a case that ends with
-# the marker still set, naming it, so the hand-rolled pair fails the case that wrote it instead
-# of the cases after it silently passing on broken reads.
-with_broken_jq() {
-  local marker="$1" rc=0
-  shift
-  [ $# -gt 0 ] || bail "with_broken_jq: no command named"
-  BREAK_JQ="$marker"
-  "$@" || rc=$?
-  BREAK_JQ=""
-  return "$rc"
-}
-
 # --- a jq that writes CRLF, on every platform (ludics-lite#335) --------------------------------
 # A native jq.exe (what Windows users and the Git Bash CI leg have) ends every output line CRLF,
 # and pr-review.sh reads it through `jq_lf`, which it decides once at source time. This is that jq
@@ -767,7 +713,7 @@ with_broken_jq() {
 #
 # The jq it wraps is read LF first, through pr-review.sh's own probe of it, so the stub adds
 # exactly one \r wherever it runs — over the Git Bash leg's jq.exe as over a Unix jq — and over
-# another stub. `type -P`, not `command -v`: the shim above makes `jq` a function, which
+# another stub. `type -P`, not `command -v`: pr-review.sh makes `jq` a function, which
 # `command -v` would name.
 jq_crlf_stub() { # <dir> <binary|no-binary>
   local real real_eol saved="$JQ_EOL"
@@ -969,16 +915,6 @@ check_shadows() {
 # case's retuned constants are put back before the next one starts, whether or not it restored
 # them.
 #
-# A marker left standing is the other leak between cases, and the one nothing can put back: the
-# constants have a value as sourced to restore to, but a broken jq program is a claim about the
-# case that set it, and a case that ends with BREAK_JQ set has already told every case after it
-# to run with one of the script's programs refusing — each of them still reporting PASS, since
-# what a broken read costs is a wrong RESULT and not a failure. `with_broken_jq` clears the
-# marker whichever way its command goes, so a case that goes through it never trips this; what
-# trips it is the hand-rolled set/clear pair the helper replaced, whose clearing line is skipped
-# by any command that fails under `set -e`. So it is refused rather than silently restored: the
-# case that leaked is named, and the cases after it do not run under it.
-#
 # SHIP_PR_TEST_CASES, a space-separated list of case names, runs only those — in the suite's order,
 # not the list's, since some cases lean on the one before them — and ends the run with
 # `SUBSET: <n> of <m> cases`, a line a full run never prints, so a partial run cannot pass for a
@@ -1051,7 +987,6 @@ run_tests() {
   fi
   for test_name in "${selected[@]}"; do
     "$test_name"
-    [ -z "$BREAK_JQ" ] || bail "$test_name left BREAK_JQ set to '$BREAK_JQ': every case after it would run with the jq programs matching that marker refusing, and report PASS anyway — break a program with \`with_broken_jq $BREAK_JQ <command>...\`, which clears the marker whichever way the command goes"
     restore_tuning
     echo "PASS: $test_name"
   done
@@ -1096,58 +1031,23 @@ $added"
 $file"
 }
 
-# --- the second guard: this file's EXIT trap must still reach pr-review.sh's ------------------
-# Sourcing pr-review.sh installs an EXIT trap; this file installs its own over it, and that is a
-# REPLACEMENT — a trap is not chained. So the script's cleanup runs in a suite only if this file's
-# trap calls it. It used to RESTATE it instead, as did pr-review-api-contract.sh, and the copies
-# drifted: ludics-lite#191 added a snapshot directory to the script's trap alone, and from then on
-# every suite run leaked one into the real TMPDIR while every suite and CI stayed green, because
-# the only artifact of the failure is a directory nobody looks at (ludics-lite#195). The
-# restatements are gone — both traps call `pr_review_cleanup` — and this is what keeps them gone.
-#
-# What is checked is reachability by NAME, in the same register as the shadow guard below: the
-# script's trap must BE a function the script defines, this file's trap must be a function this
-# file defines, and the script's name must appear in its body. A body-text check cannot prove the
-# call runs, but it fails the moment the call is deleted or the function renamed on one side only,
-# which is every way the copies drifted.
-lib_trap_command() { # <`trap -p` output>: the command it installs, unquoted; empty if none
-  local cmd="$1"
-  cmd=${cmd#trap -- }
-  cmd=${cmd% EXIT}
-  case "$cmd" in
-  "'"*"'")
-    cmd=${cmd#\'}
-    cmd=${cmd%\'}
-    ;;
-  esac
-  printf '%s' "$cmd"
-}
-
+# --- the second guard: pr-review.sh installs no EXIT trap for this file's to replace ------------
+# This file installs an EXIT trap, and a trap is REPLACED, not chained: a trap that sourcing
+# pr-review.sh installed would never run in a suite. When the script still had temporaries of its
+# own, this guard held this file's trap to CALLING the script's cleanup by name, because the copies
+# that restated it drifted: ludics-lite#191 added a snapshot directory to the script's trap alone,
+# and from then on every suite run leaked one into the real TMPDIR while every suite and CI stayed
+# green (ludics-lite#195). Since the shell half was retired the script leaves nothing behind -- the
+# forward removes its bridge file before it returns -- and installs no trap. So the guard is now
+# that it stays so: a trap that comes back is refused here, by name, before a suite can run
+# without it, rather than discovered as debris in TMPDIR.
 lib_refuse_trap() {
-  echo "$LIB_BASENAME: REFUSING to run: $1 — sourcing pr-review.sh installs an EXIT trap and this file installs its own over it, REPLACING it, so pr-review.sh's cleanup runs in a suite only if this file's trap calls it by name. Restating what it does instead is how ludics-lite#191's snapshot directory leaked from every suite run in silence (ludics-lite#195)." >&2
+  echo "$LIB_BASENAME: REFUSING to run: $1 — this file installs its own EXIT trap over it, REPLACING it, so it would never run in a suite. Leave pr-review.sh trapless (its forward cleans up after itself), or give the trap a named cleanup and have this file's trap call it; restating it instead is how ludics-lite#191's snapshot directory leaked from every suite run in silence (ludics-lite#195)." >&2
   exit 2
 }
 
-lib_helper_trap_fn=$(lib_trap_command "$LIB_HELPER_EXIT_TRAP")
-lib_own_trap_fn=$(lib_trap_command "$(trap -p EXIT)")
-lib_trap_table=$(lib_function_table)
-case "$lib_helper_trap_fn" in
-'') lib_refuse_trap "sourcing pr-review.sh installed no EXIT trap at all, so there is nothing for this file's trap to call and the guard would check nothing" ;;
-*[!A-Za-z0-9_]*) lib_refuse_trap "pr-review.sh's EXIT trap is \`$lib_helper_trap_fn\`, a command rather than a call to a named function: give it one (\`pr_review_cleanup\`) and trap that, so this file can call it" ;;
-esac
-case "$(lib_owner_of "$lib_helper_trap_fn" "$lib_trap_table")" in
-*"$HELPER") ;;
-*) lib_refuse_trap "pr-review.sh's EXIT trap names \`$lib_helper_trap_fn\`, which pr-review.sh does not define" ;;
-esac
-[ -n "$(lib_owner_of "$lib_own_trap_fn" "$lib_trap_table")" ] ||
-  lib_refuse_trap "this file's EXIT trap is \`$lib_own_trap_fn\`, not a call to a function it defines"
-case "
-$(declare -f "$lib_own_trap_fn")
-" in
-*[!A-Za-z0-9_]"$lib_helper_trap_fn"[!A-Za-z0-9_]*) ;;
-*) lib_refuse_trap "this file's EXIT trap (\`$lib_own_trap_fn\`) never calls \`$lib_helper_trap_fn\`, the function pr-review.sh's own trap runs" ;;
-esac
-unset lib_helper_trap_fn lib_own_trap_fn lib_trap_table
+[ -z "$LIB_HELPER_EXIT_TRAP" ] ||
+  lib_refuse_trap "sourcing pr-review.sh installed an EXIT trap ($LIB_HELPER_EXIT_TRAP)"
 
 # What is PROTECTED is what these two files define, and only that — the table is filtered on the
 # defining file rather than taken whole. A function the environment exported in (`export -f`) is
@@ -1175,7 +1075,7 @@ LIB_SNAPSHOT=$(lib_function_table |
 case "$LIB_SNAPSHOT" in
 *[![:space:]]*) ;;
 *)
-  echo "$LIB_BASENAME: REFUSING to run: the function-table snapshot named nothing, so the shadow guard would protect no function and every ludics-lite#46 shadow would be accepted silently; pr-review.sh ($HELPER) and this file should between them define some sixty" >&2
+  echo "$LIB_BASENAME: REFUSING to run: the function-table snapshot named nothing, so the shadow guard would protect no function and every ludics-lite#46 shadow would be accepted silently; pr-review.sh ($HELPER) and this file should between them define some seventy" >&2
   exit 2
   ;;
 esac
@@ -1350,10 +1250,10 @@ test_undeclared_shadow_is_refused() {
 # Every library function is protected, not a hand-picked list: a name that would corrupt results
 # rather than exit codes is caught the same way, and so are two at once.
 test_every_library_function_is_protected() {
-  control 'newest() { echo 0; }' 'age_of() { echo 0; }'
-  assert_refused "shadowed newest and age_of"
-  assert_contains "$CONTROL_ERR" "pr-review.sh's newest (" "newest should be named"
-  assert_contains "$CONTROL_ERR" "pr-review.sh's age_of (" "age_of should be named"
+  control 'jq_lf() { echo 0; }' 'py_forward() { echo 0; }'
+  assert_refused "shadowed jq_lf and py_forward"
+  assert_contains "$CONTROL_ERR" "pr-review.sh's jq_lf (" "jq_lf should be named"
+  assert_contains "$CONTROL_ERR" "pr-review.sh's py_forward (" "py_forward should be named"
   assert_eq "$(grep -c 'redefined at' <<<"$CONTROL_ERR")" 2 "both shadows in one refusal"
 }
 
@@ -1366,18 +1266,18 @@ test_lib_helpers_are_protected() {
 }
 
 test_declared_stub_is_allowed() {
-  control 'stub newest' 'newest() { echo 0; }'
+  control 'stub jq_lf' 'jq_lf() { echo 0; }'
   assert_eq "$CONTROL_RC" 0 "a declared stub runs ($CONTROL_ERR)"
   assert_contains "$CONTROL_OUT" "PASS: test_a_case" "the case should run"
   # The declaration may come after the definition too: the guard reads the table at run_tests.
-  control 'build_checks() { :; }' 'run_signal() { :; }' 'stub build_checks run_signal'
+  control 'cmd_merge() { :; }' 'cmd_checks() { :; }' 'stub cmd_merge cmd_checks'
   assert_eq "$CONTROL_RC" 0 "stubs declared after their definitions run ($CONTROL_ERR)"
 }
 
 test_stub_without_a_redefinition_is_refused() {
-  control 'stub newest'
+  control 'stub jq_lf'
   assert_refused "a stub never honoured"
-  assert_contains "$CONTROL_ERR" "stub newest is declared, but newest is still pr-review.sh's" \
+  assert_contains "$CONTROL_ERR" "stub jq_lf is declared, but jq_lf is still pr-review.sh's" \
     "the stale declaration should be named"
 }
 
@@ -1459,7 +1359,7 @@ test_tmpdir_writes_to_a_target_named_dir() {
   path=$(sed -n 's/^target=//p' <<<"$CONTROL_OUT")
   assert_not_contains "$path" stale "the caller's prior value must not survive the call"
   assert_contains "$path" ".tmpdir-target." "the label should still reach the caller's directory name"
-  # And the owning pid, read back with the very parse pr-review.sh's tmp_sweep_stale uses on it:
+  # And the owning pid, read back with the very parse `watch`'s tmp_sweep_stale uses on it:
   # a scratch directory whose name does not carry a pid cannot be told from a live sibling's, and
   # so is collectable by nothing at all once the suite that made it is killed (ludics-lite#219).
   # Pinning the SHAPE here rather than in prose is what stops the label-only spelling coming back.
@@ -1484,65 +1384,69 @@ test_tmpdir_refuses_a_name_it_uses() {
     "the refusal should name the cleanup list"
 }
 
-# The EXIT trap's OTHER job, which is pr-review.sh's: a watch sourced into a suite leaves a
-# snapshot directory and an error file in TMPDIR, and this file's trap — which replaced the
-# script's — is what removes them. This is ludics-lite#191's leak measured directly: the paths are
-# created in a registered root, so the case cannot itself leak whichever way it goes, and both
-# must be gone once the suite that made them has exited.
-test_the_exit_trap_removes_what_pr_review_sh_s_trap_removes() {
-  local root snap err gh
-  test_tmpdir root trap-removes
-  # All THREE paths pr_review_cleanup removes. GH_TMP_FILE is gh_retry's per-attempt capture, and
-  # it is here for the reason the other two are: what this trap removes is read off the script's
-  # function rather than restated, so a path added there has to show up here or nothing proves the
-  # addition runs (ludics-lite#219, the same shape as #191's snapshot directory).
-  control "SNAP_DIR=\$(mktemp -d \"$root/snap.XXXXXX\")" \
-    "GH_ERR_FILE=\$(mktemp \"$root/err.XXXXXX\")" \
-    "GH_TMP_FILE=\$(mktemp \"$root/gh.XXXXXX\")" \
-    'printf "snap=%s\nerr=%s\ngh=%s\n" "$SNAP_DIR" "$GH_ERR_FILE" "$GH_TMP_FILE"'
-  assert_eq "$CONTROL_RC" 0 "the probe suite must run ($CONTROL_ERR)"
-  snap=$(sed -n 's/^snap=//p' <<<"$CONTROL_OUT")
-  err=$(sed -n 's/^err=//p' <<<"$CONTROL_OUT")
-  gh=$(sed -n 's/^gh=//p' <<<"$CONTROL_OUT")
-  assert_contains "$snap" "$root/snap." "the probe should report the directory it made"
-  [ ! -e "$snap" ] || bail "the snapshot directory survived the suite's exit: $snap (ludics-lite#191)"
-  [ ! -e "$err" ] || bail "the error file survived the suite's exit: $err"
-  [ ! -e "$gh" ] || bail "gh_retry's capture survived the suite's exit: $gh"
+# What the forward writes, it removes. A sourced call with a fixture `gh` goes through the shell
+# bridge, whose file of this shell's state sits in TMPDIR while the Python runs; nothing traps for
+# it (see the second guard above), so the forward removes it itself, on the Python's success and
+# on its failure alike, before the stub returns or exits. Both are run in a TMPDIR of the case's own
+# and the TMPDIR must be empty after each -- which is ludics-lite#191's leak, measured directly, for
+# the one temporary the script still makes. The control proves the assertion can fail: a copy of
+# pr-review.sh without the removal leaves the file behind.
+#
+# A forward needs the checkout around pr-review.sh (scripts/py, lib/), which a copy of this file
+# beside a bare pr-review.sh does not have; so the renamed copy's inner run leaves this case to the
+# run that started it, as it leaves the copy control.
+test_the_forward_leaves_nothing_in_tmpdir() {
+  local root tmp bare
+  [ -z "$LIB_INNER_RUN" ] || return 0
+  test_tmpdir root forward-cleanup
+  tmp="$root/tmpdir"
+  mkdir "$tmp"
+  control 'gh() { echo "{\"ok\":1}"; }' \
+    'test_forward() {' \
+    '  cmd_retry api repos/o/n/thing >/dev/null' \
+    '  local rc=0' \
+    '  (cmd_reply not-a-pr 1 body) 2>/dev/null || rc=$?' \
+    '  assert_eq "$rc" 2 "a refused call is the Python exit, carried"' \
+    '}' \
+    'test_forward'
+  assert_eq "$CONTROL_RC" 0 "a forward through the bridge should run, both ways ($CONTROL_ERR)"
+  # That ran under the suite's own TMPDIR; again, under one of this case's own.
+  TMPDIR="$tmp" control_run "$CONTROL_FILE"
+  assert_eq "$CONTROL_RC" 0 "the forward should run under a TMPDIR of its own ($CONTROL_ERR)"
+  assert_eq "$(find "$tmp" -mindepth 1 -print | tr '\n' ' ')" "" \
+    "the bridge file must be gone once the forward returns or exits"
+  # The control: a checkout copy whose forward never removes the file. A copy of the checkout's
+  # layout, so the copy's scripts/py and lib are found where the forward looks for them.
+  bare="$root/checkout"
+  mkdir -p "$bare/ship-pr/scripts" "$bare/scripts"
+  cp "$HELPER" "$TEST_LIB_FILE" "$bare/ship-pr/scripts/"
+  cp -p "$TEST_LIB_DIR/../../scripts/py" "$bare/scripts/"
+  cp -pR "$TEST_LIB_DIR/../../lib" "$bare/"
+  perl -0777 -i -pe 'my $n = s/\n    rm -f "\$state"\n/\n/; die "expected one removal to delete, found $n\n" unless $n == 1' \
+    "$bare/ship-pr/scripts/pr-review.sh"
+  cp "$CONTROL_FILE" "$bare/ship-pr/scripts/control.sh"
+  perl -0777 -i -pe 's/^source .*$/source "\$(dirname "\$0")\/'"$LIB_BASENAME"'"/m' "$bare/ship-pr/scripts/control.sh"
+  rm -rf "$tmp" && mkdir "$tmp"
+  TMPDIR="$tmp" control_run "$bare/ship-pr/scripts/control.sh"
+  assert_eq "$CONTROL_RC" 0 "control: the copy should run as the original does ($CONTROL_ERR)"
+  assert_contains "$(find "$tmp" -mindepth 1 -print)" "/pr-review-bridge." \
+    "control: without the removal the bridge file is left behind, so the assertion above can fail"
+  rm -rf "$tmp"
 }
 
-# And the guard that keeps the above true as the script's trap grows. Three ways the wiring can
-# come apart, each shown to refuse rather than to pass quietly — which is what the hand-copied
-# trap bodies did for a whole release (ludics-lite#195).
-test_a_trap_that_stops_reaching_pr_review_sh_s_is_refused() {
-  local root copy inline
+# And the guard that keeps the script trapless. A trap added back to pr-review.sh would be replaced
+# by this file's own and never run in a suite, so it is refused, inline body or named function.
+test_a_trap_in_pr_review_sh_is_refused() {
+  local root line
   test_tmpdir root trap-guard
-  copy="$root/$LIB_BASENAME"
-  cp "$HELPER" "$TEST_LIB_FILE" "$root/"
-
-  # (1) The call deleted from this file's trap — the state the restatement decayed into, where
-  # the script's cleanup simply never runs in a suite.
-  perl -0777 -i -pe 'my $n = s/\n  pr_review_cleanup\n/\n/; die "expected one call to delete, found $n\n" unless $n == 1' "$copy"
-  control_in "$root"
-  assert_refused "a trap that no longer calls the script's cleanup"
-  assert_contains "$CONTROL_ERR" 'never calls `pr_review_cleanup`' "the missing call should be named"
-  assert_contains "$CONTROL_ERR" "ludics-lite#195" "the refusal should cite the trap it exists against"
-  cp "$TEST_LIB_FILE" "$copy"
-
-  # (2) pr-review.sh's trap written back as an inline body — the shape there is no way to call.
-  inline='trap '\''rm -f "$GH_ERR_FILE"'\'' EXIT'
-  NEW="$inline" perl -0777 -i -pe 'my $n = s/\Qtrap pr_review_cleanup EXIT\E/$ENV{NEW}/; die "expected one trap line, found $n\n" unless $n == 1' "$root/pr-review.sh"
-  control_in "$root"
-  assert_refused "an inline trap body in pr-review.sh"
-  assert_contains "$CONTROL_ERR" "a command rather than a call to a named function" \
-    "the refusal should say what shape is wanted instead"
-
-  # (3) A trap naming a function pr-review.sh does not define — a rename landed on one side only.
-  cp "$HELPER" "$root/"
-  NEW='trap no_such_cleanup EXIT' perl -0777 -i -pe 'my $n = s/\Qtrap pr_review_cleanup EXIT\E/$ENV{NEW}/; die "expected one trap line, found $n\n" unless $n == 1' "$root/pr-review.sh"
-  control_in "$root"
-  assert_refused "a trap naming a function the script does not define"
-  assert_contains "$CONTROL_ERR" 'names `no_such_cleanup`, which pr-review.sh does not define' \
-    "the unknown name should be named"
+  for line in 'trap '\''rm -f "$TMPDIR/x"'\'' EXIT' 'some_cleanup() { :; }; trap some_cleanup EXIT'; do
+    cp "$HELPER" "$TEST_LIB_FILE" "$root/"
+    NEW="$line" perl -0777 -i -pe 'my $n = s/^(\[ "\$\{SHIP_PR_TEST_SOURCE_ONLY:-\}" = 1 \] \|\| main "\$@")$/$ENV{NEW}\n$1/m; die "expected one foot line, found $n\n" unless $n == 1' "$root/pr-review.sh"
+    control_in "$root"
+    assert_refused "an EXIT trap in pr-review.sh ($line)"
+    assert_contains "$CONTROL_ERR" "sourcing pr-review.sh installed an EXIT trap" "the trap should be named"
+    assert_contains "$CONTROL_ERR" "ludics-lite#195" "the refusal should cite the trap it exists against"
+  done
 }
 
 # The parser the api-only suites share, pinned once: the endpoint, the filter, the pagination
@@ -1736,105 +1640,6 @@ test_gh_fixture_parse_refuses_what_it_cannot_parse() {
   REQUEST_LOG=""
 }
 
-# --- the jq shim, and the scope three suites used to re-prove a control each --------------------
-# `probe_jq <program>` runs one real jq program through the shim and lands its status, stdout and
-# stderr in PROBE_RC / _OUT / _ERR. The program is a trivial one of this file's own: what the
-# controls below are about is the SHIM, so tying them to a program of pr-review.sh's would make
-# them fail whenever that script's text moved.
-PROBE_RC=0
-PROBE_OUT=""
-PROBE_ERR=""
-probe_jq() {
-  local rc=0
-  PROBE_OUT=$(jq -cn --arg tag "$1" '{marked: $tag}' 2>"$CONTROL_ROOT/jq.err") || rc=$?
-  PROBE_RC="$rc"
-  PROBE_ERR=$(cat "$CONTROL_ROOT/jq.err")
-  # The status is answered as well as recorded, so a case can read what `with_broken_jq` hands
-  # back from the command it ran.
-  return "$rc"
-}
-
-# Pointed at a fragment the call carries, the shim refuses it the way a broken program does:
-# nonzero, nothing on stdout, the error on stderr. Nothing on stdout is the half that matters —
-# a shim that failed but still printed would let a site's unguarded read carry on with a value.
-test_the_jq_shim_breaks_the_program_it_is_pointed_at() {
-  with_broken_jq 'marked' probe_jq mine || :
-  assert_eq "$PROBE_RC" 3 "a marked program must fail"
-  assert_eq "$PROBE_OUT" "" "and print nothing, or the site under test reads a value anyway"
-  assert_contains "$PROBE_ERR" "jq: error:" "and say what a jq error says"
-  # The marker reaches every argument, not only the program: a program assembled from `--arg`s,
-  # and a suite's own `--jq` filter, both go through this same shim.
-  with_broken_jq 'mine' probe_jq mine || :
-  assert_eq "$PROBE_RC" 3 "a marker matching an argument breaks the call too"
-}
-
-# The claim each of the three suites used to carry its own control for: the shim breaks what it is
-# pointed at and nothing else. Both halves are here — a marker that matches nothing leaves the
-# call alone, and so does no marker at all — because they are different code paths through the
-# shim, and it is the first that a suite's `BREAK_JQ='zzz-no-program-carries-this'` stood for.
-test_the_jq_shim_leaves_every_other_program_alone() {
-  # `|| :` on a call that must SUCCEED: a shim broken the other way — refusing everything while
-  # any marker stands — would otherwise take the suite down at this line under `set -e`, with an
-  # exit 3 and no FAIL naming the claim that failed.
-  with_broken_jq 'zzz-no-program-carries-this' probe_jq mine || :
-  assert_eq "$PROBE_RC" 0 "a marker no call carries must break nothing"
-  assert_eq "$PROBE_OUT" '{"marked":"mine"}' "and the answer must be the real jq's"
-  probe_jq mine || :
-  assert_eq "$PROBE_RC" 0 "and with no marker standing the shim is transparent"
-  assert_eq "$PROBE_OUT" '{"marked":"mine"}' "answering exactly as the real jq does"
-}
-
-# The leak the helper exists against. Set and cleared by hand, the clearing line is skipped by a
-# command that fails under `set -e`, and a marker left standing is not a failure but a wrong
-# RESULT: every case after it runs with one of the script's programs broken, and each of them
-# still reports PASS.
-test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes() {
-  local rc=0
-  with_broken_jq 'marked' probe_jq mine || rc=$?
-  assert_eq "$rc" 3 "the command's own status is what the helper answers"
-  assert_eq "$BREAK_JQ" "" "a failing command must still leave the marker cleared"
-  with_broken_jq 'zzz-no-program-carries-this' probe_jq mine
-  assert_eq "$BREAK_JQ" "" "and so must one that succeeds"
-  # A command that is not there at all is a typo in the case, not a broken jq program.
-  set +e
-  (with_broken_jq 'marked') 2>"$CONTROL_ROOT/err"
-  rc=$?
-  set -e
-  assert_eq "$rc" 1 "with_broken_jq with no command must refuse"
-  assert_contains "$(cat "$CONTROL_ROOT/err")" "with_broken_jq: no command named" \
-    "and say what was missing"
-}
-
-# The refusal that makes the clearing above more than an idiom: a case that sets the marker by
-# hand and returns is failed BY NAME, so the broken program never reaches the cases after it. It
-# is written out as a throwaway suite because what is under test happens BETWEEN cases — a body
-# line handed to `control` runs while the suite is sourced, not inside one — and the suite holds
-# three cases, one per outcome the refusal has to tell apart: one that broke a program through
-# the helper and must pass, the one that leaked, and one after it that must not run at all.
-test_a_leaked_marker_fails_the_case_that_leaked_it() {
-  local file="$CONTROL_ROOT/leaked-marker.sh"
-  {
-    echo '#!/usr/bin/env bash'
-    echo 'set -euo pipefail'
-    printf 'source %s\n' "\"$TEST_LIB_FILE\""
-    echo 'test_that_clears() { with_broken_jq zzz-no-program-carries-this true; }'
-    echo 'test_that_leaks() { BREAK_JQ=".[] | select(.marked)"; }'
-    echo 'test_after_the_leak() { :; }'
-    echo 'run_tests test_that_clears test_that_leaks test_after_the_leak -- "$@"'
-  } >"$file"
-  control_run "$file"
-  assert_eq "$CONTROL_RC" 1 "a leaked marker is the reporter's exit 1 ($CONTROL_ERR)"
-  assert_contains "$CONTROL_ERR" "FAIL: test_that_leaks left BREAK_JQ set to '.[] | select(.marked)'" \
-    "the leaking case and the marker it left standing should both be named"
-  assert_contains "$CONTROL_ERR" "with_broken_jq .[] | select(.marked) <command>" \
-    "and the remedy should be named, with the marker the case meant to break"
-  # Only the case that went through the helper may pass: the leaking one is not a pass, and the
-  # case after it never ran — which is the whole point, since under the leak it would have run
-  # with that program refusing and reported PASS.
-  assert_eq "$CONTROL_OUT" "PASS: test_that_clears" \
-    "the cleared case passes, the leaking case does not, and nothing after it runs"
-}
-
 # --- SHIP_PR_TEST_CASES: a subset, and only ever a visible one -------------------------------
 # subset_suite <line>...: a throwaway suite of three cases, with the given lines above its
 # `run_tests`, written to CONTROL_FILE and run through control_run with no arguments. Each case
@@ -2015,17 +1820,10 @@ test_a_crlf_jq_is_read_back_lf() {
     rc=0
     (jq_under_stub "$dir" -e .c <<<'{"c":false}' >/dev/null) || rc=$?
     assert_eq "$rc" 1 "$mode: jq's own status should reach the caller"
-    # pr-review.sh's own `jq`, which the shim replaces in every suite: sourced alone, under the
-    # stub from the start, as a Windows user runs it.
+    # pr-review.sh's own `jq`, sourced alone in a fresh bash, under the stub from the start, as a
+    # Windows user runs it.
     out=$(PATH="$dir:$PATH" SHIP_PR_TEST_SOURCE_ONLY=1 bash -c '. "$1" && jq -r .c' _ "$HELPER" <<<'{"c":"failure"}' | od_bytes)
-    assert_eq "$out" 'failure\n' "$mode: pr-review.sh's own jq, unshimmed, should read back LF"
-    # Through the fixtures' shim as well, both ways: it forwards to jq_lf, so an unbroken
-    # program reads back LF, and a broken one still refuses.
-    out=$(jq_under_stub "$dir" -cn --arg tag mine '{marked: $tag}' | od_bytes)
-    assert_eq "$out" '{"marked":"mine"}\n' "$mode: the jq shim should forward to jq_lf, not to the CRLF jq"
-    rc=0
-    (PATH="$dir:$PATH" && jq_eol_probe && with_broken_jq marked probe_jq mine) || rc=$?
-    assert_eq "$rc" 3 "$mode: and a marked program should still refuse under it"
+    assert_eq "$out" 'failure\n' "$mode: pr-review.sh's own jq, sourced alone, should read back LF"
   done
 }
 
@@ -2144,7 +1942,7 @@ test_retune_of_a_name_the_script_does_not_set_is_refused() {
   assert_contains "$CONTROL_ERR" "retune: 'GRACE' is not a NAME=value assignment" \
     "the malformed argument should be quoted"
   # A name the SHELL always provides is not a constant of pr-review.sh's, whatever its text says.
-  # IFS is the one that matters: `IFS=… read` sits in several of its function bodies and every
+  # IFS is the one that matters: `IFS=… read` sat in several of its function bodies and every
   # shell has IFS set, so a set derived from the text plus "is it set now" accepted `retune IFS=x`
   # — which would have altered the word splitting of the harness doing the retuning.
   control 'retune IFS=x'
@@ -2160,8 +1958,8 @@ test_retune_of_a_name_the_script_does_not_set_is_refused() {
   assert_contains "$CONTROL_ERR" "retune PIPESTATUS: pr-review.sh sets no PIPESTATUS when it is sourced" \
     "PIPESTATUS should be refused by name"
   # The other side of that probe: the constants it must accept, from both ends of the file — the
-  # block that runs as pr-review.sh is sourced, and the ones a subcommand's section sets hundreds
-  # of lines further down, which a probe that stopped reading early would miss.
+  # block that runs as pr-review.sh is sourced, and the ones set further down the file, which a
+  # probe that stopped reading early would miss.
   control 'retune GRACE=1 STALL=2 ROUND_GAP=3 ABSENT_GRACE=4 CHECKS_INTERVAL=5 STALE_BASE=6' \
     '[ "$GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$STALE_BASE" = 123456 ] ||
        bail "the constants did not take: $GRACE$STALL$ROUND_GAP$ABSENT_GRACE$CHECKS_INTERVAL$STALE_BASE"'
@@ -2194,7 +1992,7 @@ test_a_probe_that_cannot_read_the_constants_refuses_with_the_reason() {
 # 0-byte file from 09-10 19:17, three minutes before the SUCCESS path learned to remove it
 # (6de6cff), and four carrying this file's own "frobnicator" line from 09-12 19:07, four minutes
 # before `mutant` gave a broken probe a TMPDIR of its own (ced18ba). Both leaks are fixed and
-# nothing held them fixed; this case is what does. pr-review.sh's tmp_sweep_stale is the backstop
+# nothing held them fixed; this case is what does. `watch`'s tmp_sweep_stale is the backstop
 # behind it, for the one path no removal here can cover — a suite killed while the probe runs.
 test_a_refused_probe_leaves_no_diagnostics_in_tmpdir() {
   local root
@@ -2225,7 +2023,7 @@ test_a_refused_probe_leaves_no_diagnostics_in_tmpdir() {
 # forever. It is a throwaway suite there instead, carrying the ludics-lite#46 shadow, which must
 # still be refused.
 # The counter's one claim: a fixture run inside a command substitution can still count. The
-# body below increments from a `$(...)` exactly the way gh_retry calls a fixture, and a variable
+# body below increments from a `$(...)`, a shell of its own as every call of a fixture is, and a variable
 # bumped in the same place is shown NOT to reach the case — which is the reason the helper exists.
 test_fixture_call_count_survives_a_command_substitution() {
   local root
@@ -2457,17 +2255,13 @@ tests=(
   test_definitions_before_sourcing_are_refused
   test_tmpdir_writes_to_a_target_named_dir
   test_tmpdir_refuses_a_name_it_uses
-  test_the_exit_trap_removes_what_pr_review_sh_s_trap_removes
-  test_a_trap_that_stops_reaching_pr_review_sh_s_is_refused
+  test_the_forward_leaves_nothing_in_tmpdir
+  test_a_trap_in_pr_review_sh_is_refused
   test_gh_fixture_parse
   test_gh_fixture_parse_knows_gh_s_option_table
   test_gh_fixture_parse_records_the_request
   test_gh_fixture_parse_refuses_what_gh_refuses
   test_gh_fixture_parse_refuses_what_it_cannot_parse
-  test_the_jq_shim_breaks_the_program_it_is_pointed_at
-  test_the_jq_shim_leaves_every_other_program_alone
-  test_with_broken_jq_clears_the_marker_whichever_way_the_command_goes
-  test_a_leaked_marker_fails_the_case_that_leaked_it
   test_a_crlf_jq_is_read_back_lf
   test_the_crlf_knob_runs_a_suite_over_the_stub
   test_a_subset_runs_the_cases_it_names_and_says_so

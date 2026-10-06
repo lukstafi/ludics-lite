@@ -1125,21 +1125,21 @@ tie now goes to the higher run id, the later allocation. Sorting each page rathe
 assembled rows leaves the report's per-workflow lines in the order the workflow list gave them.
 
 The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
-`pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup,
-the fixture `gh`'s argument parsing, and the `jq` shim that makes ONE named jq program fail so a
-case can prove a read that did not parse refuses instead of rendering a plausible value
-(ludics-lite#89). Three suites carried that shim byte-identically, each re-proving with a control
-of its own that it breaks only what it is pointed at; that claim is about the shim, so the
-preamble's own controls pin it once and a suite keeps only the baseline its broken runs are
-measured against (ludics-lite#179). The guard reaches one library further out too: the base
+`pr-review.sh` for them and carries the reporter, the assertions, the state line's field readers,
+the scratch-directory cleanup and the fixture `gh`'s argument parsing. A read that did not parse
+must refuse instead of rendering a plausible value (ludics-lite#89): the suites reach every site a
+feed can break from outside, and the package's own tests break the rest by hand
+(`lib/ludics/tests/test_prreview_readers.py`) — the preamble's `jq` shim that broke one named
+program of the shell's (ludics-lite#179) went with the shell half of `pr-review.sh`, which left it
+nothing to break. The guard reaches one library further out too: the base
 suites' shared fixture transport is sourced after the preamble, so its own helpers were outside
 the snapshot and a suite colliding with one of them — `reset_fixture`, say, which every case
 opens with — was accepted in silence. `protect_library <file>`, called by such a library from
 inside itself, extends the snapshot over what it defines, and a call that would add nothing is
 refused rather than protecting nothing. It also closes the trap that bit twice (ludics-lite#39, #45,
-#46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
-name — a reporter called `fail` — silently replaces the library's, turning every refusal's exit
-code into the reporter's. So the preamble snapshots the function table when it is sourced, and
+#46): `pr-review.sh` and the preamble put their unqualified functions in scope, and a suite helper
+sharing a name — a reporter called `fail` — silently replaces the library's, turning every
+refusal's exit code into the reporter's. So the preamble snapshots the function table when it is sourced, and
 `run_tests` refuses, naming the function and where the suite redefined it, any library function
 redefined without a `stub <fn>` declaration, and any declaration the suite never honoured. No
 fixture suite declares one any more: a stub of an internal function cannot judge a subcommand
@@ -1232,7 +1232,8 @@ standard-library-only Python 3.12 in one package, `lib/ludics/`, one script (and
 one subcommand) at a time behind unchanged command lines. Every Python entry point runs through
 `scripts/py`, which picks the first interpreter >= 3.12 (`scripts/test-py.sh`); a script's shell
 file stays the entry point and forwards to its module: `pr-review.sh` forwards the subcommands
-named in its `PY_PORTED` (today: every one of them) to `ludics.prreview`; `fleet-worker.sh` the
+(every one of them, its shell half retired: what the script keeps is listed in
+`lib/ludics/README.md`) to `ludics.prreview`; `fleet-worker.sh` the
 verbs its forwarder names (claim, release, coordinator, halt, resume-launches, halted, gate and
 every `execution` action but `slot --probe`) to `ludics.fleetworker`; `check-prompts.sh` forwards
 whole, to `ludics.checkprompts`, and `post-merge-cleanup.sh` its whole command line, to

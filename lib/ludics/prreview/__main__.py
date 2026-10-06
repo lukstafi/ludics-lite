@@ -1,12 +1,12 @@
 """``scripts/py -m ludics.prreview [--repo owner/name] <subcommand> <args...>``
 
-What pr-review.sh's forwarder runs for a subcommand in its ``PY_PORTED`` set, with the same
-arguments and the shell's resolved constants in the environment (``PY_FORWARD_VARS``). The shell
-has already taken its own ``--repo`` off; it is accepted here too so the module can be run
-directly.
+What pr-review.sh's forward runs for every subcommand, with the same arguments and the shell's
+resolved constants in the environment (``PY_FORWARD_VARS``). The shell has already taken its own
+``--repo`` off; it is accepted here too so the module can be run directly.
 
 Adding a subcommand: a module ``ludics/prreview/<name>.py`` with ``run(session, args) -> int``,
-a ``case "<name>":`` below, and the name in the shell's ``PY_PORTED``.
+a ``case "<name>":`` below and its name in ``PORTED``, and in pr-review.sh its name in ``main``'s
+case with a ``cmd_<name>`` stub (lib/ludics/README.md).
 """
 
 import os
