@@ -510,7 +510,7 @@ test_a_settle_on_absence_keeps_its_runs_pages() (
   assert_eq "$BASE_RC" 0 "an absence past a zero grace settles ($BASE_OUTPUT)"
   assert_contains "$BASE_OUTPUT" "no run for the tip appeared" "on absence"
   kept=$(sed -n 's/.*kept the runs pages it read in \(.*\) (ludics-lite#550).*/\1/p' <<<"$BASE_OUTPUT")
-  assert_contains "$kept" "$BUDGET_DIR/base-pages/" "the path is named, under the state directory"
+  assert_contains "$kept" "$(py_native_path "$BUDGET_DIR")/base-pages/" "the path is named, under the state directory"
   [ -f "$kept" ] || bail "the kept pages should be a file: '$kept'"
   assert_contains "$(cat "$kept")" "actions/workflows/1/runs?branch=$BRANCH&event=push&per_page=10" "naming the read"
   assert_contains "$(cat "$kept")" '"id":5531' "holding the page as it was served"
@@ -541,7 +541,7 @@ test_a_settle_over_a_workflow_with_no_runs_keeps_its_runs_pages() (
   run_base --wait="$EVENT_CEILING"
   assert_eq "$BASE_RC" 0 "a dispatch-only workflow does not park the wait ($BASE_OUTPUT)"
   kept=$(sed -n 's/.*kept the runs pages it read in \(.*\) (ludics-lite#550).*/\1/p' <<<"$BASE_OUTPUT")
-  assert_contains "$kept" "$BUDGET_DIR/base-pages/" "the path is named, under the state directory"
+  assert_contains "$kept" "$(py_native_path "$BUDGET_DIR")/base-pages/" "the path is named, under the state directory"
   [ -f "$kept" ] || bail "the kept pages should be a file: '$kept'"
   assert_contains "$(cat "$kept")" "actions/workflows/2/runs?branch=$BRANCH&event=push&per_page=10" \
     "naming the empty workflow's read"

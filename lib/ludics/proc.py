@@ -82,6 +82,13 @@ def windows_lookup(name: str, env: Mapping[str, str] | None = None) -> str | Non
     ``gh.exe`` further along PATH."""
     environ = os.environ if env is None else env
     suffixes = [s for s in environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if s]
+    if os.path.dirname(name):
+        # A path, not a name (the bridge's own bash, ``$BASH`` made native): the shell searches no
+        # PATH for it, and the file it names is the command whatever its suffix.
+        for candidate in [name, *(name + suffix.lower() for suffix in suffixes)]:
+            if os.path.isfile(candidate):
+                return candidate
+        return None
     for directory in environ.get("PATH", "").split(os.pathsep):
         if not directory:
             continue

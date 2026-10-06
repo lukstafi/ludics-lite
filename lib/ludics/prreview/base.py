@@ -1289,9 +1289,11 @@ class Wait:
         directory = budget.dir if budget is not None else ""
         if not directory:
             return
-        pages_dir = os.path.join(directory, "base-pages")
+        # Joined with "/", as the state directory itself is spelled (a native Windows one by
+        # ``cygpath -m``): the path named on stderr is one the caller's shell can open as printed.
+        pages_dir = f"{directory.rstrip('/')}/base-pages"
         now = self.b.clock.now()
-        path = os.path.join(pages_dir, f"{now}.{os.getpid()}.{self.repo.replace('/', '~')}.txt")
+        path = f"{pages_dir}/{now}.{os.getpid()}.{self.repo.replace('/', '~')}.txt"
         lines = [
             "# pr-review.sh base: the runs pages of a round that settled on absence (ludics-lite#550)",
             f"# repo {self.repo} branch {self.branch} tip {tip}"

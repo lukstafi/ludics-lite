@@ -48,6 +48,19 @@ class RunTool(unittest.TestCase):
             env["PATH"] = os.pathsep.join([plain, real])
             self.assertEqual(proc.windows_lookup("gh", env), os.path.join(real, "gh.exe"))
 
+    def test_the_windows_lookup_takes_a_path_as_the_command(self) -> None:
+        # The budget's liveness probe runs the bridge's bash by its full native path; looked up
+        # as a NAME on PATH it was never found, so every MSYS holder read as dead and a second
+        # base --wait took the branch's observer lock (windows git bash run 37414686215).
+        with tempfile.TemporaryDirectory() as root:
+            bash = os.path.join(root, "bash.exe")
+            with open(bash, "wb") as f:
+                f.write(b"MZ")
+            env = {"PATH": tempfile.gettempdir(), "PATHEXT": os.pathsep.join([".COM", ".EXE"])}
+            self.assertEqual(proc.windows_lookup(bash, env), bash)
+            self.assertEqual(proc.windows_lookup(os.path.join(root, "bash"), env), bash)
+            self.assertIsNone(proc.windows_lookup(os.path.join(root, "sh"), env))
+
     def test_every_word_of_a_windows_command_line_is_quoted(self) -> None:
         # Unquoted, Git Bash's runtime brace-expanded a space-free GraphQL query into two words.
         self.assertEqual(
