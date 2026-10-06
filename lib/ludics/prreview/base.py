@@ -41,6 +41,7 @@ import math
 import os
 import re
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, assert_never
@@ -393,11 +394,10 @@ type Want = tuple[str, str]  # (workflow id, display name)
 
 @dataclass
 class _Round:
-    """What one round of the wait read and folded. The wait keeps only the previous round's tip;
-    ludics-lite#550 (a round whose runs page skips the tip's in-flight run settles on a
-    weeks-old verdict) is the place a consistency check against the PREVIOUS round would go: hold
-    the previous ``_Round`` and refuse to settle on a fold whose judged commit is older than one an
-    earlier round judged, or that lost a tip run an earlier round saw in flight."""
+    """What one round of the wait read and folded: the counts its breaks read, each workflow's
+    rows as read (``by_wid``, a workflow read with no rows included), the pages as gh answered
+    them (``pages``), and why the round contradicts an earlier one (``inconsistent``,
+    ludics-lite#550), which no settle accepts."""
 
     out: str = ""
     red: int = 0
@@ -419,6 +419,10 @@ class _Round:
     exhausted_wids: set[str] = field(default_factory=lambda: set())
     exhausted: list[str] = field(default_factory=lambda: [])
     folded: list[Folded] = field(default_factory=lambda: [])
+    by_wid: dict[str, list[RunRow]] = field(default_factory=lambda: {})
+    names: dict[str, str] = field(default_factory=lambda: {})
+    pages: list[tuple[str, str]] = field(default_factory=lambda: [])
+    inconsistent: list[str] = field(default_factory=lambda: [])
 
     @property
     def pushless_names(self) -> str:
@@ -511,12 +515,26 @@ class Base:
             return None
         return [(jq_raw(get(w, "id")), tsv(get(w, "name"))) for w in items]
 
-    def runs_page(self, wid: str, ebranch: str, per_page: int) -> list[RunRow] | None:
-        doc = self.gh_json(["api", f"repos/{self.repo}/actions/workflows/{wid}/runs"
-                            f"?branch={ebranch}&event=push&per_page={per_page}"])
-        if isinstance(doc, (GhFailed, GhUnanswered)):
+    def runs_page(self, wid: str, ebranch: str, per_page: int,
+                  keep: list[tuple[str, str]] | None = None) -> list[RunRow] | None:
+        """One workflow's push runs on the branch, a page of ``per_page``; the endpoint and the
+        page as gh answered it are appended to ``keep`` (the round's evidence, ludics-lite#550)."""
+        endpoint = (f"repos/{self.repo}/actions/workflows/{wid}/runs"
+                    f"?branch={ebranch}&event=push&per_page={per_page}")
+        result = self.gh(["api", endpoint])
+        match result:
+            case GhFailed() | GhUnanswered():
+                return None
+            case GhOk(stdout=out):
+                pass
+            case _:
+                assert_never(result)
+        if keep is not None:
+            keep.append((endpoint, out))
+        docs = json_stream(out)
+        if docs is None or len(docs) != 1:
             return None
-        runs = _items(get(doc, "workflow_runs"))
+        runs = _items(get(docs[0], "workflow_runs"))
         if runs is None:
             return None
         return [_run_row(r) for r in runs]
@@ -813,6 +831,30 @@ class Base:
         return unfinished, newest
 
 
+@dataclass(frozen=True)
+class _Seen:
+    """A workflow's newest judged run as an earlier round of the wait read it: its order key
+    (creation time, then id) and what names it in a note."""
+
+    key: tuple[float, int]
+    run_id: str
+    sha: str
+
+
+def _row_key(r: RunRow) -> tuple[float, int] | None:
+    """A run's place in the branch's history: its creation time, a same-second tie to the higher
+    id. None when the time does not parse, which no comparison is made on."""
+    at = iso_seconds(r.created_at)
+    if at is None:
+        return None
+    return (at, int(r.run_id) if _DIGITS.fullmatch(r.run_id) else 0)
+
+
+# How many settles' pages the state directory keeps (ludics-lite#550): the newest, by their time.
+KEPT_PAGES = 20
+_KEPT_NAME = re.compile(r"([0-9]+)\.[0-9]+\..*\.txt")
+
+
 def _field(value: Json) -> str:
     """The shell's ``map(if type == "string" and length > 0 then . else "-" end) | @tsv``."""
     return tsv(value) if isinstance(value, str) and value else "-"
@@ -926,6 +968,10 @@ class Wait:
         self.interim_name = ""
         self.interim_why = ""
         self.pushless_name = ""
+        # What the earlier rounds of this wait saw (ludics-lite#550): each workflow's newest judged
+        # run, and the runs each workflow had at a tip.
+        self.judged_seen: dict[str, _Seen] = {}
+        self.tip_seen: dict[tuple[str, str], set[str]] = {}
 
     def tip_read(self) -> str:
         return self.b.tip_sha(self.ebranch)
@@ -980,12 +1026,18 @@ class Wait:
             # age measured on it can only come out short, which holds longer, never less.
             snap_at = b.clock.now()
             raw = self.read_runs(rnd)
+            self.consistency(rnd, tip)
             if not raw:
                 rnd.uncovered = 1
             else:
                 self.allruns = raw
                 self.judge(rnd, tip, raw)
-            if self.args.interim:
+            if rnd.inconsistent:
+                rnd.out += ("           (this round's runs page contradicts an earlier round's: "
+                            + "; ".join(rnd.inconsistent)
+                            + " — a stale read, so nothing is settled on it; read again, ludics-lite#550)\n")
+            # An interim green rests on the page as much as a settle does: none on a stale one.
+            if self.args.interim and not rnd.inconsistent:
                 outcome = self.interim(rnd, tip, snap_at)
                 if outcome == "green":
                     interim_green = True
@@ -1010,7 +1062,12 @@ class Wait:
                 if self.last_tip:
                     grace_from = now
                 self.last_tip = tip
-            if rnd.inflight == 0 and rnd.uncovered == 0 and not rnd.src_pending:
+            if rnd.inconsistent:
+                # Only a red AT THE TIP (above) and the ceiling (below) end a wait on a round whose
+                # page contradicts an earlier one: a stale page can hide the tip's run, and every
+                # settle here reads what the page does NOT hold as an answer (ludics-lite#550).
+                pass
+            elif rnd.inflight == 0 and rnd.uncovered == 0 and not rnd.src_pending:
                 # A listed workflow with no push run on the branch: dispatch-only, or one the tip
                 # just added -- held until the tip has had that newcomer's creation window.
                 hold = False
@@ -1039,6 +1096,7 @@ class Wait:
                 # The settle accepts verdicts about an OLDER commit: confirm the tip first.
                 if settle_why and self.tip_read() == tip:
                     waited_note = settle_why
+                    self.keep_pages(rnd, tip, settle_why)
                     break
             elif rnd.inflight == 0 and rnd.nogo_at_tip > 0 and now - grace_from >= grace:
                 waited_note = ("(the tip's newest run completed stopped-not-judged and no replacement"
@@ -1081,12 +1139,12 @@ class Wait:
         for wid, wname in self.wf or []:
             if not wid or b.is_advisory(wname):
                 continue
-            rows = b.runs_page(wid, self.ebranch, 10)
+            rows = b.runs_page(wid, self.ebranch, 10, rnd.pages)
             if rows is None:
                 fail(3, f"could not read {repo}'s '{wname}' runs on {branch}",
                      f"({b.err_line()}); the base's health is UNKNOWN, which is NOT 'green'.")
             if len(rows) >= 10 and not page_green(rows):
-                deeper = b.runs_page(wid, self.ebranch, 100)
+                deeper = b.runs_page(wid, self.ebranch, 100, rnd.pages)
                 if deeper is not None:
                     rows = deeper
                 elif not page_judged(rows):
@@ -1098,14 +1156,84 @@ class Wait:
                 # may start further back.
                 if len(rows) >= 100 and not page_judged(rows):
                     rnd.exhausted_wids.add(wid)
+            ordered = newest_first(rows, lambda r: r.created_at, lambda r: r.run_id, lambda r: r.line())
+            rnd.by_wid[wid] = ordered
+            rnd.names[wid] = wname
             if rows:
-                raw.extend(newest_first(rows, lambda r: r.created_at, lambda r: r.run_id,
-                                        lambda r: r.line()))
+                raw.extend(ordered)
             else:
                 # Listed, with no push run here yet: still unjudged at the tip (the newcomer).
                 rnd.norun += 1
                 rnd.norun_ids.append((wid, wname))
         return raw
+
+    def consistency(self, rnd: _Round, tip: str) -> None:
+        """ludics-lite#550: GitHub's run listing can serve a stale page while a run changes status,
+        and a round that read one settled green on a weeks-old verdict with the tip's own run in
+        flight. Within one wait, this round contradicts an earlier one when a workflow's newest
+        judged run is OLDER than the newest an earlier round judged (or it has none), or when a run
+        an earlier round saw at this tip is not on the page. Runs only accumulate on a branch:
+        neither happens to a fresh read short of a deleted run or a tip forced back, and either of
+        those leaves the wait to its ceiling, no verdict, rather than to a settle on a stale page.
+        The reasons go in ``rnd.inconsistent``; what was seen is remembered, never lowered."""
+        for wid, rows in rnd.by_wid.items():
+            name = rnd.names.get(wid, wid)
+            newest = next((r for r in rows if r.status == "completed" and r.conclusion in _JUDGED), None)
+            key = _row_key(newest) if newest is not None else None
+            seen = self.judged_seen.get(wid)
+            if seen is not None:
+                if newest is None:
+                    rnd.inconsistent.append(f"{name} has no judged run on it, where an earlier round's"
+                                            f" newest was run {seen.run_id} at {seen.sha[:8]}")
+                elif key is not None and key < seen.key:
+                    rnd.inconsistent.append(f"{name}'s newest judged run is run {newest.run_id} at"
+                                            f" {newest.head_sha[:8]}, older than run {seen.run_id} at"
+                                            f" {seen.sha[:8]}, which an earlier round judged by")
+            if newest is not None and key is not None and (seen is None or key > seen.key):
+                self.judged_seen[wid] = _Seen(key, newest.run_id, newest.head_sha)
+            if tip:
+                had = self.tip_seen.setdefault((tip, wid), set())
+                lost = sorted(had - {r.run_id for r in rows})
+                if lost:
+                    rnd.inconsistent.append(f"{name}'s run {', '.join(lost)} at the tip {tip[:8]}, which"
+                                            " an earlier round saw, is not on it")
+                had.update(r.run_id for r in rows if r.head_sha == tip)
+
+    def keep_pages(self, rnd: _Round, tip: str, why: str) -> None:
+        """Keep the raw runs pages of a round that settled on ABSENCE, under the state directory
+        (``base-pages/``, the newest KEPT_PAGES), and name the file on stderr: the settle reads
+        what a page does NOT hold, so the next stale page that gets past ``consistency`` carries
+        its own record (ludics-lite#550). A debug path: no state directory keeps nothing, and a
+        failed write is said and changes no verdict."""
+        budget = self.b.session.budget
+        directory = budget.dir if budget is not None else ""
+        if not directory:
+            return
+        pages_dir = os.path.join(directory, "base-pages")
+        now = self.b.clock.now()
+        path = os.path.join(pages_dir, f"{now}.{os.getpid()}.{self.repo.replace('/', '~')}.txt")
+        lines = [
+            "# pr-review.sh base: the runs pages of a round that settled on absence (ludics-lite#550)",
+            f"# repo {self.repo} branch {self.branch} tip {tip}"
+            f" at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))} pid {os.getpid()}",
+            f"# {why}",
+        ]
+        for endpoint, body in rnd.pages:
+            lines.append(f"## {endpoint}")
+            lines.append(body.rstrip("\n"))
+        try:
+            os.makedirs(pages_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8", errors="surrogateescape") as handle:
+                handle.write("\n".join(lines) + "\n")
+            kept = sorted((int(m.group(1)), n) for n in os.listdir(pages_dir)
+                          if (m := _KEPT_NAME.fullmatch(n)))
+            for _, n in kept[:-KEPT_PAGES]:
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(pages_dir, n))
+        except OSError as e:
+            warn(f"base: could not keep this settle's runs pages in {pages_dir} ({e.strerror})")
+            return
+        warn(f"base: this settle on absence kept the runs pages it read in {path} (ludics-lite#550)")
 
     def judge(self, rnd: _Round, tip: str, raw: list[RunRow]) -> None:
         """The fold's verdict per workflow, the report's lines, and the round's counts."""
