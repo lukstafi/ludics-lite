@@ -123,3 +123,12 @@ def advisory_from_env(env: Mapping[str, str]) -> bool:
 def threads_page_cap(env: Mapping[str, str]) -> int:
     """THREADS_PAGE_CAP: how many 100-thread pages a thread walk reads before it stops."""
     return private_int(env, ENV_THREADS_PAGE_CAP, THREADS_PAGE_CAP)
+
+
+def poll_caps(env: Mapping[str, str]) -> tuple[int, int]:
+    """REVIEW_POLL_CAP (SHIP_PR_REVIEW_POLL_CAP, 300) and BUILD_POLL_CAP (SHIP_PR_BUILD_POLL_CAP,
+    600): the seconds the polling budget's pause doubles up to (budget.py)."""
+    return (
+        _whole(env, "SHIP_PR_REVIEW_POLL_CAP", "300", "whole seconds"),
+        _whole(env, "SHIP_PR_BUILD_POLL_CAP", "600", "whole seconds"),
+    )

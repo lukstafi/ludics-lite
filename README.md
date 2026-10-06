@@ -333,6 +333,16 @@ script sees the variable CI sets: a control that reads it by accident goes red a
 instead of on the push (PR #275). The workflow calls this script for those steps, so the two
 cannot drift, and `scripts/test-preflight.sh` pins that they have not.
 
+It also runs CI's small-guards suites, as its *guards* (`preflight.sh guards` lists them), because
+a skill-text edit can pass every lint step and still fail one (ludics-lite#553). With no step
+named, the guards a Markdown edit can break — `test-check-prompts.sh` on any `*.md`,
+`test-sync-routines.sh` on `routines/*.md`, each also on the checker and the live scripts its suite
+reads — run when a tracked file matching them differs from the
+merge base with `origin/main` (`--base <ref>` for another; a base that cannot be resolved runs
+them), adding a minute or two. `--guards all` runs every small-guards suite, `--guards none` none,
+and a guard named on the command line runs alone. `scripts/test-preflight.sh` pins the guard table
+to the small-guards job's steps.
+
 To iterate on a few cases of a `ship-pr/scripts/test-pr-review-*.sh` suite, name them:
 `ship-pr/scripts/test-pr-review-watch.sh test_a test_b` (or
 `SHIP_PR_TEST_CASES="test_a test_b" ship-pr/scripts/test-pr-review-watch.sh`; naming cases both
@@ -345,14 +355,29 @@ given must already be a defined function, or the run is refused before any case:
 case inside another case's body, which a full run reached but a subset could never select.
 
 To show that new fixtures FAIL on the base code — the negative control every issue-wave brief
-asks for — run `scripts/run-against-base.sh <suite-path> [--base <ref>] [suite args...]`. It makes a
-detached worktree of `origin/main` (or `<ref>`) under `$TMPDIR`, copies the working tree's version
-of that one suite over the base's, runs it from the base worktree, and reports its exit status and
+asks for — run `scripts/run-against-base.sh <suite-path> [options] [suite args...]`. It makes a
+detached worktree of `origin/main` (or `--base <ref>`) under `$TMPDIR`, copies the working tree's
+version of that suite (and of any file named with `--also`) over the base's, runs it from the base
+worktree, and reports its exit status and
 pass/fail line (its own refusals exit 125, never the suite's status); the worktree is removed and
 pruned on every exit path, INT and TERM included, and whatever the suite left running is stopped
 with it (its process group: TERM, then KILL after a grace). It is a suite run, so wrap it in
 `~/.claude/skills/issue-wave/scripts/fleet-worker.sh execution slot -- …` like any other.
-`scripts/test-run-against-base.sh` pins it against a scratch repo.
+`scripts/test-run-against-base.sh` pins it against a scratch repo. Its options come right after
+the suite path, in any order (ludics-lite#501); the first other word, and everything after it, is
+the suite's:
+- `--also <path>` (repeatable) carries a working-tree file the suite changed with — a fixture
+  library — into the base too; everything not named stays the base's.
+- `--mutate <file> <sed-expr>` (repeatable) is the control for a change the base cannot
+  discriminate: a tests-only PR, or new "still holds" cases beside the one that changed. It applies
+  the expression inside the throwaway worktree, which without `--base` is a snapshot of the working
+  tree (tracked files only: name a new file with `--also` too), so the live tree is never edited
+  and an interrupted run leaves nothing to restore. A
+  PR whose change is entirely in tests uses mutants of the code under test, not the base, as its
+  negative control.
+- `--timeout <s>` (or `RUN_AGAINST_BASE_TIMEOUT`) stops a hanging suite's process group and
+  reports the base as failing, exit 124: a hang is a valid negative control for a fix that ends
+  one.
 
 The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 
@@ -382,6 +407,7 @@ ship-pr/scripts/test-pr-review-status.sh
 ship-pr/scripts/test-pr-review-watch.sh
 ship-pr/scripts/test-pr-review-reply.sh
 ship-pr/scripts/test-pr-review-retry.sh
+ship-pr/scripts/test-pr-review-budget.sh
 ship-pr/scripts/test-pr-review-api-contract.sh
 scripts/test-wake-lab.sh
 scripts/test-wake-lab-linux.sh
@@ -854,6 +880,35 @@ one call. `watch` used to hold its window blind and exit 3, the code that says r
 `test-pr-review-merge.sh` holds the merge call's half: the script's own flags refused is exit 2,
 and with the caller's flags forwarded after `--` the same refusal stays the ambiguous exit 3.
 
+`test-pr-review-budget.sh` drives the polling budget (ludics-lite#543) on a clock kept in a file
+(exported as `SHIP_PR_TEST_CLOCK`, with the suite's `sleep` bridged to the Python), so the hold's
+end, its probes and the pauses are exact and nothing sleeps. Every case drives a command, and the
+hold that stands is read off the state directory. A call GitHub refuses on
+quota is UNKNOWN (exit 3) and never merges. Its hold ends where the failing endpoint's own
+`X-RateLimit-Reset` says (never `/rate_limit`), and every caller during the hold, `merge` and
+`checks` alike, sends no request at all. A quota answer to the run await is exit 3, not the "no
+such run" exit 2. A `--wait` waits the hold out and repeats the refused read only after a probe of
+that endpoint answers; a probe that still finds the quota out sets the next hold from its own
+headers, and a probe that answers still sets the backoff hold (a secondary limit on the refused
+operation need not show on the probe's GET), doubling from the last one. A later refusal never
+shortens a standing hold, a write never waits one out, a hold at the start of a `--wait` counts
+toward its ceiling even when a preflight read met it, a standing hold makes `base`'s repository
+resolution exit 3 rather than guess from the remote, a refusal landing during a probe survives the
+lift, a dead holder's lock is reaped with nothing left aside, a GraphQL 200 carrying
+exhausted-quota headers is quota, and a GH_HOST or a run's `-R` naming another host is refused
+with exit 2 before any request (ludics-lite#551). A first hold the state directory cannot record
+is an error naming it, with no resend, and a run that moves before any check row exists resets
+the pause. A second build
+observer of a PR is refused naming the first's pid before any read (the advisory list and the
+merge body included), a dead holder is replaced, while one process probes an ended hold the
+others send nothing, and a probe lock left without an owner is replaced after a second. A still queue backs
+off from the interval to the build cap with nothing printed per poll, a moving signal resets the
+pause, and a red still ends the wait at once. `test-pr-review-watch.sh` pins the same pause for a
+review window, reset by a new head inside one state, and `test-pr-review-base-verdict.sh` pins it
+for `base --wait`, with its one observer per branch. What no command reaches (lock_reap's race, a
+run view's options before its id, the lift writing `quota-last` first) is in
+`lib/ludics/tests/test_prreview_budget.py`. A transport failure (a 502) stays exit 3 with no merge and sets no hold.
+
 `test-pr-review-status.sh` drives `status` and `watch` against canned reactions, reviews,
 comments and PR reads, and pins the mergeability that rides on every state line: a PR whose merge
 commit GitHub cannot build says `CONFLICTS` on every state and never "the next move is yours",
@@ -1095,21 +1150,21 @@ tie now goes to the higher run id, the later allocation. Sorting each page rathe
 assembled rows leaves the report's per-workflow lines in the order the workflow list gave them.
 
 The `test-pr-review-*.sh` suites share a preamble, `test-pr-review-lib.sh`, which sources
-`pr-review.sh` for them and carries the reporter, the assertions, the scratch-directory cleanup,
-the fixture `gh`'s argument parsing, and the `jq` shim that makes ONE named jq program fail so a
-case can prove a read that did not parse refuses instead of rendering a plausible value
-(ludics-lite#89). Three suites carried that shim byte-identically, each re-proving with a control
-of its own that it breaks only what it is pointed at; that claim is about the shim, so the
-preamble's own controls pin it once and a suite keeps only the baseline its broken runs are
-measured against (ludics-lite#179). The guard reaches one library further out too: the base
+`pr-review.sh` for them and carries the reporter, the assertions, the state line's field readers,
+the scratch-directory cleanup and the fixture `gh`'s argument parsing. A read that did not parse
+must refuse instead of rendering a plausible value (ludics-lite#89): the suites reach every site a
+feed can break from outside, and the package's own tests break the rest by hand
+(`lib/ludics/tests/test_prreview_readers.py`) — the preamble's `jq` shim that broke one named
+program of the shell's (ludics-lite#179) went with the shell half of `pr-review.sh`, which left it
+nothing to break. The guard reaches one library further out too: the base
 suites' shared fixture transport is sourced after the preamble, so its own helpers were outside
 the snapshot and a suite colliding with one of them — `reset_fixture`, say, which every case
 opens with — was accepted in silence. `protect_library <file>`, called by such a library from
 inside itself, extends the snapshot over what it defines, and a call that would add nothing is
 refused rather than protecting nothing. It also closes the trap that bit twice (ludics-lite#39, #45,
-#46): `pr-review.sh` puts some sixty unqualified functions in scope, and a suite helper sharing a
-name — a reporter called `fail` — silently replaces the library's, turning every refusal's exit
-code into the reporter's. So the preamble snapshots the function table when it is sourced, and
+#46): `pr-review.sh` and the preamble put their unqualified functions in scope, and a suite helper
+sharing a name — a reporter called `fail` — silently replaces the library's, turning every
+refusal's exit code into the reporter's. So the preamble snapshots the function table when it is sourced, and
 `run_tests` refuses, naming the function and where the suite redefined it, any library function
 redefined without a `stub <fn>` declaration, and any declaration the suite never honoured. No
 fixture suite declares one any more: a stub of an internal function cannot judge a subcommand
@@ -1139,9 +1194,9 @@ read, or `skip` with the reason it cannot be checked here), so a failure localiz
 that moved; its exit code separates a moved belief (1), an addressed endpoint answering 4xx (4) and
 a read the token was refused (5) from the API not answering or throttling (3), and the reporter
 files everything but the last, naming which: the fields `run_signal`, `build_checks`, `run_jobs` (both advisory job reads), `pr_head_read`,
-`warn_base_drift` and `status_state` index; the workflow file `base_push_trigger` reads under
+`warn_base_drift` and `status_state` index; the workflow file `Base.push_trigger` reads under
 the raw media type (the base64 envelope arriving instead would cost every paths-ignore recognition
-silently); the newest-first order of `actions/runs`; the two feeds `cmd_base` reads and nothing checked until
+silently); the newest-first order of `actions/runs`; the two feeds `base` reads and nothing checked until
 ludics-lite#90 — the workflow list (`actions/workflows?per_page=100`: the id and name the fold
 groups on, the path the filter read asks for, and that this repository fits the single page) and
 the per-workflow, branch-and-event runs page (`actions/workflows/<id>/runs?branch=&event=push`: the
@@ -1202,9 +1257,10 @@ standard-library-only Python 3.12 in one package, `lib/ludics/`, one script (and
 one subcommand) at a time behind unchanged command lines. Every Python entry point runs through
 `scripts/py`, which picks the first interpreter >= 3.12 (`scripts/test-py.sh`); a script's shell
 file stays the entry point and forwards to its module: `pr-review.sh` forwards the subcommands
-named in its `PY_PORTED` (today: every one of them) to `ludics.prreview`; `fleet-worker.sh` the
-verbs its forwarder names (claim, release, coordinator, halt, resume-launches, halted, gate and
-every `execution` action but `slot --probe`) to `ludics.fleetworker`; `check-prompts.sh` forwards
+(every one of them, its shell half retired: what the script keeps is listed in
+`lib/ludics/README.md`) to `ludics.prreview`; `fleet-worker.sh` every verb but
+`execution slot --probe`, which it still answers in bash so a box without Python 3.12
+answers it, to `ludics.fleetworker`; `check-prompts.sh` forwards
 whole, to `ludics.checkprompts`, and `post-merge-cleanup.sh` its whole command line, to
 `ludics.postmergecleanup`. The shell suites above are the conformance suite for a port,
 unchanged. The package's own checks are `npx --yes pyright@1.1.414` (strict, `pythonVersion`

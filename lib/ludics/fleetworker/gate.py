@@ -7,19 +7,22 @@ Not a reservation: it reads, and a refusal blocks the dispatch. The base verdict
 checkout's physical root. Its clocks are pinned here so the ceiling cannot drift from them
 (ludics-lite#175): the ceiling is the absence grace plus one poll interval.
 
-``launch`` (still shell) keeps its own copy of the base gate for now; this is the native gate's.
+``launch`` reads the same gate, with the commit it fetched as ``expected``: the target branch's
+tip must still be that commit once the verdict is in, or the worker would start from a base the
+verdict never judged.
 """
 
 import os
 import re
 import tempfile
+import urllib.parse
 from typing import Any
 
 from ludics.fleetworker.config import Config
 from ludics.fleetworker.execution import field, listing, records_of
 from ludics.fleetworker.identity import die
 from ludics.fleetworker.lease import anchor_gate
-from ludics.fleetworker.transport import err, run
+from ludics.fleetworker.transport import err, run, substitution
 
 BASE_ABSENT_GRACE = 300
 BASE_POLL_INTERVAL = 60
@@ -37,12 +40,28 @@ UNSET_FOR_CHECKER = (
 )
 
 
-def base_checker(cfg: Config, argv: list[str]) -> int:
-    """Run the checker with the gate's own policy, its stdout on our stderr."""
+def _checker_env(cfg: Config) -> dict[str, str]:
     env = {k: v for k, v in cfg.env.items() if k not in UNSET_FOR_CHECKER}
     env["SHIP_PR_BASE_ABSENT_GRACE"] = str(BASE_ABSENT_GRACE)
     env["SHIP_PR_CHECKS_INTERVAL"] = str(BASE_POLL_INTERVAL)
-    return run(argv, env=env, stdout_to_stderr=True).rc
+    return env
+
+
+def base_checker(cfg: Config, argv: list[str]) -> int:
+    """Run the checker with the gate's own policy, its stdout on our stderr."""
+    return run(argv, env=_checker_env(cfg), stdout_to_stderr=True).rc
+
+
+def base_checker_read(cfg: Config, argv: list[str]) -> str | None:
+    """Run the checker with the gate's own policy for what it prints: ``$(base_checker ...)``,
+    None when it failed."""
+    done = run(argv, env=_checker_env(cfg), capture=True)
+    return substitution(done.out) if done.rc == 0 else None
+
+
+def uri(text: str) -> str:
+    """jq's ``@uri``: every byte outside ``[A-Za-z0-9-_.~]`` percent-encoded, upper-case hex."""
+    return urllib.parse.quote(text.encode("utf-8", "surrogateescape"), safe="-_.~")
 
 
 def _ascii_downcase(text: str) -> str:
@@ -118,7 +137,9 @@ def _remove(path: str) -> None:
         pass
 
 
-def base_gate(cfg: Config, target: str, branch: str, force: bool, reason: str) -> int:
+def base_gate(cfg: Config, target: str, branch: str, force: bool, reason: str, expected: str = "") -> int:
+    """0 the base may be built on, 1 refused (its line on stderr); a usage error dies (2). With
+    ``expected`` (launch's fetched base), the branch's tip must still be that commit."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target):
         die("base gate: --target-repo <owner/repo> required")
     if reason and not force:
@@ -170,6 +191,17 @@ def base_gate(cfg: Config, target: str, branch: str, force: bool, reason: str) -
     if rc != 0:
         err(f"BASE REFUSED: {where} (base checker exit {rc}); dispatch blocked")
         return 1
+    if expected:
+        tip = base_checker_read(cfg, [helper, "--repo", target, "retry", "--read", "api", f"repos/{target}/commits/{uri(branch)}", "--jq", ".sha"])
+        if tip is None:
+            err(f"BASE REFUSED: cannot confirm {target} {branch} after verdict")
+            return 1
+        if not re.fullmatch(r"[0-9a-f]{40}", tip):
+            err("BASE REFUSED: invalid target tip")
+            return 1
+        if tip != expected:
+            err(f"BASE REFUSED: {target} {branch} moved or differs from fetched base {expected} (now {tip}); dispatch blocked")
+            return 1
     return 0
 
 

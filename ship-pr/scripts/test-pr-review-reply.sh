@@ -161,8 +161,8 @@ gh() {
     @*) cat "${body#@}" >"$BODIES/pr-body" 2>/dev/null || return 1 ;;
     *) printf 'the body was not sent as a file: %s\n' "$body" >>"$UNEXPECTED" && return 1 ;;
     esac
-    # Counted off the log, not by decrementing BODY_FAILS: gh_retry calls gh in a command
-    # substitution, a subshell whose assignments never reach the next attempt.
+    # Counted off the log, not by decrementing BODY_FAILS: each attempt runs the fixture in a fresh
+    # bash (the forward's bridge), whose assignments never reach the next attempt.
     if [ "$(wc -l <"$BODIES/pr-methods")" -le "$BODY_FAILS" ]; then
       echo "gh: $FAIL_MSG" >&2
       return 1

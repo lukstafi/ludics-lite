@@ -210,7 +210,10 @@ Before **every** push that touches code, run the gates the repository's CI judge
 the formatter check if it has one — its AGENTS.md or CLAUDE.md names it — and in this repository, the skills repo, `scripts/preflight.sh`, which *is* CI's `lint`
 job rather than a reconstruction of it (shell syntax, the mode bits, shellcheck at error
 severity, the PowerShell parse, the parse guard and the prompt, jq-shape and scratch-directory
-guards). A push that CI reds on a syntax error or a lost mode bit costs a CI round and, since
+guards). Run with no step named, it also runs the small-guards suites a Markdown edit can break
+(`test-check-prompts.sh`, and `test-sync-routines.sh` for `routines/`) whenever Markdown differs
+from the merge base with `origin/main` (`--base <ref>` for another); `--guards all` runs every
+suite of CI's small-guards job (ludics-lite#553). A push that CI reds on a syntax error or a lost mode bit costs a CI round and, since
 automated reviews fire on every push, a review round — and after the reviewer has approved it
 costs the approval too, which is the round ludics-lite#221 was filed for. A round's fixes are
 exactly as able to break a gate as the first commit was, so the habit belongs on the push and not
@@ -320,8 +323,8 @@ not buy fresh grace. Comments arriving after the extension was fixed remain pend
 next observer, so a later request cannot renew this window or lose its own opportunity to be
 observed. Ordinary replies and edits reset nothing.
 
-Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it) outlasts a foreground
-tool's timeout, which is why it is backgrounded. Spell the repo out, as above: a background shell
+Its default window (15 min; `WATCH_INTERVAL`/`WATCH_TIMEOUT` retune it; the polling budget below
+sets its pause) outlasts a foreground tool's timeout, which is why it is backgrounded. Spell the repo out, as above: a background shell
 does not reliably start in the checkout.
 
 **Never pipe a gate command** — `watch`, `poll`, `checks`, `base`, `merge` — through `tail`, `head`
@@ -873,6 +876,21 @@ head returns 3, never superseded or green. Detection occurs on the next poll (af
 API calls), not through a push notification. If the ceiling runs out it exits 4 naming `--allow-no-verdict`; for anything a compiler sees,
 wait again instead.
 
+**The polling budget** (ludics-lite#543) is shared by every observer: `watch`, `checks --wait`,
+`merge --wait` and `base --wait`. Each one reads at once, then pauses for its interval (`WATCH_INTERVAL`,
+`SHIP_PR_CHECKS_INTERVAL`). While nothing moves, the pause doubles up to 300 s for a review and
+600 s for a build (`SHIP_PR_REVIEW_POLL_CAP`, `SHIP_PR_BUILD_POLL_CAP`). A PR has ONE observer of each
+kind (and `base --wait` one per branch): a second `watch`, or a second `--wait` on a PR, exits 2
+naming the first's pid, so wait on that one rather than arming another. A call GitHub refuses on quota is exit 3, never a verdict, and
+it sets a hold for every `pr-review.sh` on the host. The hold ends where the failing endpoint's own
+headers say (never `/rate_limit`), and it lifts only when that endpoint answers a probe. An
+observer waits the hold out within its ceiling before a read (never before a write, which would act
+on stale reads). Any other command exits 3 at once without calling.
+So a quota exit 3 is not a reason to re-arm sooner: the next call waits for the same hold. The
+budget covers github.com alone, so a `GH_HOST` (or a run's `-R`) naming another host is refused
+with exit 2 before anything is sent. The mechanism and its boundary are in
+`lib/ludics/prreview/budget.py`.
+
 **`ABSENT` seconds after a push used to be the trap here** — a push (a rebase before merging, or
 any other) creates a head whose checks do not EXIST yet, and a wait armed in that window saw
 nothing to wait for and passed the gate having read nothing (ocannl staging#491 merged that way).
@@ -891,7 +909,7 @@ checks leave nothing to wait for (green as well as absent), the gate reads
 - a run that completed `cancelled`/`stale`/`action_required` with nothing behind it is exit 4,
   stopped-not-judged like everywhere else, as is one reported `completed` with no conclusion
   recorded yet;
-- a head with no Actions run to back its checks holds too: `build_checks` accepts every provider's
+- a head with no Actions run to back its checks holds too: the gate reads every provider's
   check runs, so an early Codecov green is not evidence that Actions has created its rows;
 - a **checkless** head holds while it is inside `SHIP_PR_BASE_ABSENT_GRACE` (300s, measured from
   the fresher of the head's commit date and the PR's own `updated_at` — each validated on its own,
@@ -940,7 +958,7 @@ semantics the check lookup asks for: a re-triggered invocation supersedes its ow
 predecessor, while one file triggered on both `push` and `pull_request` produces two independent
 runs that are both judged — and a queued run is never folded away at all, since supersession is
 something that happens to a run that stopped. The advisory list is a deny-list of check, job and workflow names in all directions — a run
-whose red is explained entirely by advisory jobs is not a red build signal, since `build_checks`
+whose red is explained entirely by advisory jobs is not a red build signal, since the gate
 already dropped those checks on purpose. A run list that cannot be read is exit 3 even under a
 pending check: an unread run list cannot rule out a red that no check run will ever carry.
 

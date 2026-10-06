@@ -454,11 +454,14 @@ EOF
 # it would be for real: nothing in these tests reaches a real box. The one exception is
 # `SHIM_SSH_LOCAL=<host>`, which runs whatever reaches that host here, as its remote shell would:
 # the stand-in for a second box, so a cross-box path is exercised through run_on's real quoting.
+# `SHIM_SSH_PY=<list>` is that box's own LUDICS_PY_CANDIDATES: a box whose Pythons are not the
+# coordinator's, which the coordinator's own environment cannot fake (it runs under scripts/py too).
 cat > "$TMP/bin/ssh" <<'SHIMEOF'
 #!/usr/bin/env bash
 host=""
 while [ $# -gt 0 ]; do case "$1" in -o) shift ;; -*) ;; *) host="$1"; break ;; esac; shift; done
 shift
+[ -z "${SHIM_SSH_LOCAL:-}" ] || [ "$host" != "$SHIM_SSH_LOCAL" ] || [ -z "${SHIM_SSH_PY:-}" ] || export LUDICS_PY_CANDIDATES="$SHIM_SSH_PY"
 [ -n "${SHIM_SSH_LOCAL:-}" ] && [ "$host" = "$SHIM_SSH_LOCAL" ] && exec bash -c "$*"
 [ "$*" = "exit 0" ] || { echo "ssh: Could not resolve hostname $host: nodename nor servname provided" >&2; exit 255; }
 [ "$host" = "${SHIM_SSH_HANG:-}" ] && sleep 30
@@ -977,11 +980,30 @@ echo x >> "$repo/ship-pr/SKILL.md"
 expect "a reachable sibling does not swallow the refusal that follows the probe" 1 "1 local change(s) in the served tree" -- env FLEET_BOXES="testbox otherbox" SHIM_SSH_SLURP=otherbox "$FW" preflight testbox --no-probe
 git -C "$repo" checkout -q -- ship-pr/SKILL.md
 [ -d "$repo/.git/fleet-checkout.lock" ] && ko "preflight lock left after the bounded fetch" || ok "preflight lock released after the bounded fetch"
-# `execution slot` runs a python3 flock on the box that runs the batches, so Python is no longer
-# an anchor-only requirement and the preflight is where a box missing it must say so.
-mkdir -p "$TMP/nopy"; printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/nopy/python3"; chmod +x "$TMP/nopy/python3"
-expect "a box whose python3 cannot import fcntl refuses (the run-time slot lock needs it)" 1 "no python3 with fcntl" -- \
-  env PATH="$TMP/nopy:$PATH" "$FW" preflight testbox --no-probe
+# `execution slot` runs a flock on the box that runs the batches, and since ludics-lite#403 every
+# fleet-worker.sh verb there but the slot probe runs under scripts/py: the first Python >= 3.12 in
+# its order (LUDICS_PY_CANDIDATES replaces the order). So the preflight asks the box that order --
+# never a bare python3, which on a Mac's non-interactive ssh is Xcode's 3.9 -- and refuses a box
+# where it finds none, or one that cannot import fcntl. The coordinator runs under scripts/py
+# itself, so a box without one is `other` (SHIM_SSH_PY is its own candidate list), and the local
+# box's fixture is an interpreter that is Python >= 3.12 for everything but fcntl.
+real_py=$("$TMP/dispatcher/scripts/py" -c 'import sys; print(sys.executable)')
+mkdir -p "$TMP/pys"
+printf '#!/bin/sh\ncase "$*" in *"import fcntl"*) exit 1 ;; esac\nexec "%s" "$@"\n' "$real_py" > "$TMP/pys/py-nofcntl"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/pys/not-python"
+printf '#!/bin/sh\necho 3.9.6; exit 1\n' > "$TMP/pys/old-python"
+chmod +x "$TMP/pys/py-nofcntl" "$TMP/pys/not-python" "$TMP/pys/old-python"
+expect "a box whose Python >= 3.12 cannot import fcntl refuses (the run-time slot lock needs it)" 1 \
+  "PREFLIGHT REFUSED testbox: $TMP/pys/py-nofcntl, the Python >= 3.12 scripts/py would run here, cannot import fcntl" -- \
+  env LUDICS_PY_CANDIDATES="$TMP/pys/py-nofcntl" "$FW" preflight testbox --no-probe --no-cross
+expect "a box with no Python >= 3.12 in scripts/py's order refuses, naming what it found" 1 \
+  "PREFLIGHT REFUSED other: no Python >= 3.12 in scripts/py's order on other (tried $TMP/pys/missing: absent, $TMP/pys/old-python ($TMP/pys/old-python): Python 3.9.6, older than 3.12, $TMP/pys/not-python ($TMP/pys/not-python): did not run as Python (exit 1)): fleet-worker.sh runs under it here" -- \
+  env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other SHIM_SSH_PY="$TMP/pys/missing
+$TMP/pys/old-python
+$TMP/pys/not-python" "$FW" preflight other --no-probe --no-cross
+expect "...and passes once the order reaches one" 0 "^PREFLIGHT OK other skills=[0-9a-f]*$" -- \
+  env FLEET_BOXES="testbox other" SHIM_SSH_LOCAL=other SHIM_SSH_PY="$TMP/pys/old-python
+$real_py" "$FW" preflight other --no-probe --no-cross
 mkdir -p "$TMP/pk-yes" "$TMP/pk-no"; printf '#!/bin/sh\nexit 0\n' > "$TMP/pk-yes/pkcheck"; printf '#!/bin/sh\nexit 1\n' > "$TMP/pk-no/pkcheck"
 chmod +x "$TMP/pk-yes/pkcheck" "$TMP/pk-no/pkcheck"; printf '#!/bin/sh\n' > "$TMP/pk-yes/fleet-test-inhibit"; chmod +x "$TMP/pk-yes/fleet-test-inhibit"
 expect "a box with systemd-inhibit and the polkit grant adds nothing to the OK line" 0 "PREFLIGHT OK testbox skills=[0-9a-f]*$" -- \
@@ -1273,6 +1295,28 @@ if [ "$rc" -eq 0 ] && grep -q "^tuf${tab}tuf-amd-linux${tab}ok=false${tab}cpu5=?
    grep -q "^mac-studio${tab}local${tab}ok=true" <<<"$out"; then
   ok "load reports a sleeping TUF as an ok=false row beside the live boxes, exit 0"
 else ko "load over a sleeping TUF (rc=$rc) -- $out"; fi
+# A number prints as the payload spelled it, as jq 1.8 prints a literal it did not compute with:
+# 1E+2 stays 1E+2 (not 100.0), 3.50 keeps its zero, -0 its sign, and a lowercase exponent reads
+# in jq's canonical spelling (1.5e3 is 1.5E+3), inside an array as well as alone; a number's
+# length (its absolute value) keeps the literal too, its sign dropped.
+cat > "$TMP/fleet-literals.json" <<'JSON'
+{"machines":[{"name":3.50,"endpoints":{"e":{"kind":"unix","host":"h","ok":1.10,"data":{"counts":{"dune":-0},"sessions":{"claude":-3.50,"codex":-0},"gpu":{"name":[1.5e3,2]}},"avg":{"m5":{"cpu_pct":0.0000001,"gpu_util_pct":1E+2}}}}}]}
+JSON
+out=$(env PATH="$TMP/loadbin:$PATH" SHIM_FLEET_JSON="$TMP/fleet-literals.json" "$FW" load 2>&1); rc=$?
+want="3.50${tab}h${tab}ok=1.10${tab}cpu5=1E-7%${tab}gpu5=1E+2%${tab}dune=-0${tab}claude=3.50${tab}codex=0${tab}gpu=[1.5E+3,2]"
+if [ "$rc" -eq 0 ] && [ "$out" = "$want" ]; then
+  ok "load prints each number as the payload spelled it, in jq 1.8's canonical form"
+else ko "load over number literals (rc=$rc) -- got: $out -- want: $want"; fi
+# A payload that parses only in part: jq printed the rows of every document before the one it
+# could not parse, then refused -- the refusal comes after them, not instead of them.
+{ printf '%s' '{"machines":[{"name":"a","endpoints":{"e":{"kind":"unix","host":"h","ok":true}}}]}'
+  printf '%s' ' {"machines":[]} {"machines":'; } > "$TMP/fleet-cut.json"
+out=$(env PATH="$TMP/loadbin:$PATH" SHIM_FLEET_JSON="$TMP/fleet-cut.json" FLEET_FLOTILLA=http://fl "$FW" load 2>&1); rc=$?
+want="a${tab}h${tab}ok=true${tab}cpu5=?%${tab}gpu5=-%${tab}dune=?${tab}claude=0${tab}codex=0${tab}gpu=-
+LOAD: unexpected payload from http://fl/api/fleet"
+if [ "$rc" -eq 1 ] && [ "$out" = "$want" ]; then
+  ok "load over a payload cut short prints the rows before the cut, then refuses, exit 1"
+else ko "load over a cut payload (rc=$rc) -- got: $out -- want: $want"; fi
 }
 
 section "launch / attach / status / log with a project repo and --repo/--branch" && {
@@ -2736,6 +2780,13 @@ expect "missing brief refuses" 2 "readable file" -- "$FW" launch testbox nb --ta
 ( cd "$TMP" && "$FW" launch testbox rel --target-repo example/project --kind claude --brief "$brief" --cwd "pro j" >/dev/null ) && settle rel
 grep -q "^cwd=$proj\$" "$ISSUE_WAVE_STATE/workers/rel/meta" && ok "a relative --cwd is recorded as its absolute path" || ko "relative cwd recorded: $(grep '^cwd=' "$ISSUE_WAVE_STATE/workers/rel/meta")"
 expect "a path with a newline refuses" 2 "must not contain newlines" -- "$FW" launch testbox nl --target-repo example/project --kind claude --brief "$brief" --cwd "$(printf '%s\nx' "$proj")"
+# Every verb but the slot probe runs in Python, through the checkout's scripts/py: a copy of the
+# script away from its checkout has none, and says so (exit 2, the environment is wrong) instead of
+# leaving it to exec's own error.
+mkdir -p "$TMP/stray/issue-wave/scripts" && cp "$FW" "$TMP/stray/issue-wave/scripts/fleet-worker.sh"
+expect "a copy of the script away from its checkout names the missing scripts/py, exit 2" 2 \
+  "^fleet-worker.sh: no .*/stray/scripts/py: run this script from its skills checkout" -- \
+  bash "$TMP/stray/issue-wave/scripts/fleet-worker.sh" status testbox w1
 }
 
 section_left

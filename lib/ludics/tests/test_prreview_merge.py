@@ -93,7 +93,8 @@ class Production(unittest.TestCase):
     def run_cmd(self, entry: list[str], *args: str, **env: str) -> subprocess.CompletedProcess[str]:
         environ = {k: v for k, v in os.environ.items() if not k.startswith(("SHIP_PR_", "LUDICS_"))}
         environ.update({"PATH": self.dir + os.pathsep + os.environ.get("PATH", ""), "REPO": "",
-                        "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0", **env})
+                        "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0",
+                        "SHIP_PR_STATE_DIR": os.path.join(self.dir, "state"), **env})
         return subprocess.run([*entry, *args], capture_output=True, text=True, env=environ, cwd=self.dir, check=False)
 
     def entries(self) -> list[list[str]]:

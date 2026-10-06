@@ -99,8 +99,8 @@ TIP=""
 WORKFLOWS_JSON=""
 JOBS_DEFAULT=""
 FAIL_ENDPOINT=""
-# The HTTP status a failed read reports: a 5xx is transport, which gh_retry retries, while a 4xx is
-# the API's answer — a 404 or a 403 on the workflow file is how base_push_trigger meets a missing
+# The HTTP status a failed read reports: a 5xx is transport, which GhSession.retry retries, while a 4xx is
+# the API's answer — a 404 or a 403 on the workflow file is how Base.push_trigger meets a missing
 # file and a token that may not read it (ludics-lite#401).
 FAIL_STATUS=""
 # The settle path's three reads (ludics-lite#156): the workflow FILE (its path, then its body at
@@ -189,7 +189,8 @@ FIRST_WID_CACHE="$TEST_ROOT/first-wid"
 
 # runs_json <workflow id> <json array of run overrides>, newest first. Each row defaults to a
 # completed push run of a workflow named "ci", with a distinct id and a created_at that decreases
-# with the index, so the fixture reads the way the API's own newest-first page does.
+# with the index, so the fixture reads the way the API's own newest-first page does: one minute
+# apart from 2026-09-10T00:59:00Z (epoch 1789001940), as ISO dates however long the page.
 runs_json() {
   jq -cn --argjson wf "$1" --argjson runs "$2" \
     '{workflow_runs: [$runs | to_entries[] | .value + {
@@ -198,7 +199,7 @@ runs_json() {
         name: (.value.name // "ci"),
         status: (.value.status // "completed"),
         head_sha: (.value.head_sha // "0000000000000000000000000000000000000000"),
-        created_at: (.value.created_at // ("2026-09-10T00:" + ((59 - .key) | tostring) + ":00Z")),
+        created_at: (.value.created_at // (1789001940 - 60 * .key | todate)),
         html_url: (.value.html_url //
                    ("https://example.test/runs/" + ((.value.id // (1000 * $wf + .key)) | tostring)))
       }]}'
@@ -355,8 +356,8 @@ gh() {
     # round, so the FIRST listed workflow's read is one per round and nothing else here is.
     # (A fixture whose first workflow is advisory would never be read, and would count no
     # rounds — no case lists one, and `is_advisory` is pr-review.sh's own test for it.)
-    # `|| return 1`: the fixture runs in gh_retry's command substitution, which does not inherit
-    # errexit, so a count that bails must be turned into a failed read by hand.
+    # `|| return 1`: the fixture function runs without errexit in the bridge's fresh bash, so a
+    # count that bails must be turned into a failed read by hand.
     if [ "$wid" = "$(first_wid)" ]; then
       round=$(fixture_call_count rounds) || return 1
     fi
@@ -778,6 +779,25 @@ test_an_aged_run_is_stamped_at_the_read() {
     "the stamp is cleared with the rest of the fixture"
 }
 
+# A row's default created_at is one minute older than the row above it, from 2026-09-10T00:59:00Z,
+# as an ISO date the API would serve, however long the page: past sixty rows the minute used to go
+# negative (`00:-1:00Z`), and from the fiftieth it lost its leading zero (`00:9:00Z`), which sorts
+# as NEWER than `00:59:00Z` byte for byte -- and `base` orders a feed by created_at as bytes.
+test_runs_json_dates_are_a_minute_apart_past_sixty_rows() {
+  local rows
+  rows=$(runs_json 1 "$(jq -cn '[range(120) | {}]')")
+  assert_eq "$(jq -r '.workflow_runs[0].created_at' <<<"$rows")" "2026-09-10T00:59:00Z" "row 0 is today's"
+  assert_eq "$(jq -r '.workflow_runs[49].created_at' <<<"$rows")" "2026-09-10T00:10:00Z" "row 49 is today's"
+  assert_eq "$(jq -r '.workflow_runs[59].created_at' <<<"$rows")" "2026-09-10T00:00:00Z" \
+    "row 59 is today's instant, with its leading zero"
+  assert_eq "$(jq -r '.workflow_runs[60].created_at' <<<"$rows")" "2026-09-09T23:59:00Z" \
+    "row 60 is the minute before, on the day before"
+  assert_eq "$(jq -r '[.workflow_runs[].created_at | fromdateiso8601] | . == (sort | reverse) and (unique | length) == 120' <<<"$rows")" \
+    true "every row parses, a minute apart, newest first"
+  assert_eq "$(jq -r '[.workflow_runs[].created_at] | . == (sort | reverse)' <<<"$rows")" true \
+    "and as bytes too, the order base sorts them in"
+}
+
 # Every setter refuses what it cannot mean. `spend_grace 0.5` is the one that would pass for
 # honoured: the fixture would sleep a fraction on the platforms whose sleep takes one and refuse
 # on the fleet's others, so a case would spend a grace on one box and not on the next.
@@ -850,21 +870,23 @@ test_a_suite_that_shadows_the_transport_is_refused() {
 }
 
 # The PR #419 shape: a fixture key pattern that also matches a name pr-review.sh defines. The old
-# reset unset WORKFLOW_YAML_FILTER in silence and a suite went red somewhere else; the reset now
-# refuses, naming it. The control: names a case creates under the same patterns are still cleared.
+# reset unset WORKFLOW_YAML_FILTER (a constant of the retired shell half) in silence and a suite
+# went red somewhere else; the reset now refuses, naming it. The shape here is the same over a
+# constant the script still sets, BUDGET_DIR. The control: names a case creates under the same
+# patterns are still cleared.
 test_reset_fixture_refuses_to_unset_a_name_it_did_not_create() {
   local rc v
   reset_fixture
-  [ -n "${WORKFLOW_YAML_FILTER:-}" ] || bail "pr-review.sh should define WORKFLOW_YAML_FILTER"
+  [ -n "${BUDGET_DIR+set}" ] || bail "pr-review.sh should define BUDGET_DIR"
   set +e
   (
-    FIXTURE_KEYS+=('WORKFLOW_YAML_[A-Za-z0-9_]*')
+    FIXTURE_KEYS+=('BUDGET_[A-Za-z0-9_]*')
     reset_fixture
   ) 2>"$TEST_ROOT/refusal"
   rc=$?
   set -e
   assert_eq "$rc" 2 "a key pattern over a library name is refused ($(cat "$TEST_ROOT/refusal"))"
-  assert_contains "$(cat "$TEST_ROOT/refusal")" "in scope before any case ran: WORKFLOW_YAML_FILTER —" \
+  assert_contains "$(cat "$TEST_ROOT/refusal")" "in scope before any case ran: BUDGET_DIR —" \
     "the refusal should name the library variable the pattern matched, alone"
   RUNS_7=x RUNS_7_FROM_2=x JOBS_7003=x RUN_7003=x WORKFLOW_PATH_7=x YAML_OF_nightly=x FILES_d=x
   reset_fixture
@@ -883,6 +905,7 @@ tests=(
   test_the_runs_read_delay_is_round_ones_and_once
   test_an_aged_run_is_stamped_at_the_read
   test_a_compare_ends_at_its_head
+  test_runs_json_dates_are_a_minute_apart_past_sixty_rows
   test_the_fixture_setters_refuse_what_they_cannot_mean
   test_a_suite_that_skips_the_preamble_is_refused
   test_a_suite_that_shadows_the_transport_is_refused

@@ -131,6 +131,16 @@ LUDICS_PY_CANDIDATES="$TMP/bin/newer" PYTHONPATH="" "$PY" -c x >/dev/null 2>&1
   ok "an unset PYTHONPATH is noted as unset" ||
   ko "an unset PYTHONPATH's note: $(cat "$TMP/bin/newer.caller" 2>/dev/null)"
 
+# The locale-coercion switch scripts/py sets for its own interpreter is noted the same way, and an
+# entry point's restore (ludics.cli) hands its children the caller's value -- none, or its own.
+show_coerce='import os; from ludics import cli; cli.restore_caller_environment(os.environ); print(os.environ.get("PYTHONCOERCECLOCALE", "unset"))'
+out=$(unset PYTHONCOERCECLOCALE; "$PY" -c "$show_coerce" 2>&1)
+[ "$out" = unset ] && ok "an unset PYTHONCOERCECLOCALE is unset again for an entry point's children" ||
+  ko "an unset PYTHONCOERCECLOCALE reached the children as: $out"
+out=$(PYTHONCOERCECLOCALE=warn "$PY" -c "$show_coerce" 2>&1)
+[ "$out" = warn ] && ok "the caller's PYTHONCOERCECLOCALE is put back for an entry point's children" ||
+  ko "PYTHONCOERCECLOCALE=warn reached the children as: $out"
+
 # The built-in list on this box: a real interpreter >= 3.12 is found.
 out=$("$PY" -c 'import sys; print(sys.version_info >= (3, 12))' 2>&1)
 [ "$out" = True ] && ok "the built-in list finds a Python >= 3.12 here" ||

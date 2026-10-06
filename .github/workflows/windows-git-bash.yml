@@ -82,7 +82,7 @@ jobs:
           scripts/py -c 'import sys; print("scripts/py:     Python", sys.version.split()[0], "at", sys.executable)' ||
             { echo '::error title=Git Bash platform proof failed::scripts/py found no Python >= 3.12'; exit 1; }
           # The pinned jq is a native jq.exe, which ends its lines CRLF, and a `$(jq -r ...)`
-          # keeps the \r; pr-review.sh reads every jq through `jq_lf`, which probes for that once
+          # keeps the \r; the suites read every jq through pr-review.sh's `jq_lf`, which probes for that once
           # (ludics-lite#335). Recorded here, so the day it changes is on the record.
           echo "jq:            $(jq --version), and jq -r ends a line with: $(printf '"x"' | jq -r . | od -An -c | tr -s ' ')"
           # A suite name that matches no step would skip them all and read green.
@@ -153,6 +153,9 @@ jobs:
       - name: pr-review fixtures, the plain retry and the run await
         if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-retry.sh') }}
         run: ship-pr/scripts/test-pr-review-retry.sh || { echo '::error title=Git Bash suite failed::test-pr-review-retry.sh'; exit 1; }
+      - name: pr-review fixtures, the polling budget
+        if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-budget.sh') }}
+        run: ship-pr/scripts/test-pr-review-budget.sh || { echo '::error title=Git Bash suite failed::test-pr-review-budget.sh'; exit 1; }
       - name: pr-review fixtures, the live-API contract's own logic
         if: ${{ !cancelled() && steps.platform.outcome == 'success' && (!inputs.suite || inputs.suite == 'test-pr-review-api-contract.sh') }}
         run: ship-pr/scripts/test-pr-review-api-contract.sh || { echo '::error title=Git Bash suite failed::test-pr-review-api-contract.sh'; exit 1; }

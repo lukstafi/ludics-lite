@@ -252,7 +252,9 @@ to deploy), a deployed skill symlink that does not point into the checkout (and,
 three `~/.codex/skills` links the README's Codex loop installs), and, for CLI workers only, a
 live one-word headless turn. `claude auth status` cannot stand in for that probe (2026-09-02:
 it reported `loggedIn:true` on minix while every `claude -p` there failed with an expired,
-unrefreshable OAuth session). Every mode also makes the box's GitHub call, `gh api user`, in the
+unrefreshable OAuth session). Every mode refuses a box with no Python >= 3.12 in `scripts/py`'s
+order, under which every `fleet-worker.sh` verb there but the slot probe runs (ludics-lite#403).
+Every mode also makes the box's GitHub call, `gh api user`, in the
 session kind a worker or leg uses, a non-interactive ssh (a local shell on the anchor), and
 refuses a token that call rejects (ludics-lite#360: on 2026-09-23 a dead keyring token surfaced
 an hour into a worker's task, and on 2026-09-24 minix's token answered HTTP 401 over ssh while
@@ -703,7 +705,11 @@ controlled through the tools in your coordinator's file, never through those com
   red for two hours). `merge --wait` refuses without a verdict (see ship-pr): brief workers to
   background it and let it hold, raising `SHIP_PR_CHECKS_WAIT` past the observed backlog rather
   than reaching for `--allow-no-verdict`, and whoever does merge unread owns re-checking the
-  master run it produces.
+  master run it produces. The worker's `watch` and `merge --wait` are a PR's only observers. The
+  coordinator reads their reports, plus one plain `checks` at most, and never arms its own. A
+  second observer is refused; one observer per issue was part of the recovery after the
+  2026-10-04 wave exhausted the quota (ship-pr's *polling budget*, which also holds every session
+  on a quota refusal).
 - **Re-check for a rival PR before each queued launch.** Per-box waves no longer race each
   other, but user-driven sessions, the CI-red triage routine (`ci-fix/*`), and a previous
   wave's stragglers still open PRs, and the pre-wave `gh pr list` goes stale within hours.

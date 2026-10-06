@@ -2,8 +2,9 @@
 # Runs the working tree's version of ONE suite against the base code: the negative control every
 # issue-wave brief asks for ("show the new fixtures FAIL on the base"). A detached worktree of
 # origin/main (or --base <ref>) is made under $TMPDIR, the current working tree's copy of
-# <suite-path> -- that file and nothing else -- is copied over the base's, and the suite runs from
-# the base worktree, so everything it reaches through its own directory is the base's. The
+# <suite-path> -- that file, and only the files named with --also -- is copied over the base's,
+# and the suite runs from the base worktree, so everything else it reaches through its own
+# directory is the base's. The
 # worktree is a real checkout, not a `git archive` export, so a suite that asks git about its
 # checkout gets an answer. It is removed on every exit path, INT and TERM included.
 #
@@ -13,19 +14,39 @@
 #
 # It is a suite run like any other, so callers take the box's correctness slot around it:
 #   ~/.claude/skills/issue-wave/scripts/fleet-worker.sh execution slot -- \
-#     scripts/run-against-base.sh <suite-path> [--base <ref>] [suite args...]
+#     scripts/run-against-base.sh <suite-path> [options] [suite args...]
 # (`execution slot --cpu -- ...` for a suite that holds no GPU).
 #
 # The base ref is used as it stands locally: fetch first if origin/main may be stale.
 #
-# Usage: run-against-base.sh <suite-path> [--base <ref>] [suite args...]
-#   <suite-path>  a file in the current checkout's working tree (relative to the cwd, or absolute)
-#   --base <ref>  the base to run against (default origin/main); it must come right after the
-#                 suite path, and every argument after it goes to the suite
-# Exit: the suite's own exit status; 125 when the helper could not run it at all, could not
-# start it (exec failed: it never ran), or could not clean up after it (the `git bisect run`
-# convention for "cannot test"), so a refusal is never read as the suite's failure -- and a
-# suite's own 125 is reported as 1.
+# Usage: run-against-base.sh <suite-path> [options] [suite args...]
+#   <suite-path>     a file in the current checkout's working tree (relative to the cwd, or
+#                    absolute)
+# The options come right after the suite path, in any order; the first word that is not one of
+# them, and every word after it, goes to the suite (`--` included: it is the suite's), so a suite
+# whose own first argument is one of these names cannot take it through the helper. A repeated
+# --base or --timeout: the later one wins.
+#   --base <ref>     the base to run against (default origin/main; with --mutate, the working tree)
+#   --also <path>    carry this working-tree file into the base too, at the same path: a fixture
+#                    library the suite changed with (ludics-lite#501). Repeatable. Everything not
+#                    named is still the base's.
+#   --mutate <file> <sed-expr>
+#                    a MUTANT run: after the copies, apply `sed -e <sed-expr>` to <file> inside
+#                    the throwaway worktree -- never to the live tree, so an interrupted run
+#                    leaves nothing to restore. Without --base the worktree is a snapshot of the
+#                    working tree (`git stash create`: tracked files, staged or not; untracked
+#                    ones are not in it -- name a new file with --also too to mutate it), since a
+#                    mutant is of the change, not of the base. An expression that changes nothing
+#                    is refused: that is not a mutant. Repeatable, applied in order. A tests-only change takes this control instead of the
+#                    base's: its new cases pass on the base too (ludics-lite#501).
+#   --timeout <s>    stop the suite after <s> whole seconds (default RUN_AGAINST_BASE_TIMEOUT, or
+#                    0: none). On expiry its process group gets TERM, then KILL after the grace,
+#                    and the run is reported as the base FAILING, exit 124: a hang is a valid
+#                    negative control for a fix that ends one, not a refusal (ludics-lite#501).
+# Exit: the suite's own exit status; 124 when the timeout expired; 125 when the helper could not
+# run it at all, could not start it (exec failed: it never ran), or could not clean up after it
+# (the `git bisect run` convention for "cannot test"), so a refusal is never read as the suite's
+# failure -- and a suite's own 125 is reported as 1, as is its own 124 when a timeout is armed.
 # Whatever the suite left running is stopped with it: its process group gets TERM, then KILL
 # after RUN_AGAINST_BASE_GRACE whole seconds (default 5).
 
@@ -41,7 +62,7 @@ die() {
   exit 125
 }
 
-[ $# -ge 1 ] || die "usage: run-against-base.sh <suite-path> [--base <ref>] [suite args...]"
+[ $# -ge 1 ] || die "usage: run-against-base.sh <suite-path> [--base <ref>] [--also <path>]... [--mutate <file> <sed-expr>]... [--timeout <s>] [suite args...]"
 case "$1" in -h | --help)
   sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
   exit 0
@@ -56,44 +77,104 @@ esac
 unset $(git rev-parse --local-env-vars)
 suite_arg=$1
 shift
-base=origin/main
-if [ "${1-}" = --base ]; then
-  [ $# -ge 2 ] || die "--base needs a ref"
-  base=$2
-  shift 2
-fi
+base=
+TIMEOUT=${RUN_AGAINST_BASE_TIMEOUT:-0}
+ALSO_ARGS=()
+MUT_ARGS=()
+MUT_EXPRS=()
+# The helper's options, up to the first word that is not one: that word and the rest are the
+# suite's. No `--` terminator, because a suite may take `--` itself and always could.
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --base)
+    [ $# -ge 2 ] || die "--base needs a ref"
+    base=$2
+    shift 2
+    ;;
+  --also)
+    [ $# -ge 2 ] || die "--also needs a path"
+    ALSO_ARGS+=("$2")
+    shift 2
+    ;;
+  --mutate)
+    [ $# -ge 3 ] || die "--mutate needs a file and a sed expression"
+    MUT_ARGS+=("$2")
+    MUT_EXPRS+=("$3")
+    shift 3
+    ;;
+  --timeout)
+    [ $# -ge 2 ] || die "--timeout needs whole seconds"
+    TIMEOUT=$2
+    shift 2
+    ;;
+  *) break ;;
+  esac
+done
 
-# A relative path gets a `./`, so a name like `-check.sh` is never read as an option by dirname,
-# basename or cd.
-case "$suite_arg" in /*) ;; *) suite_arg="./$suite_arg" ;; esac
-[ -f "$suite_arg" ] || die "no such file in the working tree: $suite_arg"
-# A symlink is refused rather than resolved: what it points at may be outside git, and the negative
-# control must be the working tree's committed-or-edited file, not something it reaches.
-[ -L "$suite_arg" ] && die "$suite_arg is a symlink; name the file it points at"
-TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git checkout: $PWD"
-TOP=$(CDPATH= cd "$TOP" && pwd -P) || die "cannot resolve the checkout root: $TOP"
-# Split with parameter expansion, and read the resolved directory back through a trailing `x`: a
-# command substitution strips trailing newlines, which a git filename may end in, and would then
-# name a different file than the one checked above.
-suite_dir=$(CDPATH= cd "${suite_arg%/*}/" && pwd -P && printf x) || die "cannot resolve: $suite_arg"
-suite_dir=${suite_dir%x}
-suite_dir=${suite_dir%$'\n'}
-suite_abs="$suite_dir/${suite_arg##*/}"
-# A suite inside a nested repository (a submodule, say) belongs to that repository: the base
-# worktree of this one would hold an empty directory there, and the suite would fail on the base
-# for want of its neighbours -- a negative control that proves nothing. Run it from inside.
-suite_top=$(git -C "$suite_dir" rev-parse --show-toplevel 2>/dev/null) \
-  && suite_top=$(CDPATH= cd "$suite_top" && pwd -P) || suite_top=
-if [ -n "$suite_top" ] && [ "$suite_top" != "$TOP" ]; then
-  die "$suite_arg is inside the nested repository $suite_top (a submodule?); run the helper from inside it"
-fi
-case "$suite_abs" in
-"$TOP"/*) rel=${suite_abs#"$TOP"/} ;;
-*) die "$suite_arg is not inside this checkout ($TOP)" ;;
-esac
-# Git's own directory is not the working tree: installing a path through `.git` would replace the
-# base worktree's `.git` file and leave a checkout git no longer recognizes.
-case "/$rel/" in */.git/*) die "$rel is inside a .git directory, not the working tree" ;; esac
+# Whole seconds, checked before anything is allocated, like the grace below; 0 is no timeout.
+case "$TIMEOUT" in '' | *[!0-9]*) die "the timeout must be whole seconds (--timeout, RUN_AGAINST_BASE_TIMEOUT): $TIMEOUT" ;; esac
+TIMEOUT=$((10#$TIMEOUT))
+
+TOP=
+# resolve <path>: sets R_ABS and R_REL for a regular working-tree file of this checkout, or dies.
+# The suite, an --also file and a --mutate file are all named this way, and all refused the same
+# ways.
+resolve() {
+  local arg=$1 dir top
+  # A relative path gets a `./`, so a name like `-check.sh` is never read as an option by
+  # dirname, basename or cd.
+  case "$arg" in /*) ;; *) arg="./$arg" ;; esac
+  [ -f "$arg" ] || die "no such file in the working tree: $arg"
+  # A symlink is refused rather than resolved: what it points at may be outside git, and the
+  # negative control must be the working tree's committed-or-edited file, not something it
+  # reaches.
+  [ -L "$arg" ] && die "$arg is a symlink; name the file it points at"
+  if [ -z "$TOP" ]; then
+    TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git checkout: $PWD"
+    TOP=$(CDPATH= cd "$TOP" && pwd -P) || die "cannot resolve the checkout root: $TOP"
+  fi
+  # Split with parameter expansion, and read the resolved directory back through a trailing `x`:
+  # a command substitution strips trailing newlines, which a git filename may end in, and would
+  # then name a different file than the one checked above.
+  dir=$(CDPATH= cd "${arg%/*}/" && pwd -P && printf x) || die "cannot resolve: $arg"
+  dir=${dir%x}
+  dir=${dir%$'\n'}
+  R_ABS="$dir/${arg##*/}"
+  # A file inside a nested repository (a submodule, say) belongs to that repository: the base
+  # worktree of this one would hold an empty directory there, and the suite would fail on the
+  # base for want of its neighbours -- a negative control that proves nothing. Run it from inside.
+  top=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) \
+    && top=$(CDPATH= cd "$top" && pwd -P) || top=
+  if [ -n "$top" ] && [ "$top" != "$TOP" ]; then
+    die "$arg is inside the nested repository $top (a submodule?); run the helper from inside it"
+  fi
+  case "$R_ABS" in
+  "$TOP"/*) R_REL=${R_ABS#"$TOP"/} ;;
+  *) die "$arg is not inside this checkout ($TOP)" ;;
+  esac
+  # Git's own directory is not the working tree: installing a path through `.git` would replace
+  # the base worktree's `.git` file and leave a checkout git no longer recognizes.
+  case "/$R_REL/" in */.git/*) die "$R_REL is inside a .git directory, not the working tree" ;; esac
+}
+resolve "$suite_arg"
+suite_abs=$R_ABS
+rel=$R_REL
+ALSO_ABS=()
+ALSO_REL=()
+i=0
+while [ "$i" -lt "${#ALSO_ARGS[@]}" ]; do
+  resolve "${ALSO_ARGS[$i]}"
+  ALSO_ABS+=("$R_ABS")
+  ALSO_REL+=("$R_REL")
+  i=$((i + 1))
+done
+MUT_REL=()
+i=0
+while [ "$i" -lt "${#MUT_ARGS[@]}" ]; do
+  resolve "${MUT_ARGS[$i]}"
+  MUT_REL+=("$R_REL")
+  i=$((i + 1))
+done
 case "$rel" in
 *.py) runner=python3 ;;
 *)
@@ -142,7 +223,22 @@ elif [ -n "$interp" ] && [ -n "${sb_path+set}" ]; then
   PATH=$sb_path command -v "$interp" >/dev/null 2>&1 \
     || die "$rel needs $interp, which is not on the PATH its shebang sets ($sb_path); it would never run"
 fi
-sha=$(git -C "$TOP" rev-parse --verify --quiet "$base^{commit}") || die "no such commit: $base"
+SNAPSHOT=
+if [ -z "$base" ] && [ "${#MUT_REL[@]}" -gt 0 ]; then
+  SNAPSHOT=1
+  # A mutant is of the change: the throwaway worktree is the working tree as it stands, tracked
+  # files staged or not, and HEAD when nothing differs from it. `git stash create` writes the
+  # commit object and nothing else -- no ref, no reflog, no change to the tree -- and is given an
+  # identity of its own, since a runner with no user.name would otherwise refuse to write it.
+  sha=$(git -C "$TOP" -c user.name=run-against-base -c user.email=run-against-base@invalid \
+    stash create 2>/dev/null) || die "could not snapshot the working tree"
+  [ -n "$sha" ] || sha=$(git -C "$TOP" rev-parse --verify --quiet 'HEAD^{commit}') \
+    || die "the working tree has no commit to snapshot"
+  base="the working tree"
+else
+  base=${base:-origin/main}
+  sha=$(git -C "$TOP" rev-parse --verify --quiet "$base^{commit}") || die "no such commit: $base"
+fi
 
 # Whole seconds, checked before anything is allocated: the cleanup does integer arithmetic on it,
 # and an expansion error inside the EXIT trap would leave the suite and its worktree behind.
@@ -256,31 +352,73 @@ fi
 # Submodules are not checked out in the base worktree. One on the suite's own path is refused
 # below; one elsewhere cannot be judged from here, so the result line names them instead.
 uninit_subs=$(git -C "$WT" ls-files -s 2>/dev/null | awk '$1 == "160000" { n++ } END { print n + 0 }')
-# The suite's path is installed one component at a time, and at each one whatever the base has
-# there -- a symlink, a file, a directory where the suite now is -- is replaced, never followed:
-# the working tree's shape wins, so nothing is created or written outside the worktree. (`rel`
-# came from a `pwd -P`, so every component above the suite is a real directory in the working
-# tree too.)
-dest=$WT
-rest=$rel
-while case "$rest" in */*) true ;; *) false ;; esac do
-  dest="$dest/${rest%%/*}"
-  rest=${rest#*/}
-  # A submodule in the base is checked out as an empty directory: the suite would fail there for
-  # want of neighbours the base does have, which is a false result, not a negative control.
-  case "$(git -C "$TOP" ls-tree "$sha" -- "${dest#"$WT"/}" 2>/dev/null)" in
-  160000\ *) die "${dest#"$WT"/} is a submodule in $base; run the helper inside that repository" ;;
-  esac
-  if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -d "$dest" ]; }; then
-    rm -f "$dest" || die "cannot replace ${dest#"$WT"/} in the base worktree"
-  fi
-  [ -d "$dest" ] || mkdir "$dest" || die "cannot create ${dest#"$WT"/} in the base worktree"
+# install <abs> <rel>: the working tree's file at <rel>, written into the base worktree. The path
+# is installed one component at a time, and at each one whatever the base has there -- a symlink,
+# a file, a directory where the file now is -- is replaced, never followed: the working tree's
+# shape wins, so nothing is created or written outside the worktree. (`rel` came from a `pwd -P`,
+# so every component above the file is a real directory in the working tree too.)
+install() {
+  local dest=$WT rest=$2
+  while case "$rest" in */*) true ;; *) false ;; esac do
+    dest="$dest/${rest%%/*}"
+    rest=${rest#*/}
+    # A submodule in the base is checked out as an empty directory: the suite would fail there
+    # for want of neighbours the base does have, which is a false result, not a negative control.
+    case "$(git -C "$TOP" ls-tree "$sha" -- "${dest#"$WT"/}" 2>/dev/null)" in
+    160000\ *) die "${dest#"$WT"/} is a submodule in $base; run the helper inside that repository" ;;
+    esac
+    if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -d "$dest" ]; }; then
+      rm -f "$dest" || die "cannot replace ${dest#"$WT"/} in the base worktree"
+    fi
+    [ -d "$dest" ] || mkdir "$dest" || die "cannot create ${dest#"$WT"/} in the base worktree"
+  done
+  dest="$dest/$rest"
+  if [ -L "$dest" ] || [ -e "$dest" ]; then rm -rf "$dest" || die "cannot replace $2 in the base worktree"; fi
+  cp -p "$1" "$dest" || die "cannot copy $2 into the base worktree"
+}
+install "$suite_abs" "$rel"
+i=0
+while [ "$i" -lt "${#ALSO_REL[@]}" ]; do
+  install "${ALSO_ABS[$i]}" "${ALSO_REL[$i]}"
+  i=$((i + 1))
 done
-dest="$dest/$rest"
-if [ -L "$dest" ] || [ -e "$dest" ]; then rm -rf "$dest" || die "cannot replace $rel in the base worktree"; fi
-cp -p "$suite_abs" "$dest" || die "cannot copy $rel into the base worktree"
+# The mutations, after every copy, so one may name a carried file. Each rewrites the file through
+# its own inode (mode kept) and must change it: an expression that matched nothing would leave a
+# "mutant" identical to the code it claims to break, and its passing suite would read as the
+# cases being blind to the mutation -- a verdict about nothing.
+i=0
+while [ "$i" -lt "${#MUT_REL[@]}" ]; do
+  target="$WT/${MUT_REL[$i]}"
+  # resolve() found the file in the live tree, so a run's tree without it is a snapshot that
+  # leaves untracked files out, or a base that predates the file: either way --also is the cure.
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    if [ -n "$SNAPSHOT" ]; then
+      die "${MUT_REL[$i]} is untracked, and the working-tree snapshot holds tracked files only: there is nothing there to mutate (carry it with --also ${MUT_REL[$i]} as well)"
+    fi
+    die "${MUT_REL[$i]} is not in $base: there is nothing there to mutate (--also ${MUT_REL[$i]} carries the working tree's copy)"
+  fi
+  { [ -f "$target" ] && [ ! -L "$target" ]; } \
+    || die "${MUT_REL[$i]} is not a regular file in $base: there is nothing there to mutate"
+  sed -e "${MUT_EXPRS[$i]}" "$target" >"$SCRATCH/mutant" \
+    || die "sed refused the mutation of ${MUT_REL[$i]}: ${MUT_EXPRS[$i]}"
+  cmp -s "$target" "$SCRATCH/mutant" \
+    && die "the mutation '${MUT_EXPRS[$i]}' changed nothing in ${MUT_REL[$i]}: that is not a mutant"
+  cat "$SCRATCH/mutant" >"$target" || die "cannot write the mutant of ${MUT_REL[$i]}"
+  i=$((i + 1))
+done
 
 say "$rel (working tree) against $base ($(git -C "$TOP" rev-parse --short "$sha"))"
+i=0
+while [ "$i" -lt "${#ALSO_REL[@]}" ]; do
+  say "also: ${ALSO_REL[$i]} (working tree)"
+  i=$((i + 1))
+done
+i=0
+while [ "$i" -lt "${#MUT_REL[@]}" ]; do
+  say "mutant: ${MUT_REL[$i]}: ${MUT_EXPRS[$i]}"
+  i=$((i + 1))
+done
+[ "$TIMEOUT" -eq 0 ] || say "timeout: ${TIMEOUT}s"
 # The suite runs in the background so the INT/TERM traps fire at once rather than after it
 # returns; its output goes through a fifo to tee, which both shows it live and keeps it for the
 # pass/fail line (a `| tee` would hide the suite's exit status behind tee's under `wait`).
@@ -311,8 +449,30 @@ set +m
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 [ -z "$pending" ] || exit "$pending"
-wait "$child"
-rc=$?
+# The timeout polls the suite's state rather than arming a watchdog process: a watchdog's own
+# sleep would outlive it when it is stopped early, and it is one more process for every exit path
+# to account for. The poll counts its own sleeps, so it fires no earlier than the timeout.
+timed_out=
+if [ "$TIMEOUT" -gt 0 ]; then
+  polls=0
+  while live "$child"; do
+    if [ "$polls" -ge $((TIMEOUT * 5)) ]; then
+      timed_out=1
+      break
+    fi
+    sleep 0.2
+    polls=$((polls + 1))
+  done
+fi
+if [ -n "$timed_out" ]; then
+  # The hang is the result: the group goes the way the cleanup stops it, TERM then KILL after
+  # the grace, and the run reports the base as failing rather than as a run that never happened.
+  stop_group
+  rc=124
+else
+  wait "$child"
+  rc=$?
+fi
 if [ -e "$SCRATCH/execfail" ]; then
   stop_group
   child=
@@ -337,11 +497,17 @@ teepid=
 
 tally=$(grep -E '[0-9]+ passed, [0-9]+ failed' "$LOG" | tail -n 1)
 [ -n "$tally" ] || tally=$(grep -v '^[[:space:]]*$' "$LOG" | tail -n 1)
-say "exit $rc on $base: ${tally:-(no output)}"
+if [ -n "$timed_out" ]; then
+  say "exit 124 on $base: timed out after ${TIMEOUT}s, and its process group was stopped -- a hang is a failing run, not a refusal${tally:+ (last tally: $tally)}"
+else
+  say "exit $rc on $base: ${tally:-(no output)}"
+fi
 [ "$uninit_subs" -eq 0 ] \
   || say "note: $base has $uninit_subs submodule(s), not checked out here; a failure that reaches into one is not the base's"
 # 125 is this helper's own "could not run it"; a suite that returns it failed, and says so as 1.
 [ "$rc" -eq 125 ] && rc=1
+# ...and with a timeout armed, 124 is the helper's "it hung"; the suite's own 124 exits 1 the same way.
+[ -z "$timed_out" ] && [ "$TIMEOUT" -gt 0 ] && [ "$rc" -eq 124 ] && rc=1
 exit "$rc"
 exit "$?"
 }

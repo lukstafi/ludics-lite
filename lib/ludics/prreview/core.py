@@ -32,11 +32,16 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, NoReturn
+from decimal import Decimal
+from typing import TYPE_CHECKING, Literal, NoReturn
 
 from ludics import cli, proc
+
+if TYPE_CHECKING:
+    # budget.py imports this module; the session holds one at run time, typed here only.
+    from ludics.prreview.budget import Budget
 
 PROG = "pr-review.sh"
 
@@ -137,9 +142,26 @@ def gateway_failure(text: str) -> bool:
 
 _HTTP_4XX = re.compile(r"HTTP 4[0-9][0-9]")
 
+# The quota reader's fail-closed allowlist (budget.py's BOUNDARY states it).
+_QUOTA_MARKERS = (
+    "API rate limit exceeded",
+    "API rate limit already exceeded",
+    "secondary rate limit",
+    "(HTTP 429)",
+)
+
+
+def quota_failure(text: str) -> bool:
+    """``quota_failure``: does this text say GitHub's quota refused the call? Then it is no answer
+    about what was asked (the polling budget, budget.py)."""
+    return any(marker in text for marker in _QUOTA_MARKERS)
+
 
 def api_rejection(text: str) -> bool:
-    """``api_rejection``: an explicit 4xx, i.e. the API ANSWERED the request."""
+    """``api_rejection``: an explicit 4xx, i.e. the API ANSWERED the request. A quota refusal (a
+    403 or 429) is not an answer about the request either."""
+    if quota_failure(text):
+        return False
     return _HTTP_4XX.search(text) is not None
 
 
@@ -370,6 +392,7 @@ class GhSession:
         *,
         run: Callable[[str, Sequence[str]], proc.Completed] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        budget: "Budget | None" = None,
     ) -> None:
         self.config = config
         self._run: Callable[[str, Sequence[str]], proc.Completed] = (
@@ -377,6 +400,9 @@ class GhSession:
         )
         self._sleep = sleep
         self._err_line = ""
+        # The polling budget (budget.py): every own call passes its hold's gate. None in the unit
+        # tests that drive the retry policy alone.
+        self.budget = budget
 
     def err_line(self) -> str:
         return self._err_line
@@ -384,26 +410,45 @@ class GhSession:
     def retry(self, mode: Mode, args: Sequence[str]) -> GhResult:
         """``gh_retry <mode> <args>`` for THIS script's own arguments. gh refusing one of them
         raises ``GhRefusedOwn`` (exit 2 for the whole command)."""
-        result = self._retry(mode, args, "own")
+        result = self._retry(mode, args, "own", budgeted=True)
         match result:
             case GhArgsRefused():
                 raise AssertionError("an own call's refusal raises, it is never returned")
             case GhOk() | GhFailed() | GhUnanswered():
                 return result
 
-    def retry_caller(self, mode: Mode, args: Sequence[str], *, listed: bool) -> GhCallerResult:
+    def retry_caller(
+        self, mode: Mode, args: Sequence[str], *, listed: bool, budgeted: bool = False
+    ) -> GhCallerResult:
         """``gh_retry`` with ``GH_RETRY_CALLER_ARGS`` set: a CALLER's arguments (``cmd_retry``).
         ``listed`` (the command passed ``gh_api_only_command``): a refusal of the arguments
-        returns ``GhArgsRefused`` on the first attempt. Unlisted: stderr is not read as gh's."""
-        return self._retry(mode, args, "listed" if listed else "unlisted")
+        returns ``GhArgsRefused`` on the first attempt. Unlisted: stderr is not read as gh's.
+        ``budgeted``: the call is still this script's own (merge's, with a caller's ``gh pr merge``
+        flags forwarded), so it passes the polling budget; a ``retry`` caller's is outside it."""
+        return self._retry(mode, args, "listed" if listed else "unlisted", budgeted=budgeted)
 
     def _retry(
-        self, mode: Mode, args: Sequence[str], whose: Literal["own", "listed", "unlisted"]
+        self,
+        mode: Mode,
+        args: Sequence[str],
+        whose: Literal["own", "listed", "unlisted"],
+        *,
+        budgeted: bool,
     ) -> GhCallerResult:
         attempts = self.config.api_attempts
         delay = self.config.api_backoff
         attempt = 1
+        quota_unheld = 0
+        budget = self.budget if budgeted else None
         while True:
+            # The polling budget: an own call goes to github.com or not at all, and no call while a
+            # hold stands.
+            if budget is not None:
+                budget.require_github()
+                held = budget.gate(mode)
+                if held is not None:
+                    self._err_line = held
+                    return GhUnanswered()
             done = self._run("gh", args)
             err = proc.substitution(done.stderr)
             out = proc.substitution(done.stdout)
@@ -418,6 +463,23 @@ class GhSession:
                 if whose == "listed":
                     return GhArgsRefused()
                 raise GhRefusedOwn(refused_own_message(args, first))
+            # A quota refusal is no answer about what was asked, so it is 3 under both policies, and
+            # it is not retried on the backoff below: it sets the hold instead. An observer's read
+            # waits that hold out at the gate above and repeats; a read the probe found no hold for
+            # gets one more try, and a write is never repeated.
+            if quota_failure(first):
+                if budget is not None:
+                    unrecorded = budget.quota_hit(args)
+                    if unrecorded is not None:
+                        self._err_line = unrecorded
+                        return GhUnanswered()
+                    if mode == "read" and budget.waiting():
+                        if budget.hold_read() is not None:
+                            continue
+                        quota_unheld += 1
+                        if quota_unheld < 2:
+                            continue
+                return GhUnanswered()
             # A fixed GraphQL answer is read FIRST, under both policies: the substring scans
             # below would match a marker the message only quotes.
             if graphql_fixed_answer(first):
@@ -482,6 +544,33 @@ class PrTarget:
     num: str
 
 
+# A PR is addressed by a repository and a number, and the number alone names one PR in every
+# repository there is. So the repository is either SPELLED OUT in the invocation — an
+# owner/name#<n> argument, --repo, REPO= — or the call is refused. Resolution happens after the PR
+# argument is parsed, because that argument may carry the repo itself.
+#
+# Two other sources stood here and both are gone (ludics-lite#92). The cwd was trusted outright,
+# and cached: a bare `reply 7` typed from a shell sitting in another project's worktree posted into
+# whatever PR 7 is over there. The per-PR cache remembered a repo by NUMBER, across checkouts and
+# across sessions, so a `reply 7` meant for repo B resolved to the repo A that some earlier call
+# had named for 7.
+#
+# Both were verified against `repos/<repo>/pulls/<n>` before use, or could have been, and this is
+# the half worth writing down because verification is the fix that looks right: that read answers
+# "this repository has a seventh PR", not "this is the PR you meant". Every active repository has a
+# PR 7. So on exactly the invocations these guesses fail on — a worktree of another project, a
+# stale entry from yesterday's PR — the check passes and the write lands on a stranger's review
+# thread, now with a verification behind it. A claim that cannot fail, standing in for a
+# safeguard, is worse than no safeguard. Nor can any other read stand in: what both sources are
+# guesses about is INTENT, and the API has nothing to say about that.
+#
+# So there is no inference left, as ludics-lite#74 (PR #79) left none for `retry run watch` after a
+# background shell in a sibling worktree turned a wrong-target read into a failed-run verdict. The
+# cost is one `owner/name#<n>` per call, which is what the skill's instructions have always told
+# callers to write. What it buys is an invariant with no exception to remember: no command
+# addresses a repository that its invocation did not name. `repo_from_cwd` survives for `base`
+# alone, which resolves a repo and a BRANCH — a name the API can actually be asked about — rather
+# than a bare number every repository answers to.
 def resolve_repo(num: str, repo: str) -> None:
     """``resolve_repo``: a PR number with no repository named anywhere is refused (#92)."""
     if repo:
@@ -511,18 +600,36 @@ def pr_arg(arg: str, repo: str) -> PrTarget:
 
 def repo_from_cwd(
     run: Callable[[str, Sequence[str]], proc.Completed] = proc.run_tool,
+    budget: "Budget | None" = None,
 ) -> str | None:
     """``repo_from_cwd``, for ``base`` alone: ``gh repo view`` (it honours gh-resolved), then the
     origin remote, which answers locally when GraphQL is down. None when neither names one.
 
+    ``gh repo view`` is not the session's call, so it passes the polling budget's gate itself. A
+    hold, or a quota refusal of the view, is exit 3 and never a reason to fall back to the remote,
+    which in a fork names the fork and not the repository gh resolved.
+
     One divergence, on purpose: the shell's ``gh ... | grep .`` under pipefail printed gh's
     nonempty lines even when gh then FAILED, and fell through to git as well; here a failed gh
     contributes nothing."""
+    if budget is not None:
+        budget.require_github()
+        held = budget.gate("read")
+        if held is not None:
+            fail(3, f"could not resolve the repository from the checkout: {held}.",
+                 "Pass it as owner/name, or wait for the hold.")
     done = run("gh", ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
     if done.rc == 0:
         lines = [line for line in done.stdout.split("\n") if line]
         if lines:
             return "\n".join(lines)
+    # Refused on quota, it is a hold like any other call's, and still no reason for the remote.
+    if quota_failure(_first_line(done.stderr)):
+        unrecorded = budget.quota_hit(["repo", "view"]) if budget is not None else None
+        if unrecorded is not None:
+            fail(3, f"could not resolve the repository from the checkout: {unrecorded}.")
+        fail(3, "could not resolve the repository from the checkout: gh repo view was refused on quota.",
+             "Pass it as owner/name, or wait for the hold.")
     done = run("git", ["remote", "get-url", "origin"])
     if done.rc != 0:
         return None
@@ -592,12 +699,40 @@ def _jq_doc(doc: Json) -> Json:
             return doc
 
 
-def json_stream(text: str) -> list[Json] | None:
-    """The documents of a concatenated JSON stream (what ``gh --paginate`` prints, one per page),
-    as ``jq -s`` reads them; None when any of it does not parse, a lone high-surrogate escape
-    included (see _jq_string)."""
-    decoder = json.JSONDecoder()
-    docs: list[Json] = []
+class JqLiteral(float):
+    """A number read with ``literals=True``: its value, and the text jq 1.8 prints for it while no
+    arithmetic has touched it -- the payload's own literal in decNumber's canonical spelling, which
+    is ``str(Decimal(...))`` exactly (``1E+2`` stays ``1E+2``, ``3.50`` keeps its zero, ``-0`` its
+    sign, ``1.5e3`` reads ``1.5E+3``). Arithmetic on one yields a plain float, as jq's yields a
+    double. ``jqsem.number_text`` and ``jqsem.tojson`` print the text."""
+
+    __slots__ = ("text",)
+    text: str
+
+    def __new__(cls, literal: str) -> "JqLiteral":
+        self = super().__new__(cls, literal)
+        self.text = str(Decimal(literal))
+        return self
+
+
+def _literal_int(literal: str) -> int | float:
+    # An integer literal prints as Python prints the int, save -0, whose sign jq keeps.
+    return JqLiteral(literal) if literal == "-0" else int(literal)
+
+
+class JsonStreamError(ValueError):
+    """json_docs: the stream stops parsing here; the documents before were yielded."""
+
+
+def json_docs(text: str, *, literals: bool = False) -> Iterator[Json]:
+    """The documents of a concatenated JSON stream one by one, as jq reads them: each is yielded
+    before the next is parsed, and a part that does not parse (a lone high-surrogate escape
+    included, see _jq_string) raises JsonStreamError there, so a caller can act on the documents
+    before the cut as ``jq`` does. With ``literals``, every non-integer number (and -0) is a
+    JqLiteral, printed as the payload spelled it."""
+    decoder = (
+        json.JSONDecoder(parse_float=JqLiteral, parse_int=_literal_int) if literals else json.JSONDecoder()
+    )
     pos = 0
     length = len(text)
     surrogates = _SURROGATE_SOURCE.search(text) is not None
@@ -605,15 +740,27 @@ def json_stream(text: str) -> list[Json] | None:
         while pos < length and text[pos] in " \t\n\r":
             pos += 1
         if pos >= length:
-            return docs
+            return
         try:
             doc, pos = decoder.raw_decode(text, pos)
-        except ValueError:
-            return None
-        try:
-            docs.append(_jq_doc(doc) if surrogates else doc)
-        except _Unparsed:
-            return None
+        except ValueError as e:
+            raise JsonStreamError(str(e)) from e
+        if surrogates:
+            try:
+                doc = _jq_doc(doc)
+            except _Unparsed as e:
+                raise JsonStreamError("a lone high surrogate") from e
+        yield doc
+
+
+def json_stream(text: str) -> list[Json] | None:
+    """The documents of a concatenated JSON stream (what ``gh --paginate`` prints, one per page),
+    as ``jq -s`` reads them; None when any of it does not parse, a lone high-surrogate escape
+    included (see _jq_string)."""
+    try:
+        return list(json_docs(text))
+    except JsonStreamError:
+        return None
 
 
 def api_list(session: GhSession, path: str, repo: str) -> ListResult:

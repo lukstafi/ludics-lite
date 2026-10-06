@@ -39,7 +39,7 @@ from ludics.prreview.core import (
     warn,
 )
 from ludics.prreview.drift import warn_base_drift
-from ludics.prreview.clock import Clock, FuncClock
+from ludics.prreview.clock import Clock, clock_from_env
 from ludics.prreview.gate import Gate, GateConfig, load_gate_config
 from ludics.prreview.threads import merge_threads_gate
 
@@ -233,6 +233,11 @@ class Merge:
         """The gate's verdict, and every refusal the merge makes on it."""
         repo, pr, opts, gate = self.repo, self.num, self.opts, self.gate
         rc = gate.check(pr, opts.wait_for, waive=bool(opts.override))
+        # The gate's verdict is about the moment of its last round. Nothing after it waits a quota
+        # hold out: a read here during one is 3, so the merge never lands on a verdict the wait made
+        # old (the polling budget, budget.py).
+        if self.session.budget is not None:
+            self.session.budget.wait_until = None
         waived = gate.check_waived + gate.run_waived
         match rc:
             case 1:
@@ -345,7 +350,8 @@ class Merge:
                 continue
             args = ["pr", "merge", pr, "--repo", repo, "--match-head-commit", gate.check_sha, *opts.gh_args]
             if opts.forwarded:
-                result = self.session.retry_caller("write", args, listed=False)
+                # Still this script's own call, so the polling budget gates it.
+                result = self.session.retry_caller("write", args, listed=False, budgeted=True)
             else:
                 result = self.session.retry("write", args)
             match result:
@@ -479,4 +485,8 @@ def run(session: GhSession, args: list[str]) -> int:
     config = load_gate_config(os.environ)
     opts = parse(args, config)
     target = pr_arg(opts.pr, session.config.repo)
-    return Merge(session, target.repo, target.num, config, FuncClock(), opts).run()
+    # A --wait is the PR's build observer from its first read on, the body's included (the polling
+    # budget, budget.py).
+    if session.budget is not None:
+        session.budget.observe("build", opts.wait_for, target.repo, target.num)
+    return Merge(session, target.repo, target.num, config, clock_from_env(os.environ), opts).run()

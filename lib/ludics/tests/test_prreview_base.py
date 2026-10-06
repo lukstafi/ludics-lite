@@ -25,6 +25,7 @@ from ludics.prreview.workflow_yaml import glob_ere, paths_ignore_covers, workflo
 from ludics.prreview.checkruns import newest_first
 from ludics.prreview.shtext import encode_ref, tab_fields
 from ludics.prreview.clock import FuncClock
+from ludics.prreview.budget import Budget
 from ludics.prreview.core import Config, GhRefusedOwn, GhSession
 
 LIB = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
@@ -172,13 +173,14 @@ class Folding(unittest.TestCase):
 # --- in process: the gh calls answered by endpoint, on a fake clock ----------------------------
 
 
-type Answer = str | tuple[int, str]
+type Answer = str | tuple[int, str] | list[str]
 
 
 class Endpoints:
     """A gh stand-in for GhSession: answers by the endpoint (the first argument after ``api`` that
     is not an option or an option's value), applies a ``--jq`` filter with jq as gh does, and
-    records every endpoint asked."""
+    records every endpoint asked. A list answers its items one call at a time, its last from then on:
+    a feed that changes between rounds."""
 
     def __init__(self, answers: dict[str, Answer]) -> None:
         self.answers = answers
@@ -203,6 +205,8 @@ class Endpoints:
             endpoint = arg
         self.asked.append(endpoint)
         answer = self.answers.get(endpoint)
+        if isinstance(answer, list):
+            answer = answer[min(self.asked.count(endpoint), len(answer)) - 1]
         if answer is None:
             return proc.Completed(1, "", f"gh: no fixture for {endpoint} (HTTP 404)\n")
         if isinstance(answer, str):
@@ -224,6 +228,22 @@ class FakeClock(FuncClock):
     def _sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
         self.t += seconds
+
+
+class _AsClock:
+    """A FakeClock as the budget's Clock protocol takes one."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        self.clock = clock
+
+    def time(self) -> float:
+        return self.clock.time()
+
+    def now(self) -> int:
+        return self.clock.now()
+
+    def sleep(self, seconds: float, /) -> None:
+        self.clock.sleep(seconds)
 
 
 def runs(*items: dict[str, object]) -> str:
@@ -249,13 +269,16 @@ KNOBS = {"SHIP_PR_BASE_ABSENT_GRACE": "300", "SHIP_PR_CHECKS_INTERVAL": "60",
 
 def base_run(answers: dict[str, Answer], args: list[str], *, clock: FakeClock | None = None,
              gate: base.GateRunner | None = None,
-             knobs: dict[str, str] | None = None) -> tuple[int, str, str, Endpoints]:
+             knobs: dict[str, str] | None = None,
+             state: str = "") -> tuple[int, str, str, Endpoints]:
     gh = Endpoints(answers)
-    session = GhSession(config(), run=gh, sleep=lambda _s: None)
+    clock = clock or FakeClock()
+    session = GhSession(config(), run=gh, sleep=lambda _s: None,
+                        budget=Budget(state, _AsClock(clock)) if state else None)
     out, err = io.StringIO(), io.StringIO()
     env = dict(KNOBS, **(knobs or {}))
     with redirect_stdout(out), redirect_stderr(err):
-        rc = cli.main_guard("pr-review.sh", lambda a: base.run(session, a, clock=clock or FakeClock(),
+        rc = cli.main_guard("pr-review.sh", lambda a: base.run(session, a, clock=clock,
                                                                 gate=gate, env=env), args)
     return rc, out.getvalue(), err.getvalue(), gh
 
@@ -314,6 +337,224 @@ class WaitLoop(unittest.TestCase):
         self.assertIn("NO VERDICT for the tip", out)
         self.assertEqual(clock.slept, [60, 10], "the last sleep is what is left of the ceiling")
 
+    def test_a_stale_page_between_rounds_is_read_again(self) -> None:
+        """ludics-lite#550: round one sees the tip's run in flight, round two's page holds only a
+        weeks-old green, round three the tip's own green. Round two is not settled on."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+        fly = at(C, 9, "2026-10-05T10:30:00Z", status="in_progress", conclusion=None)
+        prev = at(B, 8, "2026-10-05T10:00:00Z")
+        stale = at(A, 4, "2026-09-24T09:00:00Z")
+        answers = world(C, "", **{
+            f"repos/o/r/compare/{A}...{C}?per_page=20": json.dumps(
+                {"total_commits": 1, "behind_by": 0, "commits": [{"sha": C, "parents": [{"sha": A}]}]}),
+            f"repos/o/r/commits/{C}?per_page=100": json.dumps({"files": [{"filename": "src/x.ml"}]})})
+        answers["repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"] = [
+            runs(fly, prev), runs(stale), runs(at(C, 9, "2026-10-05T10:30:00Z"), prev)]
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock,
+                                 knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out, f"o/r main: green (tip {C[:8]})\n  green    ci — success at {C[:8]}\n")
+        self.assertEqual(len(clock.slept), 2, "three rounds")
+
+    def test_a_judged_run_older_than_an_earlier_rounds_contradicts_it(self) -> None:
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+        answers = world(C, "")
+        answers["repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"] = [
+            runs(at(B, 9, "2026-10-05T10:30:00Z", status="queued", conclusion=None),
+                 at(A, 8, "2026-10-05T10:00:00Z")),
+            runs(at(H, 4, "2026-09-24T09:00:00Z"))]
+        rc, out, _, _ = base_run(answers, ["main", "--wait=200"], knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 4, out)
+        self.assertIn("(this round's runs page contradicts an earlier round's: ci's newest judged run is"
+                      f" run 4 at {H[:8]}, older than run 8 at {A[:8]}, which an earlier round judged by"
+                      " — a stale read", out)
+        # The same rows, at the same instant, re-read: the same judged run, and no contradiction.
+        answers["repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"] = [
+            runs(at(B, 9, "2026-10-05T10:30:00Z", status="queued", conclusion=None),
+                 at(A, 8, "2026-10-05T10:00:00Z"))]
+        rc, out, _, _ = base_run(answers, ["main", "--wait=200"], knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertNotIn("contradicts", out)
+
+    def test_a_tip_run_gone_from_the_page_alone_contradicts_it(self) -> None:
+        """ludics-lite#550, the tip-run half on its own: round two's page drops only the tip's run
+        in flight while its newest judged run stays the same, so only the lost run tells the stale
+        page apart. Settled on, round two would be an absence green trailing the tip."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+        fly = at(C, 9, "2026-10-05T10:30:00Z", status="in_progress", conclusion=None)
+        prev = at(B, 8, "2026-10-05T10:00:00Z")
+        answers = world(C, "", **{
+            f"repos/o/r/compare/{B}...{C}?per_page=20": json.dumps(
+                {"total_commits": 1, "behind_by": 0, "commits": [{"sha": C, "parents": [{"sha": B}]}]}),
+            f"repos/o/r/commits/{C}?per_page=100": json.dumps({"files": [{"filename": "src/x.ml"}]})})
+        answers["repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"] = [
+            runs(fly, prev), runs(prev), runs(at(C, 9, "2026-10-05T10:30:00Z"), prev)]
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock,
+                                 knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out, f"o/r main: green (tip {C[:8]})\n  green    ci — success at {C[:8]}\n")
+        self.assertEqual(len(clock.slept), 2, "three rounds")
+
+    def test_a_page_with_no_judged_run_where_one_was_contradicts_it(self) -> None:
+        """ludics-lite#550, the empty half: a second workflow's page comes back empty after a round
+        that judged on it. Settled on as that workflow's absence, it would be a green that never
+        names it; its run in flight is a red."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+
+        def lint(*items: dict[str, object]) -> str:
+            return runs(*[dict(i, workflow_id=2, name="lint") for i in items])
+        answers = world(C, runs(at(C, 20, "2026-10-05T11:00:00Z")), **{
+            "repos/o/r/actions/workflows?per_page=100": json.dumps(
+                {"workflows": [{"id": 1, "name": "ci"}, {"id": 2, "name": "lint"}]}),
+            "repos/o/r/actions/workflows/2": json.dumps({"path": ".github/workflows/lint.yml"}),
+            f"repos/o/r/contents/.github/workflows/lint.yml?ref={C}": DOCS_IGNORED.replace(
+                "name: ci", "name: lint")})
+        answers["repos/o/r/actions/workflows/2/runs?branch=main&event=push&per_page=10"] = [
+            lint(at(B, 9, "2026-10-05T10:30:00Z", status="queued", conclusion=None),
+                 at(A, 8, "2026-10-05T10:00:00Z")),
+            lint(),
+            lint(at(B, 9, "2026-10-05T10:30:00Z", conclusion="failure"), at(A, 8, "2026-10-05T10:00:00Z"))]
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock,
+                                 knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"RED      lint — failure at {B[:8]}", out)
+        self.assertEqual(len(clock.slept), 2, "three rounds")
+
+    def test_a_rerun_of_a_judged_run_is_not_a_stale_page(self) -> None:
+        """A run an earlier round judged by, re-run (its ``run_attempt`` up) and the re-run
+        cancelled, leaves an older run the newest judged one. That is the branch's history moving,
+        not a stale page: the docs-only tip settles through paths-ignore as it would have on a
+        first read, rather than waiting out its ceiling. The re-run seen at its OLD attempt is
+        still a contradiction."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+
+        def lint(*items: dict[str, object]) -> str:
+            return runs(*[dict(i, workflow_id=2, name="lint") for i in items])
+        judged = at(B, 9, "2026-10-05T10:30:00Z", run_attempt=1)
+        rerun = at(B, 9, "2026-10-05T10:30:00Z", run_attempt=2, conclusion="cancelled")
+        prev = at(A, 8, "2026-10-05T10:00:00Z", run_attempt=1)
+        answers = world(C, "", **{
+            "repos/o/r/actions/workflows?per_page=100": json.dumps(
+                {"workflows": [{"id": 1, "name": "ci"}, {"id": 2, "name": "lint"}]}),
+            "repos/o/r/actions/workflows/2": json.dumps({"path": ".github/workflows/lint.yml"}),
+            f"repos/o/r/contents/.github/workflows/lint.yml?ref={C}": DOCS_IGNORED.replace(
+                "name: ci", "name: lint"),
+            "repos/o/r/actions/workflows/2/runs?branch=main&event=push&per_page=10": [
+                lint(at(C, 20, "2026-10-05T11:00:00Z", status="in_progress", conclusion=None)),
+                lint(at(C, 20, "2026-10-05T11:00:00Z"))],
+            f"repos/o/r/compare/{A}...{C}?per_page=20": json.dumps(
+                {"total_commits": 1, "behind_by": 0, "commits": [{"sha": C, "parents": [{"sha": A}]}]}),
+            f"repos/o/r/commits/{C}?per_page=100": json.dumps({"files": [{"filename": "docs/x.md"}]})})
+        page = "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"
+        answers[page] = [runs(judged, prev), runs(rerun, prev)]
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("contradicts", out)
+        self.assertIn(f"green    ci — success at {A[:8]}", out)
+        self.assertIn("paths-ignore of ci, so no run for it is coming", out)
+        self.assertEqual(len(clock.slept), 1, "two rounds")
+        # The same run at its earlier attempt, after its re-run was seen in flight: a stale page,
+        # which would otherwise settle on the absence grace.
+        running = dict(rerun, status="in_progress", conclusion=None)
+        answers[page] = [runs(judged, prev), runs(running, prev), runs(judged, prev)]
+        answers["repos/o/r/actions/workflows/2/runs?branch=main&event=push&per_page=10"] = [
+            lint(at(C, 20, "2026-10-05T11:00:00Z", status="in_progress", conclusion=None)),
+            lint(at(C, 20, "2026-10-05T11:00:00Z"))]
+        rc, out, _, _ = base_run(answers, ["main", "--wait=200"], knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 4, out)
+        self.assertIn(f"ci's run 9 at {B[:8]} reads at attempt 1, where an earlier round read attempt 2", out)
+
+    def test_a_deeper_page_staler_than_the_page_of_ten_keeps_the_ten(self) -> None:
+        """A full page of ten with no green row is read a hundred deep. When the deeper read is
+        the staler one (the tip's red run missing from it, an older green below), the page of ten
+        stands: its red is not traded for the green, and the round says it is a stale read."""
+        red: list[dict[str, object]] = [{"conclusion": "failure", "head_sha": C if i == 0 else A}
+                                        for i in range(10)]
+        older: list[dict[str, object]] = [{"conclusion": "failure", "head_sha": A} for _ in range(11)]
+        ten = runs(*red)
+        deeper = json.loads(runs(*older, {"conclusion": "success", "head_sha": B}))
+        for row in deeper["workflow_runs"]:
+            row["id"] += 1
+        answers = world(C, ten, **{
+            "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=100": json.dumps(deeper)})
+        rc, out, _, _ = base_run(answers, ["main"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"RED      ci — failure at {C[:8]}", out)
+        self.assertIn("ci's run 1000 on the page of ten is not on the deeper page", out)
+        # A deeper page holding every run of the ten reads as before: deeper.
+        fresh = json.loads(ten)
+        fresh["workflow_runs"] += deeper["workflow_runs"][10:]
+        answers["repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=100"] = json.dumps(fresh)
+        rc, out, _, _ = base_run(answers, ["main"])
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("deeper page", out)
+
+    def test_a_round_that_waited_a_quota_hold_out_is_read_again(self) -> None:
+        """A quota hold waited out between a round's reads makes its pages older than its end: a
+        red read before the hold, re-run green during it, is not the verdict. The round is read
+        again whole, as the checks gate reads its own."""
+        state = os.path.realpath(tempfile.mkdtemp(prefix="ludics-base-state."))
+        self.addCleanup(shutil.rmtree, state, True)
+        page = "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"
+        answers = world(C, "")
+        answers[page] = [runs({"conclusion": "failure", "head_sha": C, "id": 9, "run_attempt": 1}),
+                         runs({"conclusion": "success", "head_sha": C, "id": 9, "run_attempt": 2})]
+        gh = Endpoints(answers)
+        clock = FakeClock()
+        budget = Budget(state, _AsClock(clock))
+
+        def run(name: str, args: Sequence[str]) -> proc.Completed:
+            done = gh(name, args)
+            if page in args and gh.asked.count(page) == 1:
+                budget.waited = True  # the hold this read waited out
+            return done
+        session = GhSession(config(), run=run, sleep=lambda _s: None, budget=budget)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli.main_guard("pr-review.sh", lambda a: base.run(session, a, clock=clock, env=dict(KNOBS)),
+                                ["main", "--wait=900"])
+        self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
+        self.assertEqual(out.getvalue(), f"o/r main: green (tip {C[:8]})\n  green    ci — success at {C[:8]}\n")
+        self.assertIn("a quota hold was waited out inside this round's reads; reading the round again",
+                      err.getvalue())
+        self.assertEqual(gh.asked.count(page), 2)
+
+    def test_a_settle_on_absence_keeps_its_pages_and_only_the_newest(self) -> None:
+        state = os.path.realpath(tempfile.mkdtemp(prefix="ludics-base-state."))
+        self.addCleanup(shutil.rmtree, state, True)
+        pages = os.path.join(state, "base-pages")
+        os.makedirs(pages)
+        for i in range(base.KEPT_PAGES + 3):
+            with open(os.path.join(pages, f"{1_700_000_000 + i}.1.o~r.txt"), "w", encoding="utf-8") as f:
+                f.write("old\n")
+        with open(os.path.join(pages, "notes"), "w", encoding="utf-8") as f:
+            f.write("not ours\n")
+        page = runs({"conclusion": "success", "head_sha": A, "id": 77})
+        answers = world(C, page, **{
+            f"repos/o/r/compare/{A}...{C}?per_page=20": json.dumps(
+                {"total_commits": 1, "behind_by": 0, "commits": [{"sha": C, "parents": [{"sha": A}]}]}),
+            f"repos/o/r/commits/{C}?per_page=100": json.dumps({"files": [{"filename": "src/x.ml"}]})})
+        rc, out, err, _ = base_run(answers, ["main", "--wait=900"], state=state,
+                                   knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 0, out + err)
+        kept = sorted(n for n in os.listdir(pages) if n.endswith(".txt"))
+        self.assertEqual(len(kept), base.KEPT_PAGES, "the newest are kept")
+        self.assertIn("notes", os.listdir(pages), "a file not of this shape is left alone")
+        newest = os.path.join(pages, kept[-1])
+        self.assertIn(f"kept the runs pages it read in {newest} (ludics-lite#550)", err)
+        with open(newest, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("## repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10\n" + page, text)
+        self.assertIn(f"tip {C}", text)
+
     def test_an_unknown_read_is_exit_three_with_the_reason(self) -> None:
         answers = world(C, runs())
         answers["repos/o/r/actions/workflows?per_page=100"] = (1, "gh: Server Error (HTTP 500)\n")
@@ -359,6 +600,33 @@ class NamedSources(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn(f"o/r main: green (tip {C[:8]}; ci judged by PR #7's head run (roll-forward rule))", out)
         self.assertIn("(roll-forward rule): o/r#7 @eeeeeeee: green — 1 build checks passed", out)
+
+    def test_no_interim_green_on_a_round_that_contradicts_an_earlier_one(self) -> None:
+        """ludics-lite#550 under --interim (the gate's ``base --wait --interim``): round one reads an
+        older red beside the tip's run in flight, round two a stale page (and a stale deeper read)
+        that drops the red, round three the tip's own red. The interim is not taken on round two."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+        fly = at(C, 10, "2026-10-05T10:30:00Z", status="in_progress", conclusion=None)
+        red = at(B, 9, "2026-10-05T10:20:00Z", conclusion="failure")
+        prev = at(A, 8, "2026-10-05T10:00:00Z")
+        answers = pushless_world()
+        answers.update({
+            f"repos/o/r/contents/.github/workflows/ci.yml?ref={C}": DOCS_IGNORED,
+            "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10": [
+                runs(fly, red, prev), runs(fly, prev),
+                runs(at(C, 10, "2026-10-05T10:30:00Z", conclusion="failure"), red, prev)],
+            "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=100": runs(fly, prev),
+            "repos/o/r/actions/runs/10": json.dumps({"status": "in_progress"}),
+        })
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900", "--interim"], clock=clock,
+                                 gate=gate_stub("green", "o/r#7 @eeeeeeee: green — 1 build checks passed"),
+                                 knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("interim (tip", out)
+        self.assertIn(f"RED      ci — failure at {C[:8]}", out)
+        self.assertEqual(len(clock.slept), 2, "three rounds")
 
     def test_a_gate_verdict_outside_the_vocabulary_is_unknown(self) -> None:
         rc, _, err, _ = base_run(pushless_world(), ["main"], gate=gate_stub("superseded", "x"))
@@ -429,7 +697,8 @@ class EndToEnd(unittest.TestCase):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("LUDICS_BRIDGE", "SHIP_PR_"))}
         env.update({"PATH": self.dir + os.pathsep + env.get("PATH", ""), "REPO": "o/r",
-                    "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0"})
+                    "SHIP_PR_API_ATTEMPTS": "1", "SHIP_PR_API_BACKOFF": "0",
+                    "SHIP_PR_STATE_DIR": os.path.join(self.dir, "state")})
         return subprocess.run([*entry, "base", *args], capture_output=True, text=True, env=env,
                               cwd=self.dir, check=False)
 

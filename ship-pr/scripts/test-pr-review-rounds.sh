@@ -94,18 +94,6 @@ run_rounds() {
   ROUNDS_RC="$rc"
 }
 
-# The shell's own count, which `watch` reads until it is ported: only for the one program no feed
-# can reach on its own (see test_a_broken_jq_program_is_not_a_round_count).
-run_shell_rounds() {
-  local capture rc
-  set +e
-  capture=$(rounds_line "$(review_rounds 7)" 2>&1)
-  rc=$?
-  set -e
-  ROUNDS_OUTPUT="$capture"
-  ROUNDS_RC="$rc"
-}
-
 # Two heads carry findings. The approval, the author's own reply (a COMMENTED review in the same
 # feed), the pending draft and the second inline comment on head A must not add rounds.
 test_counts_distinct_heads_with_findings() {
@@ -533,11 +521,10 @@ test_rounds_ends_with_its_trailer() {
 
 # --- a read that does not parse must not render as a count (ludics-lite#89) ---------------------
 # The count's read is reached from outside: a review whose submission time is not a date. The
-# head tally beside it reads nothing the count did not read first, so no feed reaches it alone;
-# it is a jq program of the SHELL's review_rounds, which `watch` reads until it is ported, broken
-# by name with the preamble's shim (`with_broken_jq`, ludics-lite#179). The count's own arm
-# refuses; the tally defaults, and what this pins is that the default is the visible `?` and never
-# a plausible number.
+# head tally beside it reads nothing the count did not read first, so no feed reaches it alone; it
+# is broken by hand in the package's own tests (lib/ludics/tests/test_prreview_readers.py, Rounds),
+# which pin that its default is the visible `?` and never a plausible number. This suite broke the
+# shell's program for it by name until the shell half was retired.
 
 test_a_broken_jq_program_is_not_a_round_count() {
   set_reviews \
@@ -560,17 +547,6 @@ test_a_broken_jq_program_is_not_a_round_count() {
   assert_contains "$ROUNDS_OUTPUT" "the reviews feed did not parse" "naming the read"
   assert_not_contains "$ROUNDS_OUTPUT" "rounds with findings: 0" "must not print a zero count"
   assert_eq "$(tail -n 1 <<<"$ROUNDS_OUTPUT")" "rounds: n=unknown threshold=12" "and the trailer says unknown"
-
-  set_reviews \
-    "$(review "$REVIEWER" COMMENTED aaaa 2026-09-01T10:00:00Z)" \
-    "$(review "$REVIEWER" COMMENTED bbbb 2026-09-01T11:00:00Z)"
-  run_shell_rounds
-  assert_contains "$ROUNDS_OUTPUT" "over 2 head(s)" "control: the shell's own head tally"
-  with_broken_jq '| unique | map(select(. != "")) | length' run_shell_rounds
-  assert_contains "$ROUNDS_OUTPUT" "review rounds with findings: 2 of 12" \
-    "an unreadable head tally does not make the count unknown"
-  assert_contains "$ROUNDS_OUTPUT" "over ? head(s)" \
-    "an unreadable head tally renders as ?, never as a number"
 }
 
 tests=(

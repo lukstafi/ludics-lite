@@ -1,18 +1,20 @@
 """``scripts/py -m ludics.prreview [--repo owner/name] <subcommand> <args...>``
 
-What pr-review.sh's forwarder runs for a subcommand in its ``PY_PORTED`` set, with the same
-arguments and the shell's resolved constants in the environment (``PY_FORWARD_VARS``). The shell
-has already taken its own ``--repo`` off; it is accepted here too so the module can be run
-directly.
+What pr-review.sh's forward runs for every subcommand, with the same arguments and the shell's
+resolved constants in the environment (``PY_FORWARD_VARS``). The shell has already taken its own
+``--repo`` off; it is accepted here too so the module can be run directly.
 
 Adding a subcommand: a module ``ludics/prreview/<name>.py`` with ``run(session, args) -> int``,
-a ``case "<name>":`` below, and the name in the shell's ``PY_PORTED``.
+a ``case "<name>":`` below and its name in ``PORTED``, and in pr-review.sh its name in ``main``'s
+case with a ``cmd_<name>`` stub (lib/ludics/README.md).
 """
 
 import os
 import sys
 
 from ludics import cli
+from ludics.prreview import budget
+from ludics.prreview.clock import clock_from_env, plain_sleep
 from ludics.prreview.core import PROG, GhSession, die, load_config
 
 PORTED = (
@@ -34,7 +36,19 @@ def dispatch(argv: list[str]) -> int:
     elif args and args[0].startswith("--repo="):
         env["REPO"] = args[0][len("--repo=") :]
         args = args[1:]
-    session = GhSession(load_config(env))
+    config = load_config(env)
+    # The polling budget every subcommand's own calls share (its knobs validated here, for every
+    # subcommand, as the shell validated them when it was sourced). The observer lock a command
+    # takes is released however it ends.
+    shared = budget.from_env(env, clock_from_env(env))
+    session = GhSession(config, sleep=plain_sleep(env), budget=shared)
+    try:
+        return _run(session, args, env)
+    finally:
+        shared.release()
+
+
+def _run(session: GhSession, args: list[str], env: dict[str, str]) -> int:
     sub = args[0] if args else ""
     rest = args[1:]
     match sub:

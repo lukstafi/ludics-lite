@@ -23,36 +23,21 @@ from typing import Any, assert_never, cast
 
 from ludics import cli
 from ludics.fleetworker.config import Config
+from ludics.fleetworker.farside import FLEET_PYTHON
 from ludics.fleetworker.identity import check_identity, coordinator_id, die, my_token
 from ludics.fleetworker.lease import LEASE_MUTATION
+from ludics.fleetworker.preflight import refresh_box
 from ludics.fleetworker.transport import Done, err, fleet_name, prelude, run, run_on, substitution
 
 REGISTRY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registry.py")
 
-# The far side's interpreter: the first that reports >= 3.12, in scripts/py's order (a
-# non-interactive ssh session on a Mac often has no /opt/homebrew on PATH, and its bare python3 is
-# Xcode's 3.9), or LUDICS_PY_CANDIDATES, one per line, as the anchor's environment sets it.
-FIND_PYTHON = r"""fleet_python() {
-  local c candidates
-  if [ -n "${LUDICS_PY_CANDIDATES+set}" ]; then candidates=$LUDICS_PY_CANDIDATES
-  else candidates="/opt/homebrew/bin/python3
-/usr/local/bin/python3
-python3.13
-python3.12
-python3
-$HOME/.local/bin/python3.12"; fi
-  while IFS= read -r c; do
-    [ -n "$c" ] || continue
-    command -v "$c" >/dev/null 2>&1 || continue
-    "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' </dev/null >/dev/null 2>&1 || continue
-    printf '%s' "$c"; return 0
-  done <<FLEET_PYTHON_CANDIDATES
-$candidates
-FLEET_PYTHON_CANDIDATES
-  return 1
-}
-py=$(fleet_python) || { echo "EXECUTION REFUSED: no Python >= 3.12 on $BOX to run the execution registry (scripts/py's probe; install one, or name it in LUDICS_PY_CANDIDATES)" >&2; exit 1; }
-"""
+# The far side's interpreter: the first that reports >= 3.12, in scripts/py's order
+# (farside.FLEET_PYTHON, which the preflight's probe of a box shares).
+FIND_PYTHON = (
+    FLEET_PYTHON
+    + 'py=$(fleet_python) || { echo "EXECUTION REFUSED: no Python >= 3.12 on $BOX to run the execution registry'
+    + " (scripts/py's probe; install one, or name it in LUDICS_PY_CANDIDATES)\" >&2; exit 1; }\n"
+)
 
 
 def registry_command(source: str) -> str:
@@ -427,8 +412,7 @@ def execution_refresh(cfg: Config, record_text: str) -> None:
                     f" run fleet-worker.sh refresh {host} once it concludes"
                 )
                 return
-            # `refresh` is still the shell's: its far side shares the checkout lock with the preflight.
-            run(["bash", cfg.script, "refresh", host], stdout_to_stderr=True)
+            refresh_box(cfg, host, to_stderr=True)
         case _:
             assert_never(host)
 
