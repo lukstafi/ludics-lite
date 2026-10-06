@@ -333,6 +333,16 @@ script sees the variable CI sets: a control that reads it by accident goes red a
 instead of on the push (PR #275). The workflow calls this script for those steps, so the two
 cannot drift, and `scripts/test-preflight.sh` pins that they have not.
 
+It also runs CI's small-guards suites, as its *guards* (`preflight.sh guards` lists them), because
+a skill-text edit can pass every lint step and still fail one (ludics-lite#553). With no step
+named, the guards a Markdown edit can break — `test-check-prompts.sh` on any `*.md`,
+`test-sync-routines.sh` on `routines/*.md`, each also on the checker and the live scripts its suite
+reads — run when a tracked file matching them differs from the
+merge base with `origin/main` (`--base <ref>` for another; a base that cannot be resolved runs
+them), adding a minute or two. `--guards all` runs every small-guards suite, `--guards none` none,
+and a guard named on the command line runs alone. `scripts/test-preflight.sh` pins the guard table
+to the small-guards job's steps.
+
 To iterate on a few cases of a `ship-pr/scripts/test-pr-review-*.sh` suite, name them:
 `ship-pr/scripts/test-pr-review-watch.sh test_a test_b` (or
 `SHIP_PR_TEST_CASES="test_a test_b" ship-pr/scripts/test-pr-review-watch.sh`; naming cases both
@@ -345,14 +355,29 @@ given must already be a defined function, or the run is refused before any case:
 case inside another case's body, which a full run reached but a subset could never select.
 
 To show that new fixtures FAIL on the base code — the negative control every issue-wave brief
-asks for — run `scripts/run-against-base.sh <suite-path> [--base <ref>] [suite args...]`. It makes a
-detached worktree of `origin/main` (or `<ref>`) under `$TMPDIR`, copies the working tree's version
-of that one suite over the base's, runs it from the base worktree, and reports its exit status and
+asks for — run `scripts/run-against-base.sh <suite-path> [options] [suite args...]`. It makes a
+detached worktree of `origin/main` (or `--base <ref>`) under `$TMPDIR`, copies the working tree's
+version of that suite (and of any file named with `--also`) over the base's, runs it from the base
+worktree, and reports its exit status and
 pass/fail line (its own refusals exit 125, never the suite's status); the worktree is removed and
 pruned on every exit path, INT and TERM included, and whatever the suite left running is stopped
 with it (its process group: TERM, then KILL after a grace). It is a suite run, so wrap it in
 `~/.claude/skills/issue-wave/scripts/fleet-worker.sh execution slot -- …` like any other.
-`scripts/test-run-against-base.sh` pins it against a scratch repo.
+`scripts/test-run-against-base.sh` pins it against a scratch repo. Its options come right after
+the suite path, in any order (ludics-lite#501); the first other word, and everything after it, is
+the suite's:
+- `--also <path>` (repeatable) carries a working-tree file the suite changed with — a fixture
+  library — into the base too; everything not named stays the base's.
+- `--mutate <file> <sed-expr>` (repeatable) is the control for a change the base cannot
+  discriminate: a tests-only PR, or new "still holds" cases beside the one that changed. It applies
+  the expression inside the throwaway worktree, which without `--base` is a snapshot of the working
+  tree (tracked files only: name a new file with `--also` too), so the live tree is never edited
+  and an interrupted run leaves nothing to restore. A
+  PR whose change is entirely in tests uses mutants of the code under test, not the base, as its
+  negative control.
+- `--timeout <s>` (or `RUN_AGAINST_BASE_TIMEOUT`) stops a hanging suite's process group and
+  reports the base as failing, exit 124: a hang is a valid negative control for a fix that ends
+  one.
 
 The scripts carry their own test suites (Python fixtures use `python3`; PowerShell fixtures run on Windows):
 

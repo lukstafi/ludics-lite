@@ -29,7 +29,12 @@
 #   - a sparse source checkout still gets a complete base (and stays sparse itself), another
 #     worktree's registration is never pruned, and a base's submodules are named on the result;
 #   - a second signal during the cleanup does not cut the teardown short;
-#   - RUN_AGAINST_BASE_GRACE is validated up front, and a suite's own 125 exits 1.
+#   - RUN_AGAINST_BASE_GRACE is validated up front, and a suite's own 125 exits 1;
+#   - --also carries a named working-tree file (a fixture library) into the base, and nothing
+#     else; --mutate edits a file inside the throwaway worktree only -- by default a snapshot of
+#     the working tree, uncommitted edits included -- and refuses a mutation that changes nothing;
+#   - --timeout / RUN_AGAINST_BASE_TIMEOUT stops a hanging suite's group and reports the base as
+#     failing (124), a suite ignoring TERM included, while one inside the timeout is judged as ever.
 #
 # Usage: test-run-against-base.sh   (exit 0 all pass, 1 otherwise)
 
@@ -129,6 +134,7 @@ case "${1-}" in
   ( trap 'sleep 1; echo done >"$2"; exit 0' TERM; : >"$2.ready"; sleep 60 & wait ) >/dev/null 2>&1 &
   for i in $(seq 1 300); do [ -e "$2.ready" ] && break; sleep 0.1; done ;;
 --rc125) exit 125 ;;
+--rc124) exit 124 ;;
 --lockout) mkdir -p "$HERE/sealed/d" && : >"$HERE/sealed/d/f" && chmod 000 "$HERE/sealed/d" ;;
 --lock) git -C "$HERE" worktree lock "$(git -C "$HERE" rev-parse --show-toplevel)" ;;
 esac
@@ -176,6 +182,22 @@ chmod +x "$R/.git/hooks/test-meta"
 mkdir -p "$R/scripts/lnk/deep"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/lnk/deep/test-deep.sh"
 cp -p "$R/scripts/test-link.sh" "$R/scripts/test-dir"
+# A suite whose fixture library changed with it (ludics-lite#501): the library is new in the
+# working tree, so without --also the base run fails for want of it -- the wrong reason.
+printf '%s\n' 'want_sum() { echo 5; }' >"$R/scripts/fixlib.sh"
+cat >"$R/scripts/test-fix.sh" <<'EOF'
+#!/usr/bin/env bash
+HERE=$(cd "$(dirname "$0")" && pwd -P)
+[ -f "$HERE/fixlib.sh" ] || { echo "NO FIXTURE LIBRARY"; echo "0 passed, 1 failed"; exit 2; }
+. "$HERE/fixlib.sh"
+. "$HERE/lib.sh"
+pass=0; fail=0
+[ "$(add 2 3)" = "$(want_sum)" ] && pass=$((pass + 1)) || { fail=$((fail + 1)); echo "FAIL: add 2 3"; }
+echo "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]
+EOF
+chmod +x "$R/scripts/test-fix.sh"
+ln -s "$TMP/outside-suite.sh" "$R/scripts/fixlink.sh"
 status_before=$(git -C "$R" status --porcelain)
 
 # worktrees_clean LABEL: nothing but the checkout itself registered, and no helper scratch left.
@@ -231,6 +253,16 @@ else
   ko "want a git toplevel under $HTMP holding the suite; got TOPLEVEL=$top HERE=$here"
 fi
 if grep -qF 'ARGS=[one two]' <<<"$out"; then ok "suite arguments pass through"; else ko "args lost -- $out"; fi
+# The options lead: each of them is taken, the later --base winning, for as long as they lead,
+# and the first word that is none of them ends them -- it and every word after it are the suite's,
+# an option's name included (the 2026-10 contract; before --also it was one leading --base).
+run_rab test-toy.sh --base nosuch --base fixed one --base x --timeout 5
+if [ "$rc" -eq 0 ] && grep -qF 'ARGS=[one --base x --timeout 5]' <<<"$out" \
+  && grep -qF 'against fixed' <<<"$out"; then
+  ok "leading options are the helper's, the later --base winning; the first other word ends them"
+else
+  ko "option boundary: rc=$rc -- $out"
+fi
 worktrees_clean "after a failing base run"
 if [ "$(git -C "$R" status --porcelain)" = "$status_before" ]; then
   ok "the checkout's working tree is untouched"
@@ -581,6 +613,197 @@ if grep -qF 'note: linked has 1 submodule(s), not checked out here' <<<"$out"; t
 else
   ko "submodule note missing -- $out"
 fi
+
+# ---- --also: a fixture library that changed with the suite rides into the base (#501) ---------
+run_rab test-fix.sh
+if [ "$rc" -eq 2 ] && grep -qF 'NO FIXTURE LIBRARY' <<<"$out"; then
+  ok "without --also only the suite is copied: the base run lacks the new library"
+else
+  ko "no --also: rc=$rc -- $out"
+fi
+run_rab test-fix.sh --also fixlib.sh
+if [ "$rc" -eq 1 ] && grep -qF 'FAIL: add 2 3' <<<"$out" && ! grep -qF 'NO FIXTURE LIBRARY' <<<"$out" \
+  && grep -qF 'run-against-base: also: scripts/fixlib.sh (working tree)' <<<"$out"; then
+  ok "--also carries the library, so the base fails for the base's reason, and says it carried it"
+else
+  ko "--also: rc=$rc -- $out"
+fi
+run_rab test-fix.sh --also fixlib.sh --base fixed
+if [ "$rc" -eq 0 ] && grep -qF 'exit 0 on fixed: 1 passed, 0 failed' <<<"$out"; then
+  ok "...options in any order: --also before --base, and a fixed base passes"
+else
+  ko "--also then --base: rc=$rc -- $out"
+fi
+if ! grep -qF 'add() { echo $(($1 - $2)); }' "$R/scripts/lib.sh"; then
+  ok "...and the working tree's own library was never carried with it"
+else
+  ko "the working tree's lib.sh changed"
+fi
+run_rab test-fix.sh --also fixlink.sh
+if [ "$rc" -eq 125 ] && grep -qF 'is a symlink' <<<"$out"; then
+  ok "an --also path that is a symlink is refused like a suite"
+else
+  ko "--also symlink: rc=$rc -- $out"
+fi
+run_rab test-fix.sh --also "$TMP/outside.sh"
+if [ "$rc" -eq 125 ] && grep -qF 'is not inside this checkout' <<<"$out"; then
+  ok "...and so is one outside the checkout"
+else
+  ko "--also outside: rc=$rc -- $out"
+fi
+run_rab test-fix.sh --also
+if [ "$rc" -eq 125 ] && grep -qF -- '--also needs a path' <<<"$out"; then
+  ok "...and an --also with no path"
+else
+  ko "--also bare: rc=$rc -- $out"
+fi
+worktrees_clean "after --also cases"
+
+# ---- --mutate: a mutant of the change, made in the throwaway worktree only (#501, #545) ---------
+lib_before=$(cksum <"$R/scripts/lib.sh")
+run_rab test-toy.sh --mutate lib.sh 's/+/-/'
+if [ "$rc" -eq 1 ] && grep -qF 'FAIL: add 2 3' <<<"$out" \
+  && grep -qF 'run-against-base: mutant: scripts/lib.sh: s/+/-/' <<<"$out" \
+  && grep -qF 'exit 1 on the working tree: 1 passed, 1 failed' <<<"$out"; then
+  ok "a mutant that undoes the fix turns the new case red, and the run names the mutation"
+else
+  ko "mutant: rc=$rc -- $out"
+fi
+if [ "$(cksum <"$R/scripts/lib.sh")" = "$lib_before" ] && [ "$(git -C "$R" status --porcelain)" = "$status_before" ]; then
+  ok "...and the live tree is untouched"
+else
+  ko "the mutant reached the live tree: $(git -C "$R" status --porcelain)"
+fi
+if [ -z "$(git -C "$R" stash list)" ]; then
+  ok "...and the working-tree snapshot leaves no stash entry behind"
+else
+  ko "the snapshot left a stash entry: $(git -C "$R" stash list)"
+fi
+# The snapshot is the working tree, uncommitted fix included: the base commit would fail this
+# suite, so a mutant that leaves the logic alone passing is what shows the snapshot is not HEAD.
+run_rab test-toy.sh --mutate lib.sh 's/$/ # mutated/'
+if [ "$rc" -eq 0 ] && grep -qF 'exit 0 on the working tree: 2 passed, 0 failed' <<<"$out"; then
+  ok "without --base a mutant runs on the working tree's uncommitted state, not on HEAD"
+else
+  ko "snapshot: rc=$rc -- $out"
+fi
+run_rab test-toy.sh --base fixed --mutate lib.sh 's/+/-/'
+if [ "$rc" -eq 1 ] && grep -qF 'exit 1 on fixed: 1 passed, 1 failed' <<<"$out"; then
+  ok "...and with --base the mutation applies to that ref's copy"
+else
+  ko "mutant on --base: rc=$rc -- $out"
+fi
+# A mutation of a carried file: --also first, then the mutation, in that order whatever the flags'.
+run_rab test-fix.sh --base fixed --mutate fixlib.sh 's/5/6/' --also fixlib.sh
+if [ "$rc" -eq 1 ] && grep -qF 'FAIL: add 2 3' <<<"$out"; then
+  ok "a mutation may name a file --also carried"
+else
+  ko "mutant of an --also file: rc=$rc -- $out"
+fi
+run_rab test-toy.sh --mutate lib.sh 's/no-such-text/x/'
+if [ "$rc" -eq 125 ] && grep -qF 'changed nothing in scripts/lib.sh' <<<"$out"; then
+  ok "a mutation that changes nothing is refused: it is not a mutant"
+else
+  ko "no-op mutant: rc=$rc -- $out"
+fi
+run_rab test-toy.sh --mutate test-new.sh 's/1 passed/2 passed/' --base fixed
+if [ "$rc" -eq 125 ] && grep -qF 'nothing there to mutate' <<<"$out"; then
+  ok "a mutation of a file the run's tree does not hold is refused"
+else
+  ko "mutant of a missing file: rc=$rc -- $out"
+fi
+# An untracked file is in the live tree but not in the snapshot: the refusal says so and names
+# the way through, rather than calling the working tree empty there.
+printf '%s\n' 'echo 2' >"$R/scripts/untracked.sh"
+run_rab test-toy.sh --mutate untracked.sh 's/2/3/'
+if [ "$rc" -eq 125 ] && grep -qF 'scripts/untracked.sh is untracked, and the working-tree snapshot holds tracked files only' <<<"$out" \
+  && grep -qF -- '--also scripts/untracked.sh' <<<"$out"; then
+  ok "a mutation of an untracked file is refused as untracked, naming --also"
+else
+  ko "mutant of an untracked file: rc=$rc -- $out"
+fi
+run_rab test-toy.sh --mutate untracked.sh 's/2/3/' --also untracked.sh
+if [ "$rc" -eq 0 ] && grep -qF 'mutant: scripts/untracked.sh: s/2/3/' <<<"$out"; then
+  ok "...and carried with --also it is mutated"
+else
+  ko "mutant of an untracked file carried: rc=$rc -- $out"
+fi
+rm -f "$R/scripts/untracked.sh"
+run_rab test-toy.sh --mutate lib.sh
+if [ "$rc" -eq 125 ] && grep -qF -- '--mutate needs a file and a sed expression' <<<"$out"; then
+  ok "a --mutate without its expression is refused"
+else
+  ko "--mutate bare: rc=$rc -- $out"
+fi
+# An interrupted mutant run leaves the live tree as it was: the mutant only ever existed in the
+# throwaway worktree, which goes with the run.
+rm -f "$TMP/mut.pid"
+set -m
+(cd "$R/scripts" && TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=1 exec "$RAB" test-toy.sh --mutate lib.sh 's/+/-/' --slow "$TMP/mut.pid") >"$TMP/mut.out" 2>&1 &
+mpid=$!
+set +m
+for i in $(seq 1 300); do [ -s "$TMP/mut.pid" ] && break; sleep 0.1; done
+kill -TERM "$mpid" 2>/dev/null
+wait "$mpid"
+mrc=$?
+if [ "$mrc" -eq 143 ] && [ "$(cksum <"$R/scripts/lib.sh")" = "$lib_before" ]; then
+  ok "a mutant run stopped by TERM leaves the live tree as it was"
+else
+  ko "interrupted mutant: rc=$mrc, lib.sh $( [ "$(cksum <"$R/scripts/lib.sh")" = "$lib_before" ] && echo same || echo CHANGED) -- $(cat "$TMP/mut.out")"
+fi
+worktrees_clean "after --mutate cases"
+
+# ---- --timeout: a hang is a failing base, not a run without a verdict (#501, #549) -------------
+# timeout_case LABEL MODE [helper env...]: the hanging suite is stopped, the run exits 124, and the
+# suite and the worktree are gone, well inside the bound that a missing timeout would cross.
+timeout_case() {
+  local label=$1 mode=$2 pidf="$TMP/to.pid.$1" spid
+  shift 2
+  rm -f "$pidf"
+  SECONDS=0
+  out=$(cd "$R/scripts" && env TMPDIR="$HTMP" RUN_AGAINST_BASE_GRACE=1 "$@" "$RAB" test-toy.sh $TIMEOUT_ARGS "$mode" "$pidf" 2>&1)
+  rc=$?
+  took=$SECONDS
+  spid=$(cat "$pidf" 2>/dev/null)
+  if [ "$rc" -eq 124 ] && [ "$took" -lt 30 ] && grep -qF 'exit 124 on origin/main: timed out after 2s' <<<"$out"; then
+    ok "$label: the hang is reported as the base failing, exit 124 (${took}s)"
+  else
+    ko "$label: rc=$rc after ${took}s -- $out"
+  fi
+  if [ -n "$spid" ] && case $(ps -o stat= -p "$spid" 2>/dev/null) in '' | Z*) true ;; *) false ;; esac then
+    ok "$label: the hung suite is stopped"
+  else
+    ko "$label: the suite ($spid) outlived the timeout"
+    [ -n "$spid" ] && kill -KILL "$spid" 2>/dev/null
+  fi
+  worktrees_clean "after $label"
+}
+TIMEOUT_ARGS="--timeout 2"
+timeout_case "--timeout" --slow
+# A suite that ignores TERM is killed after the grace, as at any other stop.
+timeout_case "--timeout on a suite ignoring TERM" --stubborn
+TIMEOUT_ARGS=
+timeout_case "RUN_AGAINST_BASE_TIMEOUT" --slow RUN_AGAINST_BASE_TIMEOUT=2
+# A suite that finishes inside the timeout is judged as ever.
+run_rab test-toy.sh --timeout 30
+if [ "$rc" -eq 1 ] && grep -qF 'exit 1 on origin/main: 1 passed, 1 failed' <<<"$out"; then
+  ok "a suite that finishes inside the timeout reports its own status"
+else
+  ko "timeout not reached: rc=$rc -- $out"
+fi
+run_rab test-toy.sh --timeout 30 --rc124
+if [ "$rc" -eq 1 ] && grep -qF 'exit 124 on origin/main' <<<"$out"; then
+  ok "...and a suite's own 124 exits 1 while a timeout is armed, so 124 means the timeout"
+else
+  ko "suite 124 with a timeout: rc=$rc -- $out"
+fi
+run_rab test-toy.sh --timeout 1.5
+if [ "$rc" -eq 125 ] && grep -qF 'must be whole seconds' <<<"$out"; then
+  ok "a fractional timeout is refused up front"
+else
+  ko "timeout 1.5: rc=$rc -- $out"
+fi
+worktrees_clean "after --timeout cases"
 
 # A suite that locks its own worktree: a single --force refuses a locked one.
 run_rab test-toy.sh --lock

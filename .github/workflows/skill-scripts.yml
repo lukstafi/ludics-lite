@@ -84,6 +84,10 @@ jobs:
     # so one red guard does not hide another's verdict as it could not when they were five jobs.
     # The first carries neither: check-prompts.sh is pinned as a BARE invocation
     # (scripts/test-preflight.sh), and it writes its own `::error` annotations.
+    # scripts/preflight.sh runs the others as its GUARDS (`preflight.sh guards`; the Markdown-
+    # triggered ones by default, all under `--guards all`, ludics-lite#553), and
+    # scripts/test-preflight.sh holds its guard table and this job's steps to one set: a suite
+    # added here and not there fails it.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
