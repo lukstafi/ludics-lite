@@ -382,7 +382,7 @@ if is_num "$wid"; then
     '(.path | startswith(".github/workflows/")) and .name == $wname' "$wf" --arg wname "$wname"
   # The file's own text, which is what `base --wait` reads to decide whether a tip with no run is
   # one the workflow's paths-ignore excludes, and whether the workflow still runs on push at all
-  # (base_push_trigger, ludics-lite#401). It asks for the RAW media
+  # (base.py's Base.push_trigger, ludics-lite#401). It asks for the RAW media
   # type, because the JSON envelope's base64 body wants a decoder spelled `-d` on one of this
   # fleet's platforms and `-D` on the other. What can move is the media type being ignored and the
   # envelope arriving anyway: the parser would see one long line of base64, refuse it, and every
@@ -808,7 +808,7 @@ else
   skip "open PRs' mergeability and clock fields" "no open PR right now"
 fi
 skip "a push made while mergeable_state=dirty gets no pull_request run" "needs a dirty PR pushed to under observation; not manufactured here"
-# The push clock: gate_checks reads updated_at because a push to the head branch moves it, and
+# The push clock: the gate (gate.py) reads updated_at because a push to the head branch moves it, and
 # status_state's review clock reads created_at instead, as a floor that comments cannot move. The
 # push time itself is not an API field, and a committer date is not one either (a skewed or
 # assigned date can be later than the real push), so the belief was measured live on
@@ -1027,7 +1027,7 @@ fi
 #     up as "T<comment id>");
 #   - `isResolved` a boolean — the gate counts a thread closed only when it is literally true, so
 #     a string "true" would hold every approval as unresolved, and a dropped field the same;
-#   - the first comment's `fullDatabaseId` a decimal string, which THREAD_ID_JQ names a thread by
+#   - the first comment's `fullDatabaseId` a decimal string, which threads.thread_id names a thread by
 #     ahead of `databaseId` — the schema types databaseId as a 32-bit Int while review-comment ids
 #     run past 2^31, and the reply fixture assumes it null there. What GitHub serves past 2^31 is
 #     printed, and the claim is the one the fallback needs: null or the same number, never clamped.
@@ -1054,14 +1054,14 @@ else
   else
     pin "every thread carries a non-empty node id (resolve's threadId) and isResolved as a boolean (closed only when literally true)" \
       'all(.[]; (.id | type == "string" and length > 0) and (.isResolved | type == "boolean"))' "$tnodes"
-    pin "every thread's first comment carries fullDatabaseId as a decimal string (the BigInt THREAD_ID_JQ names a thread by, ahead of databaseId)" \
+    pin "every thread's first comment carries fullDatabaseId as a decimal string (the BigInt threads.thread_id names a thread by, ahead of databaseId)" \
       'all(.[]; .comments.nodes[0].fullDatabaseId | type == "string" and test("^[1-9][0-9]*$"))' "$tnodes"
     # Past 2^31 is selected on the decimal string, so the claim is about exactly the threads whose
     # 32-bit databaseId the schema cannot hold; jq's numbers are doubles, exact far past these ids.
     BIG='.comments.nodes[0] | select((.fullDatabaseId | type == "string" and test("^[1-9][0-9]*$")) and (.fullDatabaseId | tonumber) > 2147483647)'
     n_big=$(jq "[.[] | $BIG] | length" <<<"$tnodes")
     if [ "$n_big" -ge 1 ]; then
-      pin "databaseId is not clamped past 2^31: on #$THREADS_PR's $n_big thread(s) whose first comment id is past it, databaseId is null or the very number fullDatabaseId spells (THREAD_ID_JQ's fallback)" \
+      pin "databaseId is not clamped past 2^31: on #$THREADS_PR's $n_big thread(s) whose first comment id is past it, databaseId is null or the very number fullDatabaseId spells (threads.thread_id's fallback)" \
         "all(.[] | $BIG; .databaseId == null or ((.databaseId | type == \"number\") and (.databaseId | tostring) == .fullDatabaseId))" "$tnodes"
       echo "      databaseId past 2^31 on #$THREADS_PR: $(jq -r "[.[] | $BIG | if .databaseId == null then \"null\" elif (.databaseId | tostring) == .fullDatabaseId then \"whole\" else \"other\" end] | group_by(.) | map(\"\(.[0]) on \(length)\") | join(\", \")" <<<"$tnodes")"
     else

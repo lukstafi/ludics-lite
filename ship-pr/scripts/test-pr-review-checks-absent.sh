@@ -175,8 +175,8 @@ iso_ago() { jq -rn --argjson n "$1" '(now - $n) | todateiso8601'; }
 
 # Pops the next canned answer, and repeats the last one forever after: the round count is the
 # behaviour under test, not something each case should have to predict. The round counter lives in
-# a FILE because gh_retry runs `gh` inside a command substitution — a variable incremented there
-# dies with the subshell, and every round would be served the first answer forever.
+# a FILE because every `gh` call runs the fixture in a fresh bash (the forward's bridge) — a variable
+# incremented there dies with that shell, and every round would be served the first answer forever.
 next_of() {
   local name="$1" counter="$TEST_ROOT/$1.calls" idx total
   idx=$(cat "$counter" 2>/dev/null) || idx=0

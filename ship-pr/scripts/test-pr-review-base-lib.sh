@@ -99,8 +99,8 @@ TIP=""
 WORKFLOWS_JSON=""
 JOBS_DEFAULT=""
 FAIL_ENDPOINT=""
-# The HTTP status a failed read reports: a 5xx is transport, which gh_retry retries, while a 4xx is
-# the API's answer — a 404 or a 403 on the workflow file is how base_push_trigger meets a missing
+# The HTTP status a failed read reports: a 5xx is transport, which GhSession.retry retries, while a 4xx is
+# the API's answer — a 404 or a 403 on the workflow file is how Base.push_trigger meets a missing
 # file and a token that may not read it (ludics-lite#401).
 FAIL_STATUS=""
 # The settle path's three reads (ludics-lite#156): the workflow FILE (its path, then its body at
@@ -355,8 +355,8 @@ gh() {
     # round, so the FIRST listed workflow's read is one per round and nothing else here is.
     # (A fixture whose first workflow is advisory would never be read, and would count no
     # rounds — no case lists one, and `is_advisory` is pr-review.sh's own test for it.)
-    # `|| return 1`: the fixture runs in gh_retry's command substitution, which does not inherit
-    # errexit, so a count that bails must be turned into a failed read by hand.
+    # `|| return 1`: the fixture function runs without errexit in the bridge's fresh bash, so a
+    # count that bails must be turned into a failed read by hand.
     if [ "$wid" = "$(first_wid)" ]; then
       round=$(fixture_call_count rounds) || return 1
     fi

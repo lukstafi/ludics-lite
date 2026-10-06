@@ -562,8 +562,8 @@ ok    every Code Review row of the sampled PRs' summaries is Completed or Failed
 ok    a findings review is submitted before its row flips to Completed: the app's last review naming the newest Completed row's commit is not after that row, on 1 sampled PRs (status_state's 'nothing since the 👀' rests on it, #453)
 ok    the gate's own THREADS_QUERY, sent verbatim, answers #9's reviewThreads as a connection: nodes[], a numeric totalCount and a boolean pageInfo.hasNextPage
 ok    every thread carries a non-empty node id (resolve's threadId) and isResolved as a boolean (closed only when literally true)
-ok    every thread's first comment carries fullDatabaseId as a decimal string (the BigInt THREAD_ID_JQ names a thread by, ahead of databaseId)
-ok    databaseId is not clamped past 2^31: on #9's 3 thread(s) whose first comment id is past it, databaseId is null or the very number fullDatabaseId spells (THREAD_ID_JQ's fallback)
+ok    every thread's first comment carries fullDatabaseId as a decimal string (the BigInt threads.thread_id names a thread by, ahead of databaseId)
+ok    databaseId is not clamped past 2^31: on #9's 3 thread(s) whose first comment id is past it, databaseId is null or the very number fullDatabaseId spells (threads.thread_id's fallback)
 ok    on a walk of #9 at 2 a page (2 pages), EVERY page states a numeric totalCount, nodes[] and a boolean hasNextPage, with a non-empty endCursor whenever there is a next page (threads_walk reads the last page's count)
 ok    ... and the pages add up: each states the verbatim read's totalCount (3), their rows reach it, and the last says hasNextPage false (threads_walk's whole-read test)
 skip  reviewThreads paged past 100 threads — no PR here has more than one page of 100 threads; the paging itself is pinned above on a smaller page of the same query
@@ -689,6 +689,28 @@ test_an_unanswered_api_exits_3_and_leaves_nothing_behind() {
   assert_nothing_left "an exit 4"
 }
 
+# The contract speaks in the gate's words by asking the gate's Python for them (the branch
+# encoder first), so a Python that does not answer is a usage-class stop, exit 2 -- never an
+# empty ref read as the base. Run from a copy of the two scripts whose checkout's scripts/py
+# fails, since the contract finds its runner beside itself as pr-review.sh's forward does.
+test_a_gate_python_that_does_not_answer_exits_2() {
+  local tree="$TEST_ROOT/no-py"
+  rm -rf "${tree:?}"
+  mkdir -p "$tree/ship-pr/scripts" "$tree/scripts"
+  cp "$SCRIPT_DIR/pr-review.sh" "$SCRIPT_DIR/pr-review-api-contract.sh" "$tree/ship-pr/scripts/"
+  printf '#!/bin/sh\necho "no gate here" >&2\nexit 1\n' >"$tree/scripts/py"
+  chmod +x "$tree/scripts/py"
+  world_healthy
+  local CONTRACT="$tree/ship-pr/scripts/pr-review-api-contract.sh"
+  run_contract
+  assert_eq "$CONTRACT_RC" 2 "a gate Python that does not answer should end the run 2 ($CONTRACT_ERR)"
+  assert_contains "$CONTRACT_ERR" "the gate's Python ($tree/scripts/py) did not answer; the contract cannot speak in its words" \
+    "the message should name the runner"
+  assert_eq "$(cat "$TEST_ROOT/calls")" "api repos/$REPO" "the run should stop after the repository read, before reading an unencoded ref"
+  assert_not_contains "$CONTRACT_OUT" "beliefs checked" "no verdict should be claimed"
+  assert_nothing_left "an exit 2"
+}
+
 tests=(
   test_sourcing_stops_before_the_first_read
   test_pages_joins_every_page_and_nulls_a_moved_wrapper
@@ -702,6 +724,7 @@ tests=(
   test_a_doctored_response_moves_its_pin_and_only_it
   test_a_moved_wrapper_is_one_moved_and_its_rows_skip
   test_an_unanswered_api_exits_3_and_leaves_nothing_behind
+  test_a_gate_python_that_does_not_answer_exits_2
 )
 
 run_tests "${tests[@]}" -- "$@"

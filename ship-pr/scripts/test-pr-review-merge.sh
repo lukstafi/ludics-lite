@@ -76,8 +76,8 @@ STATE_FAIL=""                          # nonempty = the merged-state read after 
 DISABLE_AUTO_FAIL=""                   # nonempty = `pr merge --disable-auto` is refused
 MERGE_QUEUE_FAIL=""                    # nonempty = the merge-queue read gets a 503
 # The "from the SECOND read on" switches above are counted by the lib's fixture_call_count, under
-# the names body, base and default-branch: gh_retry calls the fixture inside a command
-# substitution, so a variable it increments dies with that subshell, and the count has to travel
+# the names body, base and default-branch: every call runs the fixture in a fresh bash of its own
+# (the forward's bridge), so a variable it increments dies with that shell, and the count has to travel
 # in a file -- as CALLS_FILE already does. Three hand-rolled files did this before (ludics-lite#274).
 # Each count is captured with its status and a failure returned before an answer is chosen: a
 # `[ "$(...)" -ge 2 ]` over a count that could not be made is merely false, and the fixture would

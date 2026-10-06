@@ -840,6 +840,25 @@ test_a_plain_retry_passes_the_answer_through() {
   done
 }
 
+# A first word that is not a whole subcommand gets pr-review.sh's own usage, exit 2, before
+# anything is forwarded or read -- including a word that merely CONTAINS subcommands ('body
+# reply'), which the retired shell's space-padded py_ported glob forwarded to the Python's refusal.
+test_a_word_that_is_not_a_subcommand_gets_the_usage() {
+  local word out rc
+  for word in 'body reply' 'poll status' 'retry poll' frobnicate '' --repo=example/repo; do
+    reset_fixture
+    set +e
+    out=$(main "$word" x 2>&1)
+    rc=$?
+    set -e
+    assert_eq "$rc" 2 "'$word' is not a subcommand ($out)"
+    assert_contains "$out" "pr-review.sh: usage: pr-review.sh [--repo owner/name] {poll|watch|status|rounds|checks|merge|reply|resolve} <pr> ..." \
+      "and gets the usage ('$word')"
+    assert_not_contains "$out" "not a subcommand ported to Python" "never the Python's refusal ('$word')"
+    assert_eq "$(gh_calls)" "" "and nothing is called ('$word')"
+  done
+}
+
 # What the plain retry writes is what the shell's `printf '%s\n' "$out"` wrote: the answer as its
 # command substitution kept it, NUL bytes dropped and every other byte intact; and a reader that
 # closes early (`| head -1`) ends it the way SIGPIPE ended the shell, 141, never 1, which in this CLI
@@ -1046,6 +1065,7 @@ tests=(
   test_run_watch_reads_each_conclusion_class
   test_run_watch_sleeps_no_further_than_its_deadline
   test_a_plain_retry_passes_the_answer_through
+  test_a_word_that_is_not_a_subcommand_gets_the_usage
   test_a_plain_retry_keeps_its_exits_apart
   test_a_plain_retry_writes_as_the_shell_did
   test_parse_ref

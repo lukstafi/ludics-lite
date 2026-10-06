@@ -532,7 +532,7 @@ test_a_hold_at_the_start_counts_toward_the_ceiling() {
   assert_eq "$(now)" "$((T0 + 600))" "and the ceiling still runs from the command's start"
 }
 
-# `base` resolves a repository from the checkout with `gh repo view`, a call gh_retry never sees,
+# `base` resolves a repository from the checkout with `gh repo view`, a call GhSession.retry never sees,
 # so it passes the hold's gate itself. A standing hold is exit 3, never a fall back to the origin
 # remote (in a fork that names the fork, not the repository gh resolved); an ended one is probed
 # and lifted first, as for any read.
