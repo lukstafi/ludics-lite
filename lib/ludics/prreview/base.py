@@ -1080,6 +1080,11 @@ class Wait:
                     if age is not None and age < grace:
                         hold = True
                 if not hold and self.tip_read() == tip:
+                    if rnd.norun > 0:
+                        # Settled over a workflow's ABSENCE from the branch: its empty page is
+                        # evidence the way an uncovered tip's is (ludics-lite#550).
+                        self.keep_pages(rnd, tip, f"(settled with no push run on {branch} for"
+                                        f" {', '.join(n for _, n in rnd.norun_ids)})")
                     break
             elif (rnd.uncovered > 0 and rnd.tip_unjudged == 0 and rnd.inflight == 0
                   and not rnd.src_pending):

@@ -527,6 +527,28 @@ test_a_settle_on_absence_keeps_its_runs_pages() (
   rm -rf "$BUDGET_DIR"
 )
 
+# The other settle on absence: every run there is covers the tip, and a listed workflow has no push
+# run on the branch at all (dispatch-only, its first run past the creation window). An empty page
+# read stale would settle the same way, so its pages are kept too, naming that workflow.
+test_a_settle_over_a_workflow_with_no_runs_keeps_its_runs_pages() (
+  local kept
+  reset_fixture
+  BUDGET_DIR="$TEST_ROOT/budget-state"
+  WORKFLOWS_JSON=$(workflows_json '[{"id":1,"name":"ci"},{"id":2,"name":"nightly"}]')
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" \
+    '[{conclusion:"success", head_sha:$c, id:5541, created_at:"2026-09-10T00:00:00Z"}]')")
+  RUNS_2=$(jq -cn '{workflow_runs: []}')
+  run_base --wait="$EVENT_CEILING"
+  assert_eq "$BASE_RC" 0 "a dispatch-only workflow does not park the wait ($BASE_OUTPUT)"
+  kept=$(sed -n 's/.*kept the runs pages it read in \(.*\) (ludics-lite#550).*/\1/p' <<<"$BASE_OUTPUT")
+  assert_contains "$kept" "$BUDGET_DIR/base-pages/" "the path is named, under the state directory"
+  [ -f "$kept" ] || bail "the kept pages should be a file: '$kept'"
+  assert_contains "$(cat "$kept")" "actions/workflows/2/runs?branch=$BRANCH&event=push&per_page=10" \
+    "naming the empty workflow's read"
+  assert_contains "$(cat "$kept")" "no push run on $BRANCH for nightly" "and why the round settled"
+  rm -rf "$BUDGET_DIR"
+)
+
 tests=(
   test_a_paths_ignored_tip_settles_without_waiting_out_the_grace
   test_a_tip_that_changed_a_source_file_is_not_recognized
@@ -553,6 +575,7 @@ tests=(
   test_a_page_whose_judged_run_is_older_than_an_earlier_rounds_is_not_settled_on
   test_a_page_that_stays_inconsistent_runs_out_the_ceiling
   test_a_settle_on_absence_keeps_its_runs_pages
+  test_a_settle_over_a_workflow_with_no_runs_keeps_its_runs_pages
 )
 
 run_tests "${tests[@]}" -- "$@"
