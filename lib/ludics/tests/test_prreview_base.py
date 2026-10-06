@@ -500,6 +500,33 @@ class NamedSources(unittest.TestCase):
         self.assertIn(f"o/r main: green (tip {C[:8]}; ci judged by PR #7's head run (roll-forward rule))", out)
         self.assertIn("(roll-forward rule): o/r#7 @eeeeeeee: green — 1 build checks passed", out)
 
+    def test_no_interim_green_on_a_round_that_contradicts_an_earlier_one(self) -> None:
+        """ludics-lite#550 under --interim (the gate's ``base --wait --interim``): round one reads an
+        older red beside the tip's run in flight, round two a stale page (and a stale deeper read)
+        that drops the red, round three the tip's own red. The interim is not taken on round two."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+        fly = at(C, 10, "2026-10-05T10:30:00Z", status="in_progress", conclusion=None)
+        red = at(B, 9, "2026-10-05T10:20:00Z", conclusion="failure")
+        prev = at(A, 8, "2026-10-05T10:00:00Z")
+        answers = pushless_world()
+        answers.update({
+            f"repos/o/r/contents/.github/workflows/ci.yml?ref={C}": DOCS_IGNORED,
+            "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10": [
+                runs(fly, red, prev), runs(fly, prev),
+                runs(at(C, 10, "2026-10-05T10:30:00Z", conclusion="failure"), red, prev)],
+            "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=100": runs(fly, prev),
+            "repos/o/r/actions/runs/10": json.dumps({"status": "in_progress"}),
+        })
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900", "--interim"], clock=clock,
+                                 gate=gate_stub("green", "o/r#7 @eeeeeeee: green — 1 build checks passed"),
+                                 knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("interim (tip", out)
+        self.assertIn(f"RED      ci — failure at {C[:8]}", out)
+        self.assertEqual(len(clock.slept), 2, "three rounds")
+
     def test_a_gate_verdict_outside_the_vocabulary_is_unknown(self) -> None:
         rc, _, err, _ = base_run(pushless_world(), ["main"], gate=gate_stub("superseded", "x"))
         self.assertEqual(rc, 3)
