@@ -255,10 +255,14 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: ubuntu-latest
-    # The plain pass. The hostile-locale pass and the CRLF jq repeat are the next job: the two
+    # The plain pass. The hostile-locale pass and the CRLF jq repeat are the next two jobs: the
     # passes in one job outgrew a 15-minute cap under a wave's load and timed green runs out with
-    # no verdict (ludics-lite#474), and Ubuntu runners are plentiful enough to run both at once.
-    timeout-minutes: 10
+    # no verdict (ludics-lite#474), and Ubuntu runners are plentiful enough to run them at once.
+    # 15, not #474's 10: served by Python (ludics-lite#403), the green runs on v2 took 427-574s
+    # (runs 37340116809, 37377439485, 37385847278, 37390277847 attempt 2, 37404230827), one more
+    # crossed 10 minutes green step by step (37390277847 attempt 1), and the budget suite came on
+    # top (~60s): p90 ~640s, x1.5.
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-jq
@@ -307,7 +311,11 @@ jobs:
     # The same pr-review suites again, under the environments that once turned them red, split
     # from the plain pass above (ludics-lite#474). Each pass runs whatever the one before did and
     # names its suite when it fails, as the plain pass's job did for these when they were its tail.
-    timeout-minutes: 13
+    # The CRLF jq repeat is its own job below since ludics-lite#403: with it, the job crossed
+    # #474's 13 minutes green on v2 (run 37404230827: 637s + 166s). The hostile pass alone took
+    # 491-663s on v2 (37390277847 both attempts, 37404230827), the budget suite on top (~80s):
+    # p90 ~745s, x1.5.
+    timeout-minutes: 19
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-jq
@@ -316,11 +324,22 @@ jobs:
       - name: Repeat fixtures with inherited names, spaced paths, and a non-C locale
         if: ${{ !cancelled() }}
         run: ship-pr/scripts/run-pr-review-hostile.sh || { echo '::error title=suite failed::run-pr-review-hostile.sh'; exit 1; }
+
+  pr-review-crlf:
+    name: pr-review fixtures, CRLF jq (ubuntu)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
+    runs-on: ubuntu-latest
+    # The hostile job's tail until ludics-lite#403 slowed both past its cap: 140-166s on v2
+    # (runs 37390277847 attempt 2, 37404230827), x1.5, at the 5-minute floor.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-jq
       - name: Repeat the four suites a CRLF jq turned red, over a stub jq.exe
         # A native jq.exe ends its lines CRLF, and these four went red on it under Git Bash
         # (ludics-lite#335). The stub is one that refuses `-b`, the strip path no runner's real jq
         # takes; the Git Bash leg covers `-b` with the real jq.exe.
-        if: ${{ !cancelled() }}
         env:
           SHIP_PR_TEST_JQ_EOL: crlf-no-binary
         run: |
@@ -380,7 +399,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 17
+    # Re-measured on v2 (ludics-lite#403): 703-770s over runs 37340116809, 37377439485,
+    # 37385847278, 37390277847 and 37404230827, x1.5.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -453,8 +474,9 @@ jobs:
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.scripts == 'true') }}
     runs-on: macos-latest
     # The cleanup suite kills a stalled case at SHIP_PR_TEST_CASE_TIMEOUT (ludics-lite#14), so
-    # this is the backstop behind that, sized for the whole sequence by THE CAPS above.
-    timeout-minutes: 25
+    # this is the backstop behind that, sized for the whole sequence by THE CAPS above. Re-measured
+    # on v2 (ludics-lite#403): 1086-1167s over the runs named at fleet-worker, x1.5.
+    timeout-minutes: 30
     steps:
       # A shallow checkout, as the ubuntu ship-pr jobs take: these suites build their own
       # scratch repositories. The full history belongs to the fleet launcher, in the job below.
@@ -545,8 +567,9 @@ jobs:
     runs-on: macos-latest
     # The merge gate's critical path, and the job that drifts: its fleet launcher suite grows
     # with each stream-channel case that waits in real time (ludics-lite#259). Sized by THE CAPS
-    # above; splitting it was considered and declined (ludics-lite#474).
-    timeout-minutes: 46
+    # above; splitting it was considered and declined (ludics-lite#474). Re-measured on v2
+    # (ludics-lite#403): 1822-2088s over the runs named at fleet-worker, x1.5.
+    timeout-minutes: 53
     steps:
       - uses: actions/checkout@v4
         with:
