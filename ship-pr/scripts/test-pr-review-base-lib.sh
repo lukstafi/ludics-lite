@@ -189,7 +189,8 @@ FIRST_WID_CACHE="$TEST_ROOT/first-wid"
 
 # runs_json <workflow id> <json array of run overrides>, newest first. Each row defaults to a
 # completed push run of a workflow named "ci", with a distinct id and a created_at that decreases
-# with the index, so the fixture reads the way the API's own newest-first page does.
+# with the index, so the fixture reads the way the API's own newest-first page does: one minute
+# apart from 2026-09-10T00:59:00Z (epoch 1789001940), as ISO dates however long the page.
 runs_json() {
   jq -cn --argjson wf "$1" --argjson runs "$2" \
     '{workflow_runs: [$runs | to_entries[] | .value + {
@@ -198,7 +199,7 @@ runs_json() {
         name: (.value.name // "ci"),
         status: (.value.status // "completed"),
         head_sha: (.value.head_sha // "0000000000000000000000000000000000000000"),
-        created_at: (.value.created_at // ("2026-09-10T00:" + ((59 - .key) | tostring) + ":00Z")),
+        created_at: (.value.created_at // (1789001940 - 60 * .key | todate)),
         html_url: (.value.html_url //
                    ("https://example.test/runs/" + ((.value.id // (1000 * $wf + .key)) | tostring)))
       }]}'
@@ -778,6 +779,25 @@ test_an_aged_run_is_stamped_at_the_read() {
     "the stamp is cleared with the rest of the fixture"
 }
 
+# A row's default created_at is one minute older than the row above it, from 2026-09-10T00:59:00Z,
+# as an ISO date the API would serve, however long the page: past sixty rows the minute used to go
+# negative (`00:-1:00Z`), and from the fiftieth it lost its leading zero (`00:9:00Z`), which sorts
+# as NEWER than `00:59:00Z` byte for byte -- and `base` orders a feed by created_at as bytes.
+test_runs_json_dates_are_a_minute_apart_past_sixty_rows() {
+  local rows
+  rows=$(runs_json 1 "$(jq -cn '[range(120) | {}]')")
+  assert_eq "$(jq -r '.workflow_runs[0].created_at' <<<"$rows")" "2026-09-10T00:59:00Z" "row 0 is today's"
+  assert_eq "$(jq -r '.workflow_runs[49].created_at' <<<"$rows")" "2026-09-10T00:10:00Z" "row 49 is today's"
+  assert_eq "$(jq -r '.workflow_runs[59].created_at' <<<"$rows")" "2026-09-10T00:00:00Z" \
+    "row 59 is today's instant, with its leading zero"
+  assert_eq "$(jq -r '.workflow_runs[60].created_at' <<<"$rows")" "2026-09-09T23:59:00Z" \
+    "row 60 is the minute before, on the day before"
+  assert_eq "$(jq -r '[.workflow_runs[].created_at | fromdateiso8601] | . == (sort | reverse) and (unique | length) == 120' <<<"$rows")" \
+    true "every row parses, a minute apart, newest first"
+  assert_eq "$(jq -r '[.workflow_runs[].created_at] | . == (sort | reverse)' <<<"$rows")" true \
+    "and as bytes too, the order base sorts them in"
+}
+
 # Every setter refuses what it cannot mean. `spend_grace 0.5` is the one that would pass for
 # honoured: the fixture would sleep a fraction on the platforms whose sleep takes one and refuse
 # on the fleet's others, so a case would spend a grace on one box and not on the next.
@@ -883,6 +903,7 @@ tests=(
   test_the_runs_read_delay_is_round_ones_and_once
   test_an_aged_run_is_stamped_at_the_read
   test_a_compare_ends_at_its_head
+  test_runs_json_dates_are_a_minute_apart_past_sixty_rows
   test_the_fixture_setters_refuse_what_they_cannot_mean
   test_a_suite_that_skips_the_preamble_is_refused
   test_a_suite_that_shadows_the_transport_is_refused
