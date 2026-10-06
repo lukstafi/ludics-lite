@@ -17,9 +17,9 @@
 #     state_merge / state_detail <line> token, age, mergeability, and the rest, pipes kept
 #   test_tmpdir <var> <label>           a throwaway directory in <var> (any name but the two the
 #                                       function itself uses, which it refuses), removed at exit —
-#                                       this file owns the EXIT trap (pr-review.sh installs one of
-#                                       its own when sourced, which the suites used to re-install
-#                                       by hand), so a suite never touches `trap`. <label> is
+#                                       this file owns the EXIT trap (pr-review.sh, sourced,
+#                                       installs none, and the guard below keeps it so), so a
+#                                       suite never touches `trap`. <label> is
 #                                       interpolated into the created directory's NAME, so a case
 #                                       that must prove something about a spaced path just asks
 #                                       for one — test_the_guard_survives_a_path_with_spaces
@@ -1042,7 +1042,7 @@ $file"
 # that it stays so: a trap that comes back is refused here, by name, before a suite can run
 # without it, rather than discovered as debris in TMPDIR.
 lib_refuse_trap() {
-  echo "$LIB_BASENAME: REFUSING to run: $1 — this file installs its own EXIT trap over it, REPLACING it, so it would never run in a suite. Leave pr-review.sh trapless (its forward cleans up after itself), or give the trap a named cleanup and have this file's trap call it; restating it instead is how ludics-lite#191's snapshot directory leaked from every suite run in silence (ludics-lite#195)." >&2
+  echo "$LIB_BASENAME: REFUSING to run: $1 — this file installs its own EXIT trap over it, REPLACING it, so it would never run in a suite. Leave pr-review.sh trapless: a temporary it makes is removed by the code that made it, as the forward removes its bridge file. A trap's cleanup restated here instead is how ludics-lite#191's snapshot directory leaked from every suite run in silence (ludics-lite#195)." >&2
   exit 2
 }
 
