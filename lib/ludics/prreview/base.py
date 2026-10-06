@@ -928,6 +928,14 @@ class Wait:
         b, repo = self.b, self.repo
         knobs = b.knobs
         grace, wait_for = knobs.absent_grace, self.args.wait_for
+        started = b.clock.now()
+        # A --wait is the branch's observer in the polling budget (ludics-lite#551): it waits a
+        # quota hold out within its ceiling from its first read (the default branch's, when none is
+        # named), and it is one per branch, refused before it reads the runs.
+        budget = b.session.budget
+        if wait_for > 0 and budget is not None:
+            budget.wait_from = started
+            budget.wait_until = started + wait_for
         if not self.branch:
             doc = b.gh_json(["api", f"repos/{repo}"])
             branch = "" if isinstance(doc, (GhFailed, GhUnanswered)) else jq_raw(get(doc, "default_branch"))
@@ -937,14 +945,8 @@ class Wait:
             self.branch = branch
         branch = self.branch
         self.ebranch = encode_ref(branch)
-        started = b.clock.now()
-        # A --wait is the branch's observer in the polling budget (ludics-lite#551): one per branch,
-        # refused before it reads the runs, and it waits a quota hold out within its ceiling.
-        budget = b.session.budget
         if wait_for > 0 and budget is not None:
             budget.base_claim(repo, branch)
-            budget.wait_from = started
-            budget.wait_until = started + wait_for
         cap = budget.build_cap if budget is not None else knobs.checks_interval
         last_sig = ""
         last_pause: int | None = None

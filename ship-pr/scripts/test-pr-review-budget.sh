@@ -405,10 +405,16 @@ test_a_second_observer_of_the_pr_is_refused() {
   run second_checks cmd_checks "$REPO#7" --wait
   run second_merge cmd_merge "$REPO#7" --wait
   retune ADVISORY_FROM_ENV=1
+  # The review observer is another kind: a second watch of the PR is refused alike.
+  mkdir -p "$STATE_DIR/observers/example~repo#7.review"
+  printf '%s\n%s\n' "$holder" "$T0" >"$STATE_DIR/observers/example~repo#7.review/owner"
+  run second_watch eval 'WATCH_INTERVAL=1 WATCH_TIMEOUT=1 cmd_watch 7 0,0,0'
   kill "$holder" 2>/dev/null || :
   wait "$holder" 2>/dev/null || :
   assert_eq "$(rc second_checks) $(rc second_merge)" "2 2" \
     "checks --wait and merge --wait are refused alike ($(err second_checks) / $(err second_merge))"
+  assert_eq "$(rc second_watch)" 2 "and so is a second watch ($(err second_watch))"
+  assert_contains "$(err second_watch)" "review observer: pid $holder" "naming the one already watching"
   assert_eq "$(requests)" "" "before any read of their own"
   # The holder is gone now: its lock is replaced, and a single read never takes one.
   run third cmd_checks "$REPO#7" --wait
@@ -558,6 +564,25 @@ test_resolving_the_repo_passes_the_hold() {
   assert_contains "$(err refused)" "gh repo view was refused on quota" "with no repository guessed from the remote"
   assert_eq "$(out refused)" "" "and nothing on stdout"
   assert_eq "$(standing | cut -f2)" graphql "and it sets the hold, on GraphQL"
+}
+
+# base --wait waits a hold out within its ceiling (ludics-lite#551) from its first read: with no
+# branch named, that is the read of the default branch, before the branch's observer is known.
+# (The fixture's repository has no default branch, so base stops right after that read, exit 3.)
+test_base_wait_waits_a_hold_from_its_first_read() {
+  reset_fixture
+  plant_hold "$((T0 + 600))" graphql 600
+  run base eval 'REPO=; cmd_base "$FIXTURE_REPO" --wait=1200'
+  assert_eq "$(cat "$SLEEP_LOG")" 600 "the hold is waited out ($(err base))"
+  assert_eq "$(requests | tr '\n' '|')" "probe graphql ok|read repos/$REPO|" \
+    "then the default branch is read"
+  assert_eq "$(rc base)" 3 "which the fixture leaves empty"
+  # Without --wait, the same hold is exit 3 at once.
+  reset_fixture
+  plant_hold "$((T0 + 600))" graphql 600
+  run once eval 'REPO=; cmd_base "$FIXTURE_REPO"'
+  assert_eq "$(rc once) $(cat "$SLEEP_LOG")" "3 " "no wait without --wait ($(err once))"
+  assert_eq "$(requests)" "" "and no request"
 }
 
 # Entries for different endpoints end separately and are probed separately: GraphQL and REST have
@@ -999,6 +1024,7 @@ run_tests \
   test_an_ownerless_probe_lock_is_recovered \
   test_a_hold_at_the_start_counts_toward_the_ceiling \
   test_resolving_the_repo_passes_the_hold \
+  test_base_wait_waits_a_hold_from_its_first_read \
   test_a_refusal_during_the_probe_survives_the_lift \
   test_a_reap_keeps_a_lock_retaken_meanwhile \
   test_a_callers_call_is_outside_the_budget \

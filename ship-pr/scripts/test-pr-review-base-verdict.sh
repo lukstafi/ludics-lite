@@ -496,6 +496,27 @@ test_a_still_base_wait_backs_off_to_the_build_cap() (
     "an unchanged branch doubles the pause up to the cap, the last cut to the ceiling"
 )
 
+# The branch's runs are part of what "moved" means: a run that goes from queued to in progress,
+# the round's counts unchanged, resets the pause to the interval.
+test_a_moving_base_run_resets_the_pause() (
+  export SHIP_PR_TEST_CLOCK="$TEST_ROOT/clock"
+  date +%s >"$SHIP_PR_TEST_CLOCK"
+  sleep() {
+    printf '%s\n' "$1" >>"$TEST_ROOT/sleeps"
+    printf '%s\n' "$(($(cat "$SHIP_PR_TEST_CLOCK") + $1))" >"$SHIP_PR_TEST_CLOCK"
+  }
+  reset_fixture
+  : >"$TEST_ROOT/sleeps"
+  retune CHECKS_INTERVAL=60
+  BUILD_POLL_CAP=600
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" '[{status:"queued", conclusion:null, head_sha:$c, id:6172}]')")
+  runs_from_round 2 1 "$(jq -cn --arg c "$SHA_C" '[{status:"in_progress", conclusion:null, head_sha:$c, id:6172}]')"
+  run_base --wait=1000
+  assert_eq "$BASE_RC" 4 "the ceiling ends the wait without a verdict ($BASE_OUTPUT)"
+  assert_eq "$(tr '\n' ' ' <"$TEST_ROOT/sleeps")" "60 60 120 240 480 40 " \
+    "the run's move resets the pause, which then doubles again"
+)
+
 test_a_second_base_wait_on_a_branch_is_refused() (
   local holder
   reset_fixture
@@ -527,6 +548,7 @@ tests=(
   test_a_branch_name_is_percent_encoded
   test_the_default_branch_is_read_when_none_is_named
   test_a_still_base_wait_backs_off_to_the_build_cap
+  test_a_moving_base_run_resets_the_pause
   test_a_second_base_wait_on_a_branch_is_refused
   test_a_branch_no_workflow_ran_on_is_not_green
   test_a_workflow_the_moved_tip_added_is_read
