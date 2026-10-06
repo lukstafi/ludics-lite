@@ -65,8 +65,9 @@ RUN_STATUSES=()      # the run await's reads, in order ("" = completed at once)
 GRAPHQL_PROBE=""     # how GraphQL's probe answers: "" (200, quota left), exhausted (a 200 with
                      # Remaining 0), secondary (a 200 whose body says so, no header)
 
-# No merge here reaches its call: every one stops at the gate, or before it, so the reads a merge
-# makes after the gate (the drift, the series, the open threads) are never asked for.
+# A merge that passes its gate reads on before its call: the drift and the commit series (which the
+# fixture's PR answers too thinly to judge, a warning each and no stop) and the open review threads
+# (none open). A case that wants something to land after the gate hooks those reads.
 
 # The clock. `date +%s` is every reader's (the budget's and the gate's); any other form is the
 # real date's.
@@ -207,9 +208,12 @@ gh() {
   printf 'read %s\n' "$FIXTURE_ENDPOINT" >>"$CALL_LOG"
   case "$FIXTURE_ENDPOINT" in
   "repos/$REPO/pulls/7")
-    body=$(jq -cn --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" \
+    # Merged once a merge call has gone out, as merge's read after its call wants it.
+    a=false state=open
+    [ ! -s "$MERGE_LOG" ] || a=true state=closed
+    body=$(jq -cn --arg sha "$HEAD_SHA" --arg base "$BASE_SHA" --argjson merged "$a" --arg state "$state" \
       '{head:{sha:$sha, ref:"topic"}, base:{sha:$base}, updated_at:"2026-10-04T00:00:00Z",
-        merged:false, state:"open", mergeable:true, mergeable_state:"clean"}')
+        merged:$merged, state:$state, mergeable:true, mergeable_state:"clean"}')
     ;;
   "repos/$REPO/commits/$HEAD_SHA/check-runs?filter=latest&per_page=100")
     state=$(next_check)
@@ -225,6 +229,8 @@ gh() {
   "repos/ghe/repo") body='{}' ;;
   # `base`'s read of the repository it resolved: no default branch, so it stops there (exit 3).
   "repos/$REPO") body='{"default_branch":""}' ;;
+  # The open review threads a merge reads after its gate: none.
+  graphql) body=$(review_threads_answer '[]' "$@") ;;
   "repos/$REPO/actions/runs/101/jobs?per_page=100")
     body='{"jobs":[{"name":"build","status":"in_progress","conclusion":null,"created_at":"2026-10-04T00:00:00Z","completed_at":null}]}'
     ;;
@@ -714,14 +720,32 @@ test_an_ended_hold_lifted_before_the_lock_is_not_probed() {
 
 # merge's own call stays in the budget with a caller's `gh pr merge` flags forwarded: a write
 # during a hold is not sent.
-# (The merge call itself, gated with the flags forwarded: test_prreview_budget.py.)
+# The hold lands on the last read after the gate (the open threads), so the gate and every read
+# pass and only the merge call itself meets it.
 test_a_forwarded_merge_is_still_gated() {
   reset_fixture
-  plant_hold "$((T0 + 600))" graphql 600
+  run control cmd_merge "$REPO#7" -- --squash
+  assert_eq "$(rc control)" 0 "with no hold the merge goes through ($(err control))"
+  assert_contains "$(cat "$MERGE_LOG")" "--squash" "with the flags forwarded"
+  reset_fixture
+  READ_HOOK='[ "$FIXTURE_ENDPOINT" != graphql ] || plant_hold "$((T0 + 600))" graphql 600'
   run merge cmd_merge "$REPO#7" -- --squash
   assert_eq "$(rc merge)" 3 "the merge is not sent during the hold ($(err merge))"
-  assert_eq "$(cat "$MERGE_LOG")" "" "no merge call at all"
-  assert_eq "$(requests)" "" "and no request"
+  assert_contains "$(requests | tail -n 1)" "read graphql" "the threads were read, the hold landing as they were"
+  assert_eq "$(cat "$MERGE_LOG")" "" "and no merge call at all"
+}
+
+# The gate's verdict is about its last round: no read after it waits a hold out (merge --wait's
+# ceiling is the gate's), so a merge never lands on a verdict the wait made old. A hold landing on
+# the drift read, the first read after the gate, stops the merge at the threads read, exit 3.
+test_no_read_after_the_gate_waits_a_hold() {
+  reset_fixture
+  READ_HOOK='case "$FIXTURE_FILTER" in *mergeable_state*) plant_hold "$((T0 + 600))" graphql 600 ;; esac'
+  run merge cmd_merge "$REPO#7" --wait=1200
+  assert_eq "$(rc merge)" 3 "the merge stops ($(err merge))"
+  assert_contains "$(err merge)" "review-threads read" "at the threads read"
+  assert_eq "$(cat "$SLEEP_LOG")" "" "with no wait"
+  assert_eq "$(cat "$MERGE_LOG")" "" "and no merge call"
 }
 
 # A wait behind another process's recovery probe is a wait too: it marks the round for a re-read,
@@ -750,8 +774,6 @@ test_a_wait_behind_a_probe_marks_the_round() {
   assert_eq "$(cat "$SLEEP_LOG")" 5 "after one wait"
 }
 
-# An observer's quota refusal outside the budget (an Enterprise GH_HOST) gets no second try: with
-# no hold to wait for, a second read is only another request during the incident.
 # An observer on another host is never retried on quota: since ludics-lite#551 it is refused before
 # its first request, so there is no refusal to retry.
 test_an_out_of_scope_refusal_is_not_retried() {
@@ -994,6 +1016,7 @@ run_tests \
   test_a_fresh_state_directory_still_probes \
   test_an_ended_hold_lifted_before_the_lock_is_not_probed \
   test_a_forwarded_merge_is_still_gated \
+  test_no_read_after_the_gate_waits_a_hold \
   test_a_wait_behind_a_probe_marks_the_round \
   test_an_out_of_scope_refusal_is_not_retried \
   test_a_host_qualified_run_await_is_scoped_by_its_host \
