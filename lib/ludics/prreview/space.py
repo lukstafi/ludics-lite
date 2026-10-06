@@ -16,9 +16,10 @@ Boundary: one character (or, in a single-byte locale, one byte) at a time. Not r
 3.2's matching of a string that MIXES invalid bytes with multibyte whitespace, which bash itself
 answers inconsistently between its two expansions. Where the C library cannot be reached (a native
 Windows interpreter under Git Bash), the locale is read off LC_ALL, LC_CTYPE and LANG as Cygwin
-reads it -- no setting at all is C.UTF-8 there -- and a UTF-8 one gets the class Cygwin's newlib and
-glibc both answer: Unicode's spaces and separators without the no-break ones (U+00A0, U+2007,
-U+202F).
+reads it -- no setting at all is C.UTF-8 there -- and a UTF-8 one gets the class the bash there
+asks, newlib's ``iswspace_l``: every space separator (Zs) with the no-break ones (U+00A0, U+2007,
+U+202F) included, unlike glibc's, plus the line and paragraph separators. Git Bash's bash read a
+body of U+00A0, U+2003 and a space as empty under en_US.UTF-8 (windows git bash run 37377447173).
 """
 
 import ctypes
@@ -41,9 +42,10 @@ class _Classes:
     utf8: bool
 
 
-# newlib's and glibc's iswspace past ASCII in a UTF-8 locale.
+# newlib's iswspace past ASCII in a UTF-8 locale: Zs, Zl and Zp ("exclude <noBreak>?" is left a
+# question in its source, so U+00A0, U+2007 and U+202F are in).
 _UNICODE_SPACE = frozenset(
-    (0x1680, *range(0x2000, 0x2007), 0x2008, 0x2009, 0x200A, 0x2028, 0x2029, 0x205F, 0x3000)
+    (0x00A0, 0x1680, *range(0x2000, 0x200B), 0x2028, 0x2029, 0x202F, 0x205F, 0x3000)
 )
 
 

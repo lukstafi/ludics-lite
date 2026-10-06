@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from ludics import cli
-from ludics.proc import decode, substitution
+from ludics.proc import command_argv, decode, substitution, windows_command_line
 
 PROG = "post-merge-cleanup.sh"
 
@@ -60,34 +60,6 @@ def _redirect(stream: Stream) -> int | None:
             return subprocess.PIPE
 
 
-_WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".com", ".bat", ".cmd")
-
-
-def _is_script(path: str) -> bool:
-    """A file Windows cannot start by itself: no executable suffix, and a ``#!`` line."""
-    if path.lower().endswith(_WINDOWS_EXECUTABLE_SUFFIXES):
-        return False
-    try:
-        with open(path, "rb") as handle:
-            return handle.read(2) == b"#!"
-    except OSError:
-        return False
-
-
-def _windows_lookup(name: str) -> str | None:
-    """PATH as Git Bash searches it: in each directory, the bare name (a ``#!`` script such as a
-    suite's fake ``git``) and then the name with each executable suffix, first match winning."""
-    suffixes = [s for s in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if s]
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        if not directory:
-            continue
-        for candidate in [name, *(name + suffix.lower() for suffix in suffixes)]:
-            path = os.path.join(directory, candidate)
-            if os.path.isfile(path) and (candidate != name or _is_script(path)):
-                return path
-    return None
-
-
 def msys_name(name: str) -> str:
     """A file name as Git Bash's own tools spell it. Windows names cannot hold characters 1-31 or
     ``"*:<>?|``, so MSYS stores each as the private-use character U+F000 plus its code and maps it
@@ -102,48 +74,8 @@ def msys_name(name: str) -> str:
     )
 
 
-def command_argv(name: str) -> list[str] | None:
-    """The argv prefix that runs ``name`` as the shell found it on PATH.
-
-    Under Git Bash the shell ran a ``#!`` script on PATH -- a suite's fake ``git``, a wrapper a box
-    installs -- through its own exec, which reads the line; Windows cannot start such a file, so a
-    native interpreter hands it to the bash on PATH, which is Git Bash's own. Elsewhere the file
-    is started directly, as the shell started it."""
-    exe = _windows_lookup(name) if os.name == "nt" else shutil.which(name)
-    if exe is None:
-        return None
-    if os.name == "nt" and _is_script(exe):
-        shell = shutil.which("bash")
-        if shell is not None:
-            return [shell, exe]
-    return [exe]
-
-
 def git_executable() -> list[str] | None:
     return command_argv("git")
-
-
-def windows_command_line(argv: list[str]) -> str:
-    """Every argument double-quoted, by the C runtime's rules. A Cygwin/MSYS program started by a
-    native one parses its own command line and expands each UNQUOTED word as a glob, braces
-    included -- `<oid>^{object}` arrived at a fake git as `<oid>^object` -- so a #! script run
-    through Git Bash's bash gets nothing unquoted."""
-    words: list[str] = []
-    for arg in argv:
-        out: list[str] = []
-        slashes = 0
-        for char in arg:
-            if char == "\\":
-                slashes += 1
-                continue
-            if char == '"':
-                out.append("\\" * (2 * slashes + 1) + '"')
-            else:
-                out.append("\\" * slashes + char)
-            slashes = 0
-        out.append("\\" * (2 * slashes))
-        words.append('"' + "".join(out) + '"')
-    return " ".join(words)
 
 
 def spawn_args(args: list[str]) -> list[str] | str | None:

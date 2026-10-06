@@ -594,6 +594,30 @@ py_native_path() {
   printf '%s\n' "$1"
 }
 
+# <subcommand> <args...>: PY_ARGS, the same words with the ones the Python opens as files in
+# native form -- `body`'s file (but `-`) and `base --integration-records` -- which MSYS would have
+# rewritten had py_forward not turned its rewriting off.
+py_native_args() {
+  local sub="$1" a n=0 next=""
+  PY_ARGS=("$1")
+  shift
+  for a in "$@"; do
+    n=$((n + 1))
+    if [ -n "$next" ]; then
+      next=""
+      a=$(py_native_path "$a")
+    else
+      case "$sub:$a" in
+      base:--integration-records) next=1 ;;
+      base:--integration-records=*) a="--integration-records=$(py_native_path "${a#--integration-records=}")" ;;
+      body:-) ;;
+      body:*) [ "$n" -ne 2 ] || a=$(py_native_path "$a") ;;
+      esac
+    fi
+    PY_ARGS+=("$a")
+  done
+}
+
 py_forward() { # <exec|call> <subcommand> <args...>
   local how="$1" py pair name state rc fn bridged=""
   local -a env_args=()
@@ -609,12 +633,31 @@ py_forward() { # <exec|call> <subcommand> <args...>
     name=${pair%%=*}
     env_args+=("${pair#*=}=${!name-}")
   done
+  # Under Git Bash, two hand-overs. This bash: the native Python asks it `kill -0` about the MSYS
+  # pids in a leftover's name (tmp_sweep_stale), which a Windows process cannot ask about itself.
+  # And the words as typed: MSYS rewrites a native program's argument that looks like a POSIX path,
+  # so `/repo#1` arrived as `C:/Program Files/Git/repo#1`, and a reply body starting with a slash
+  # would be posted rewritten -- words no function of this shell ever saw rewritten. The file
+  # arguments are converted here instead (py_native_args). `retry` keeps the rewrite: its words go
+  # on to gh, which the shell started directly, rewrite included.
+  local -a py_args=("$@")
+  case "${OSTYPE:-}" in
+  msys* | cygwin*)
+    env_args+=("LUDICS_CALLER_SHELL=$(py_native_path "$BASH")")
+    if [ "${1:-}" != retry ]; then
+      env_args+=("LUDICS_CALLER_ARG_CONV_EXCL=${MSYS2_ARG_CONV_EXCL+=$MSYS2_ARG_CONV_EXCL}")
+      env_args+=("MSYS2_ARG_CONV_EXCL=*")
+      py_native_args "$@"
+      py_args=("${PY_ARGS[@]}")
+    fi
+    ;;
+  esac
   for fn in "${PY_BRIDGE_COMMANDS[@]}"; do
     if declare -F "$fn" >/dev/null; then bridged="$bridged $fn"; fi
   done
   if [ -z "$bridged" ]; then
-    [ "$how" != exec ] || exec env "${env_args[@]}" "$py" -m ludics.prreview "$@"
-    env "${env_args[@]}" "$py" -m ludics.prreview "$@"
+    [ "$how" != exec ] || exec env "${env_args[@]}" "$py" -m ludics.prreview "${py_args[@]}"
+    env "${env_args[@]}" "$py" -m ludics.prreview "${py_args[@]}"
     rc=$?
   else
     # Keyed by the owning pid, like every temporary path pr-review.sh makes, and removed before
@@ -624,7 +667,7 @@ py_forward() { # <exec|call> <subcommand> <args...>
     py_bridge_state >"$state"
     env "${env_args[@]}" LUDICS_BRIDGE_FUNCS="${bridged# }" \
       LUDICS_BRIDGE_STATE="$(py_native_path "$state")" \
-      LUDICS_BRIDGE_SHELL="$(py_native_path "$BASH")" "$py" -m ludics.prreview "$@"
+      LUDICS_BRIDGE_SHELL="$(py_native_path "$BASH")" "$py" -m ludics.prreview "${py_args[@]}"
     rc=$?
     rm -f "$state"
   fi

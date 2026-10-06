@@ -138,7 +138,12 @@ class SpaceTable(unittest.TestCase):
                 self.assertEqual(table.utf8, utf8)
                 self.assertEqual(table.wide(0x3000), utf8)
                 self.assertEqual(table.wide(0x2003), utf8)
-                self.assertFalse(table.wide(0x00A0), "a no-break space is not whitespace there")
+                # newlib's iswspace takes every Zs, the no-break ones included (Git Bash's bash
+                # read U+00A0 as whitespace under en_US.UTF-8, windows git bash run 37377447173).
+                for code in (0x00A0, 0x2007, 0x202F, 0x2028, 0x2029):
+                    self.assertEqual(table.wide(code), utf8, hex(code))
+                self.assertFalse(table.wide(0x200B), "a zero-width space is Cf, not a separator")
+                self.assertFalse(table.wide(0x0085), "nor is NEL, a control")
                 self.assertTrue(table.byte(ord("\t")))
                 self.assertFalse(table.byte(0xA0))
 

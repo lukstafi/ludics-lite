@@ -178,6 +178,16 @@ class CallerPythonpath(unittest.TestCase):
         cli.restore_caller_environment(env)
         self.assertEqual(env, {"PYTHONCOERCECLOCALE": "0"})
 
+    def test_the_forwards_arg_conversion_switch_is_the_callers_again(self) -> None:
+        # pr-review.sh's Git Bash forward turns MSYS's argument rewriting off for this interpreter
+        # only; the bridge's bash must rewrite its own native children's arguments as before.
+        env = {"MSYS2_ARG_CONV_EXCL": "*", "LUDICS_CALLER_ARG_CONV_EXCL": ""}
+        cli.restore_caller_environment(env)
+        self.assertEqual(env, {})
+        env = {"MSYS2_ARG_CONV_EXCL": "*", "LUDICS_CALLER_ARG_CONV_EXCL": "=--foo"}
+        cli.restore_caller_environment(env)
+        self.assertEqual(env, {"MSYS2_ARG_CONV_EXCL": "--foo"})
+
 
 if __name__ == "__main__":
     unittest.main()

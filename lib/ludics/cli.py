@@ -101,7 +101,14 @@ def die_of_sigpipe() -> int:
 # scripts/py's notes of the caller's PYTHONPATH and PYTHONCOERCECLOCALE: ``=<value>`` when it was
 # set, empty when not.
 CALLER_PYTHONPATH = "LUDICS_CALLER_PYTHONPATH"
-CALLER_NOTES = {CALLER_PYTHONPATH: "PYTHONPATH", "LUDICS_CALLER_PYTHONCOERCECLOCALE": "PYTHONCOERCECLOCALE"}
+# pr-review.sh's forward under Git Bash sets MSYS2_ARG_CONV_EXCL=* so that this interpreter's
+# arguments arrive as typed, and notes the caller's own value here the same way.
+CALLER_ARG_CONV_EXCL = "LUDICS_CALLER_ARG_CONV_EXCL"
+CALLER_NOTES = {
+    CALLER_PYTHONPATH: "PYTHONPATH",
+    "LUDICS_CALLER_PYTHONCOERCECLOCALE": "PYTHONCOERCECLOCALE",
+    CALLER_ARG_CONV_EXCL: "MSYS2_ARG_CONV_EXCL",
+}
 
 
 def restore_caller_environment(env: MutableMapping[str, str]) -> None:
@@ -110,7 +117,9 @@ def restore_caller_environment(env: MutableMapping[str, str]) -> None:
     runs -- a batch under ``fleet-worker.sh execution slot``, a local far side, git's hooks, a
     fixture's gh -- sees the caller's environment, not the ``ludics`` package. This process's own
     path and locale were fixed at startup. A run not through scripts/py has no notes, and keeps
-    what it has."""
+    what it has. Likewise MSYS2_ARG_CONV_EXCL, which pr-review.sh's forward set only for this
+    interpreter's own start: an MSYS program this one runs (the bridge's bash) must rewrite its
+    native children's arguments as the caller's shell would."""
     for note, name in CALLER_NOTES.items():
         saved = env.pop(note, None)
         if saved is None:
