@@ -26,10 +26,12 @@ porters: where code goes, how a subcommand is forwarded, and how to check it.
 
 ```
 scripts/py                       the interpreter wrapper: the first Python >= 3.12, run as
-                                 `-X utf8 -P` with PYTHONPATH=lib, the caller's own PYTHONPATH
-                                 noted in LUDICS_CALLER_PYTHONPATH (scripts/test-py.sh)
+                                 `-X utf8 -P` with PYTHONPATH=lib and PYTHONCOERCECLOCALE=0,
+                                 the caller's own values noted in LUDICS_CALLER_PYTHONPATH and
+                                 LUDICS_CALLER_PYTHONCOERCECLOCALE (scripts/test-py.sh)
 lib/ludics/cli.py                shared by every entry point: Exit, main (the caller's
-                                 PYTHONPATH back, then main_guard), main_guard (an Exit's message
+                                 PYTHONPATH and PYTHONCOERCECLOCALE back, then main_guard),
+                                 main_guard (an Exit's message
                                  and status; a closed stdout ends the command by SIGPIPE, 141, as
                                  it ended the shell's printf), say/emit/note
 lib/ludics/proc.py               run_tool and the shell bridge
@@ -146,3 +148,9 @@ execution` sends its source to the anchor box, where a Python >= 3.12 found by t
 probe runs it from stdin. So it imports nothing from `ludics` (the anchor's checkout may hold
 another version) and its positional argv is a contract; `issue-wave/scripts/test-fleet-execution.py`
 loads it with `runpy` and patches `os.replace` between records.
+
+Every other far side of `fleet-worker.sh` -- the bash a worker verb runs on its box, local child or
+`ssh <box> bash -s` -- is still bash, the shell's heredocs byte for byte, in
+`lib/ludics/fleetworker/farside.py`: a box needs no Python for a worker's record, only for the
+batches it runs (`execution slot`) and, on the anchor, the registry. The one verb `fleet-worker.sh`
+still answers itself is `execution slot --probe`, which must answer on a box without Python 3.12.

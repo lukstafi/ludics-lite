@@ -1,1 +1,1 @@
-"""fleet-worker.sh's coordination verbs, ported (ludics-lite#403): ``python -m ludics.fleetworker``."""
+"""fleet-worker.sh, ported (ludics-lite#403): ``python -m ludics.fleetworker``; every verb but the slot probe."""

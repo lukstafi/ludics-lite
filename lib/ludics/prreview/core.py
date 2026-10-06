@@ -32,8 +32,9 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Literal, NoReturn
 
 from ludics import cli, proc
@@ -698,12 +699,40 @@ def _jq_doc(doc: Json) -> Json:
             return doc
 
 
-def json_stream(text: str) -> list[Json] | None:
-    """The documents of a concatenated JSON stream (what ``gh --paginate`` prints, one per page),
-    as ``jq -s`` reads them; None when any of it does not parse, a lone high-surrogate escape
-    included (see _jq_string)."""
-    decoder = json.JSONDecoder()
-    docs: list[Json] = []
+class JqLiteral(float):
+    """A number read with ``literals=True``: its value, and the text jq 1.8 prints for it while no
+    arithmetic has touched it -- the payload's own literal in decNumber's canonical spelling, which
+    is ``str(Decimal(...))`` exactly (``1E+2`` stays ``1E+2``, ``3.50`` keeps its zero, ``-0`` its
+    sign, ``1.5e3`` reads ``1.5E+3``). Arithmetic on one yields a plain float, as jq's yields a
+    double. ``jqsem.number_text`` and ``jqsem.tojson`` print the text."""
+
+    __slots__ = ("text",)
+    text: str
+
+    def __new__(cls, literal: str) -> "JqLiteral":
+        self = super().__new__(cls, literal)
+        self.text = str(Decimal(literal))
+        return self
+
+
+def _literal_int(literal: str) -> int | float:
+    # An integer literal prints as Python prints the int, save -0, whose sign jq keeps.
+    return JqLiteral(literal) if literal == "-0" else int(literal)
+
+
+class JsonStreamError(ValueError):
+    """json_docs: the stream stops parsing here; the documents before were yielded."""
+
+
+def json_docs(text: str, *, literals: bool = False) -> Iterator[Json]:
+    """The documents of a concatenated JSON stream one by one, as jq reads them: each is yielded
+    before the next is parsed, and a part that does not parse (a lone high-surrogate escape
+    included, see _jq_string) raises JsonStreamError there, so a caller can act on the documents
+    before the cut as ``jq`` does. With ``literals``, every non-integer number (and -0) is a
+    JqLiteral, printed as the payload spelled it."""
+    decoder = (
+        json.JSONDecoder(parse_float=JqLiteral, parse_int=_literal_int) if literals else json.JSONDecoder()
+    )
     pos = 0
     length = len(text)
     surrogates = _SURROGATE_SOURCE.search(text) is not None
@@ -711,15 +740,27 @@ def json_stream(text: str) -> list[Json] | None:
         while pos < length and text[pos] in " \t\n\r":
             pos += 1
         if pos >= length:
-            return docs
+            return
         try:
             doc, pos = decoder.raw_decode(text, pos)
-        except ValueError:
-            return None
-        try:
-            docs.append(_jq_doc(doc) if surrogates else doc)
-        except _Unparsed:
-            return None
+        except ValueError as e:
+            raise JsonStreamError(str(e)) from e
+        if surrogates:
+            try:
+                doc = _jq_doc(doc)
+            except _Unparsed as e:
+                raise JsonStreamError("a lone high surrogate") from e
+        yield doc
+
+
+def json_stream(text: str) -> list[Json] | None:
+    """The documents of a concatenated JSON stream (what ``gh --paginate`` prints, one per page),
+    as ``jq -s`` reads them; None when any of it does not parse, a lone high-surrogate escape
+    included (see _jq_string)."""
+    try:
+        return list(json_docs(text))
+    except JsonStreamError:
+        return None
 
 
 def api_list(session: GhSession, path: str, repo: str) -> ListResult:

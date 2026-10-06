@@ -29,6 +29,19 @@ LAB_SITE = Path(LAB_LOCKS.name) / 'hosts.sh'
 LAB_SITE.write_text('# wake-lab site file fixture: never sourced by the registry\n')
 os.environ['WAKE_LAB_HOSTS'] = str(LAB_SITE)
 os.environ['FLEET_LAB_HOST'] = 'fixture'
+# A dispatch to another box refreshes that box's skills checkout over ssh (ludics-lite#362), and the
+# fixture rosters name real fleet aliases (`rog`, `mac`): no case may reach a real box. Every
+# subprocess below inherits this PATH, whose `ssh` answers as a box that never answered (255, ssh's
+# own transport failure) and logs what it was asked, so the refresh is still exercised up to the
+# wire and read as REFRESH UNREACHABLE, never run.
+SSH_SHIM = tempfile.TemporaryDirectory(prefix='fleet-ssh-shim-')
+SSH_LOG = Path(SSH_SHIM.name) / 'calls'
+(Path(SSH_SHIM.name) / 'ssh').write_text(
+    '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$SSH_SHIM_LOG"\ncat > /dev/null\n'
+    'echo "ssh: shim: no real box is reached from this suite" >&2\nexit 255\n')
+(Path(SSH_SHIM.name) / 'ssh').chmod(0o755)
+os.environ['SSH_SHIM_LOG'] = str(SSH_LOG)
+os.environ['PATH'] = SSH_SHIM.name + os.pathsep + os.environ['PATH']
 with tempfile.TemporaryDirectory(prefix='fleet-execution-') as temporary:
     root = Path(temporary)
     env = {**os.environ, 'FLEET_ANCHOR': 'local', 'FLEET_LOCAL_BOX': 'fixture',
@@ -246,6 +259,8 @@ with tempfile.TemporaryDirectory(prefix='fleet-slots-') as temporary:
     change('run', {**request('run-1'), 'evidence': 'invoking the runner now'})
     first = records()['run-1']
     assert first['state'] == 'launching', first
+    # ...and the refresh after it reached for the execution host through the suite's ssh shim alone.
+    assert ' mac bash -s -- ' in SSH_LOG.read_text(), SSH_LOG.read_text() if SSH_LOG.exists() else 'no ssh call'
     assert [e['action'] for e in first['history']] == ['reserve', 'dispatch'], first['history']
     assert first['history'][1]['data'] == {'request_id': 'run-1', 'evidence': 'invoking the runner now'}
     assert first['request'] == request('run-1'), first['request']
@@ -926,3 +941,6 @@ with tempfile.TemporaryDirectory(prefix='fleet-window-order-') as temporary:
     assert [records()[n]['state'] for n in ['measure', 'iterate-a', 'iterate-b']] == ['concluded', 'launching', 'reserved']
     assert records()['iterate-b']['history'][-1]['action'] == 'restore'
     print('PASS: a crash between window records leaves nothing suspended by an absent measurement; a retry finishes')
+calls = SSH_LOG.read_text().splitlines() if SSH_LOG.exists() else []
+assert calls and all(' bash -s -- ' in call for call in calls), calls
+print('PASS: every cross-box refresh went to the suite\'s ssh shim (%d calls), never to a real box' % len(calls))

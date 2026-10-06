@@ -1233,9 +1233,9 @@ one subcommand) at a time behind unchanged command lines. Every Python entry poi
 `scripts/py`, which picks the first interpreter >= 3.12 (`scripts/test-py.sh`); a script's shell
 file stays the entry point and forwards to its module: `pr-review.sh` forwards the subcommands
 (every one of them, its shell half retired: what the script keeps is listed in
-`lib/ludics/README.md`) to `ludics.prreview`; `fleet-worker.sh` the
-verbs its forwarder names (claim, release, coordinator, halt, resume-launches, halted, gate and
-every `execution` action but `slot --probe`) to `ludics.fleetworker`; `check-prompts.sh` forwards
+`lib/ludics/README.md`) to `ludics.prreview`; `fleet-worker.sh` every verb but
+`execution slot --probe`, which it still answers in bash so a box without Python 3.12
+answers it, to `ludics.fleetworker`; `check-prompts.sh` forwards
 whole, to `ludics.checkprompts`, and `post-merge-cleanup.sh` its whole command line, to
 `ludics.postmergecleanup`. The shell suites above are the conformance suite for a port,
 unchanged. The package's own checks are `npx --yes pyright@1.1.414` (strict, `pythonVersion`

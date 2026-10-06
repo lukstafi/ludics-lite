@@ -148,7 +148,8 @@ class WindowPayload(unittest.TestCase):
 
 
 class CallerPythonpath(unittest.TestCase):
-    """scripts/py's note puts the caller's PYTHONPATH back for every child of an entry point."""
+    """scripts/py's notes put the caller's PYTHONPATH and PYTHONCOERCECLOCALE back for every child
+    of an entry point."""
 
     def test_the_note_restores_set_empty_and_unset(self) -> None:
         env = {"PYTHONPATH": "/checkout/lib", "LUDICS_CALLER_PYTHONPATH": "=/mine"}
@@ -163,6 +164,19 @@ class CallerPythonpath(unittest.TestCase):
         env = {"PYTHONPATH": "/checkout/lib"}
         cli.restore_caller_environment(env)
         self.assertEqual(env, {"PYTHONPATH": "/checkout/lib"})
+
+    def test_the_locale_coercion_switch_is_put_back_too(self) -> None:
+        # scripts/py exports PYTHONCOERCECLOCALE=0 for its own interpreter; a local far side, a
+        # batch, a hook must see the caller's value -- here none at all -- as under the bash.
+        env = {"PYTHONCOERCECLOCALE": "0", "LUDICS_CALLER_PYTHONCOERCECLOCALE": ""}
+        cli.restore_caller_environment(env)
+        self.assertEqual(env, {})
+        env = {"PYTHONCOERCECLOCALE": "0", "LUDICS_CALLER_PYTHONCOERCECLOCALE": "=warn"}
+        cli.restore_caller_environment(env)
+        self.assertEqual(env, {"PYTHONCOERCECLOCALE": "warn"})
+        env = {"PYTHONCOERCECLOCALE": "0"}
+        cli.restore_caller_environment(env)
+        self.assertEqual(env, {"PYTHONCOERCECLOCALE": "0"})
 
 
 if __name__ == "__main__":
