@@ -209,6 +209,12 @@ def page_judged(rows: Sequence[RunRow]) -> bool:
     return any(r.status == "completed" and r.conclusion in _JUDGED for r in rows)
 
 
+def page_green(rows: Sequence[RunRow]) -> bool:
+    """A row that judged the branch GREEN: what bounds a red streak from below. A full page without
+    one is read deeper, a page that judged nothing included."""
+    return any(r.status == "completed" and conclusion_class(r.conclusion) == "green" for r in rows)
+
+
 @dataclass(frozen=True)
 class Folded:
     """One workflow of the fold: its newest run at all, newest COMPLETED run, and newest JUDGED
@@ -1066,8 +1072,10 @@ class Wait:
         return self.report(rnd, tip, waited_note, no_tip_verdict, interim_green)
 
     def read_runs(self, rnd: _Round) -> list[RunRow]:
-        """Each listed non-advisory workflow's push runs on the branch, a page of ten (a hundred
-        behind a page of ten that judged nothing, ludics-lite#535), each ordered newest first."""
+        """Each listed non-advisory workflow's push runs on the branch, a page of ten, each ordered
+        newest first. A full page with no GREEN row is read a hundred deep: one that judged nothing
+        (ludics-lite#535), whose verdict is below it, and one red to its end, whose streak's floor
+        is (#403's port-time item from #546), so ``red_detail`` can say where the red starts."""
         b, repo, branch = self.b, self.repo, self.branch
         raw: list[RunRow] = []
         for wid, wname in self.wf or []:
@@ -1077,12 +1085,17 @@ class Wait:
             if rows is None:
                 fail(3, f"could not read {repo}'s '{wname}' runs on {branch}",
                      f"({b.err_line()}); the base's health is UNKNOWN, which is NOT 'green'.")
-            if len(rows) >= 10 and not page_judged(rows):
-                rows = b.runs_page(wid, self.ebranch, 100)
-                if rows is None:
+            if len(rows) >= 10 and not page_green(rows):
+                deeper = b.runs_page(wid, self.ebranch, 100)
+                if deeper is not None:
+                    rows = deeper
+                elif not page_judged(rows):
                     fail(3, f"could not read {repo}'s '{wname}' runs on {branch} past its newest ten,",
                          f"none of which judged it ({b.err_line()}); the base's health is UNKNOWN,"
                          " which is NOT 'green'.")
+                # A page that judged it red keeps its red when the floor's read fails: the floor is
+                # decoration on a verdict already reached, and the streak walk then says the red
+                # may start further back.
                 if len(rows) >= 100 and not page_judged(rows):
                     rnd.exhausted_wids.add(wid)
             if rows:

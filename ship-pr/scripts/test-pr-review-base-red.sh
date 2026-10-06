@@ -73,14 +73,16 @@ test_red_names_the_failing_job_and_the_first_red_commit() {
 
 # The claim that must be able to fail: with no green under the streak, the first red commit is
 # NOT in evidence. Naming the oldest run the page happened to hold would send an owner bisecting
-# from the wrong end.
+# from the wrong end. The window is a hundred deep here: a page of ten with no green on it is read
+# a hundred deep for the streak's floor (below), so it is a hundred reds that leave none.
 test_a_window_of_only_reds_does_not_name_a_first_red_commit() {
   reset_fixture
-  RUNS_1=$(runs_json 1 "$(all_red_runs 10)")
+  RUNS_1=$(runs_json 1 "$(all_red_runs 110)")
   TIP=$SHA_0
   run_base
   assert_eq "$BASE_RC" 1 "a window of failures is red"
-  assert_contains "$BASE_OUTPUT" "red for all 10 judged run(s) in the window" \
+  assert_contains "$(cat "$REQUEST_LOG")" "event=push&per_page=100" "the page of ten was read deeper"
+  assert_contains "$BASE_OUTPUT" "red for all 100 judged run(s) in the window" \
     "the report should say how much of the window is red"
   assert_contains "$BASE_OUTPUT" "may start further back" \
     "an unbounded streak should say the first red commit is not known"
@@ -90,10 +92,52 @@ test_a_window_of_only_reds_does_not_name_a_first_red_commit() {
     "'red since' names a first red commit, which this window cannot support"
 }
 
+# A red streak longer than the page of ten: no green-class row on the page, so the floor is not
+# on it, and the runs are read a hundred deep as for a page that judged nothing (#403's port-time
+# item from #546) -- the streak walk then names where the red starts and that a green is under it.
+test_a_red_streak_past_the_page_finds_its_floor_below_it() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[range(3412; 3400; -1) | {conclusion: "failure", head_sha: $c, id: .}] +
+     [{conclusion: "failure", head_sha: $b, id: 3399},
+      {conclusion: "success", head_sha: $a, id: 3398}]')")
+  run_base
+  assert_eq "$BASE_RC" 1 "a red tip is red"
+  assert_contains "$(cat "$REQUEST_LOG")" "event=push&per_page=100" "the page of ten was read deeper"
+  assert_contains "$BASE_OUTPUT" "red since ${SHA_B:0:8} (run created" "the first red commit, below the page"
+  assert_contains "$BASE_OUTPUT" "13 run(s) back; the judged run before it was not red" \
+    "and the floor is known"
+  assert_not_contains "$BASE_OUTPUT" "may start further back" "the floor was read, not guessed"
+  # A green on the page bounds the streak there: one read of ten, as before.
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg a "$SHA_A" \
+    '[range(3509; 3500; -1) | {conclusion: "failure", head_sha: $c, id: .}] +
+     [{conclusion: "success", head_sha: $a, id: 3499}]')")
+  run_base
+  assert_contains "$BASE_OUTPUT" "red since ${SHA_C:0:8}" "the floor is on the page"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "event=push&per_page=100" "no deeper read for a page with a green"
+}
+
+# The floor's read failing leaves the red standing: the page already judged the branch red, and
+# where the streak starts is decoration on that verdict -- unknown, said so, never UNKNOWN overall.
+test_a_failed_floor_read_leaves_the_red_standing() {
+  reset_fixture
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg a "$SHA_A" \
+    '[range(3612; 3600; -1) | {conclusion: "failure", head_sha: $c, id: .}] +
+     [{conclusion: "success", head_sha: $a, id: 3599}]')")
+  FAIL_ENDPOINT="repos/$REPO/actions/workflows/1/runs?*per_page=100"
+  run_base
+  assert_eq "$BASE_RC" 1 "the page's red is the verdict ($BASE_OUTPUT)"
+  assert_contains "$BASE_OUTPUT" "is RED" "headlined as red"
+  assert_contains "$BASE_OUTPUT" "red for all 10 judged run(s) in the window" "the streak walk reads the page"
+  assert_contains "$BASE_OUTPUT" "may start further back" "and says the floor is not known"
+}
+
 # A burst's cancelled rows can fill the page of ten: the newest JUDGED run is then below it, and a red
 # there is the base's verdict, not "no verdict" (ludics-lite#535). The fold reads that workflow a
 # hundred deep, and the streak walk reads the same rows, so the red's first commit and its floor
-# are both named from below the page. A page that judged something is never read again.
+# are both named from below the page. A page that judged something green is never read again (a
+# page red to its end is, for its floor: the case above).
 test_a_red_behind_a_page_of_cancelled_runs_is_red() {
   reset_fixture
   RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" --arg z "$SHA_0" \
@@ -111,14 +155,14 @@ test_a_red_behind_a_page_of_cancelled_runs_is_red() {
   assert_contains "$BASE_OUTPUT" "(newest completed run: cancelled at ${SHA_C:0:8}, stopped not judged" \
     "the cancelled run on top stays visible as context"
   assert_contains "$(cat "$REQUEST_LOG")" "event=push&per_page=100" "found by the deeper read"
-  # The same red inside the page: one read of ten, as before.
+  # The same red inside the page, with its floor there too: one read of ten, as before.
   reset_fixture
-  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" \
-    '[range(3209; 3200; -1) | {conclusion: "cancelled", head_sha: $c, id: .}] +
-     [{conclusion: "failure", head_sha: $b, id: 3199}]')")
+  RUNS_1=$(runs_json 1 "$(jq -cn --arg c "$SHA_C" --arg b "$SHA_B" --arg a "$SHA_A" \
+    '[range(3209; 3201; -1) | {conclusion: "cancelled", head_sha: $c, id: .}] +
+     [{conclusion: "failure", head_sha: $b, id: 3199}, {conclusion: "success", head_sha: $a, id: 3198}]')")
   run_base
   assert_eq "$BASE_RC" 1 "a red on the page is red"
-  assert_not_contains "$(cat "$REQUEST_LOG")" "event=push&per_page=100" "no deeper read for a page that judged"
+  assert_not_contains "$(cat "$REQUEST_LOG")" "event=push&per_page=100" "no deeper read for a page that judged green"
 }
 
 # Nothing that was not JUDGED ends a streak: a cancelled run and a run still going both say
@@ -279,6 +323,8 @@ test_a_wait_that_runs_out_over_an_older_red_has_no_verdict() {
 tests=(
   test_red_names_the_failing_job_and_the_first_red_commit
   test_a_window_of_only_reds_does_not_name_a_first_red_commit
+  test_a_red_streak_past_the_page_finds_its_floor_below_it
+  test_a_failed_floor_read_leaves_the_red_standing
   test_a_red_behind_a_page_of_cancelled_runs_is_red
   test_an_unjudged_run_inside_the_streak_does_not_end_it
   test_an_unreadable_jobs_read_is_unknown_not_a_clean_bill
