@@ -426,6 +426,52 @@ class WaitLoop(unittest.TestCase):
         self.assertIn(f"RED      lint — failure at {B[:8]}", out)
         self.assertEqual(len(clock.slept), 2, "three rounds")
 
+    def test_a_rerun_of_a_judged_run_is_not_a_stale_page(self) -> None:
+        """A run an earlier round judged by, re-run (its ``run_attempt`` up) and the re-run
+        cancelled, leaves an older run the newest judged one. That is the branch's history moving,
+        not a stale page: the docs-only tip settles through paths-ignore as it would have on a
+        first read, rather than waiting out its ceiling. The re-run seen at its OLD attempt is
+        still a contradiction."""
+        def at(sha: str, rid: int, created: str, **more: object) -> dict[str, object]:
+            return {"conclusion": "success", "head_sha": sha, "id": rid, "created_at": created, **more}
+
+        def lint(*items: dict[str, object]) -> str:
+            return runs(*[dict(i, workflow_id=2, name="lint") for i in items])
+        judged = at(B, 9, "2026-10-05T10:30:00Z", run_attempt=1)
+        rerun = at(B, 9, "2026-10-05T10:30:00Z", run_attempt=2, conclusion="cancelled")
+        prev = at(A, 8, "2026-10-05T10:00:00Z", run_attempt=1)
+        answers = world(C, "", **{
+            "repos/o/r/actions/workflows?per_page=100": json.dumps(
+                {"workflows": [{"id": 1, "name": "ci"}, {"id": 2, "name": "lint"}]}),
+            "repos/o/r/actions/workflows/2": json.dumps({"path": ".github/workflows/lint.yml"}),
+            f"repos/o/r/contents/.github/workflows/lint.yml?ref={C}": DOCS_IGNORED.replace(
+                "name: ci", "name: lint"),
+            "repos/o/r/actions/workflows/2/runs?branch=main&event=push&per_page=10": [
+                lint(at(C, 20, "2026-10-05T11:00:00Z", status="in_progress", conclusion=None)),
+                lint(at(C, 20, "2026-10-05T11:00:00Z"))],
+            f"repos/o/r/compare/{A}...{C}?per_page=20": json.dumps(
+                {"total_commits": 1, "behind_by": 0, "commits": [{"sha": C, "parents": [{"sha": A}]}]}),
+            f"repos/o/r/commits/{C}?per_page=100": json.dumps({"files": [{"filename": "docs/x.md"}]})})
+        page = "repos/o/r/actions/workflows/1/runs?branch=main&event=push&per_page=10"
+        answers[page] = [runs(judged, prev), runs(rerun, prev)]
+        clock = FakeClock()
+        rc, out, _, _ = base_run(answers, ["main", "--wait=900"], clock=clock)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("contradicts", out)
+        self.assertIn(f"green    ci — success at {A[:8]}", out)
+        self.assertIn("paths-ignore of ci, so no run for it is coming", out)
+        self.assertEqual(len(clock.slept), 1, "two rounds")
+        # The same run at its earlier attempt, after its re-run was seen in flight: a stale page,
+        # which would otherwise settle on the absence grace.
+        running = dict(rerun, status="in_progress", conclusion=None)
+        answers[page] = [runs(judged, prev), runs(running, prev), runs(judged, prev)]
+        answers["repos/o/r/actions/workflows/2/runs?branch=main&event=push&per_page=10"] = [
+            lint(at(C, 20, "2026-10-05T11:00:00Z", status="in_progress", conclusion=None)),
+            lint(at(C, 20, "2026-10-05T11:00:00Z"))]
+        rc, out, _, _ = base_run(answers, ["main", "--wait=200"], knobs={"SHIP_PR_BASE_ABSENT_GRACE": "0"})
+        self.assertEqual(rc, 4, out)
+        self.assertIn(f"ci's run 9 at {B[:8]} reads at attempt 1, where an earlier round read attempt 2", out)
+
     def test_a_settle_on_absence_keeps_its_pages_and_only_the_newest(self) -> None:
         state = os.path.realpath(tempfile.mkdtemp(prefix="ludics-base-state."))
         self.addCleanup(shutil.rmtree, state, True)

@@ -186,6 +186,9 @@ class RunRow:
     created_at: str
     url: str
     run_id: str
+    # ``run_attempt``, 0 when unread: what tells a re-run of a judged run from a stale page
+    # (ludics-lite#550). Not one of BASE_RUN_ROWS's fields, so not in ``line``.
+    attempt: int = 0
 
     def line(self) -> str:
         return "\t".join((self.wid, self.name, self.status, self.conclusion, self.head_sha,
@@ -202,7 +205,12 @@ def _run_row(run: Json) -> RunRow:
         created_at=tsv(get(run, "created_at")),
         url=tsv(alt(get(run, "html_url"), "-")),
         run_id=jq_raw(get(run, "id")),
+        attempt=_attempt(get(run, "run_attempt")),
     )
+
+
+def _attempt(value: Json) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
 def page_judged(rows: Sequence[RunRow]) -> bool:
@@ -839,6 +847,7 @@ class _Seen:
     key: tuple[float, int]
     run_id: str
     sha: str
+    attempt: int
 
 
 def _row_key(r: RunRow) -> tuple[float, int] | None:
@@ -972,6 +981,7 @@ class Wait:
         # run, and the runs each workflow had at a tip.
         self.judged_seen: dict[str, _Seen] = {}
         self.tip_seen: dict[tuple[str, str], set[str]] = {}
+        self.attempts_seen: dict[tuple[str, str], int] = {}
 
     def tip_read(self) -> str:
         return self.b.tip_sha(self.ebranch)
@@ -1177,15 +1187,30 @@ class Wait:
         and a round that read one settled green on a weeks-old verdict with the tip's own run in
         flight. Within one wait, this round contradicts an earlier one when a workflow's newest
         judged run is OLDER than the newest an earlier round judged (or it has none), or when a run
-        an earlier round saw at this tip is not on the page. Runs only accumulate on a branch:
-        neither happens to a fresh read short of a deleted run or a tip forced back, and either of
+        an earlier round saw at this tip is not on the page, or when a run reads at an earlier
+        ``run_attempt`` than an earlier round read it at. Runs only accumulate on a branch: none of
+        these happens to a fresh read short of a deleted run or a tip forced back, and either of
         those leaves the wait to its ceiling, no verdict, rather than to a settle on a stale page.
-        The reasons go in ``rnd.inconsistent``; what was seen is remembered, never lowered."""
+        The one way history does step back is a re-run of the judged run (its attempt up), which
+        un-judges it: that lowers what is remembered for the workflow to what this page judges.
+        The reasons go in ``rnd.inconsistent``; what was seen is otherwise never lowered."""
         for wid, rows in rnd.by_wid.items():
             name = rnd.names.get(wid, wid)
             newest = next((r for r in rows if r.status == "completed" and r.conclusion in _JUDGED), None)
             key = _row_key(newest) if newest is not None else None
             seen = self.judged_seen.get(wid)
+            for r in rows:
+                had_attempt = self.attempts_seen.get((wid, r.run_id), 0)
+                if r.attempt and r.attempt < had_attempt:
+                    rnd.inconsistent.append(f"{name}'s run {r.run_id} at {r.head_sha[:8]} reads at attempt"
+                                            f" {r.attempt}, where an earlier round read attempt {had_attempt}")
+                self.attempts_seen[(wid, r.run_id)] = max(had_attempt, r.attempt)
+            again = next((r for r in rows if seen is not None and r.run_id == seen.run_id), None)
+            if seen is not None and again is not None and seen.attempt and again.attempt > seen.attempt:
+                # The run an earlier round judged by was re-run since: what it judged no longer
+                # stands, and an older run newest-judged is the branch's history, not a stale page.
+                del self.judged_seen[wid]
+                seen = None
             if seen is not None:
                 if newest is None:
                     rnd.inconsistent.append(f"{name} has no judged run on it, where an earlier round's"
@@ -1195,7 +1220,7 @@ class Wait:
                                             f" {newest.head_sha[:8]}, older than run {seen.run_id} at"
                                             f" {seen.sha[:8]}, which an earlier round judged by")
             if newest is not None and key is not None and (seen is None or key > seen.key):
-                self.judged_seen[wid] = _Seen(key, newest.run_id, newest.head_sha)
+                self.judged_seen[wid] = _Seen(key, newest.run_id, newest.head_sha, newest.attempt)
             if tip:
                 had = self.tip_seen.setdefault((tip, wid), set())
                 lost = sorted(had - {r.run_id for r in rows})
